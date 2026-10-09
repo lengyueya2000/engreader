@@ -33,6 +33,9 @@ object ArticleExtractor {
     private val HEADING = Regex("(?is)<h([12])\\b[^>]*>(.*?)</h\\1>")
     private val TITLE_TAG = Regex("(?is)<title[^>]*>(.*?)</title>")
 
+    /** A whole link, so the text a card headline is made of can be told apart. */
+    private val ANCHOR = Regex("(?is)<a\\b[^>]*>.*?</a\\s*>")
+
     /**
      * A whole `<meta>` tag, with quoted values allowed to contain `>`.
      *
@@ -111,17 +114,28 @@ object ArticleExtractor {
             .filter { it.length in 4..90 && it.split(' ').size in 2..12 }
             .toSet()
 
+        // Link ranges, so a card headline can be told from prose: "related stories"
+        // blocks are written as ordinary paragraphs and were kept, which is how the
+        // body ended up carrying "Fort Hood attacker to be executed…" as if it were
+        // a sentence of the article.
+        val links = ANCHOR.findAll(doc).map { it.range }.toList()
+
         val out = mutableListOf<String>()
         for (match in PARAGRAPH.findAll(doc)) {
             val attrs = match.groupValues[1]
             if (CAPTION_ATTRS.containsMatchIn(attrs)) continue
-            val text = Html.text(match.groupValues[2])
+            val inner = match.groupValues[2]
+            val text = Html.text(inner)
             if (text.length < 55) continue
             if (JUNK.containsMatchIn(text) && text.length < 240) continue
             // Reject nav-ish paragraphs: too many short fragments or link markers.
             if (text.count { it == '|' } >= 2) continue
             val words = text.split(' ').size
             if (words < 9) continue
+            // A paragraph that is only a link, or that sits inside one, is a headline
+            // on a card, not a sentence: nothing about it is written as prose.
+            if (links.any { match.range.first in it }) continue
+            if (bareWords(inner) < 3) continue
             out += text
         }
 
@@ -131,6 +145,10 @@ object ArticleExtractor {
         // to the longest text blocks between block-level tags.
         return fallbackBlocks(doc, headingTexts, out)
     }
+
+    /** Words in [html] that are not inside a link, i.e. words the site did not wrap. */
+    private fun bareWords(html: String): Int =
+        Html.text(ANCHOR.replace(html, " ")).split(' ').count { word -> word.any { it.isLetter() } }
 
     private fun fallbackBlocks(
         doc: String,

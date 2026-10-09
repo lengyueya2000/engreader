@@ -42,6 +42,111 @@ class SourceRegressionTest {
     }
 
     @Test
+    fun `an inline tag does not push punctuation away from its word`() {
+        // Every tag used to be replaced by a space, so a link or emphasis that
+        // wrapped a word detached whatever followed it: this read "report ," and
+        // "Gaza ." in the reader. Real pages wrap words in <a> constantly.
+        assertEquals(
+            "The report, published today, was clear.",
+            Html.text("""The <a href="/x">report</a>, published today, was clear."""),
+        )
+        assertEquals(
+            "It concluded Israel was guilty of genocide in Gaza.",
+            Html.text("""It concluded Israel was guilty of genocide in <a href="/gaza">Gaza</a>."""),
+        )
+        assertEquals(
+            "Nature (IUCN) Red List designation",
+            Html.text("""Nature (<a href="/iucn">IUCN</a>) Red List designation"""),
+        )
+        assertEquals("It said \u201cno\u201d.", Html.text("It said <em>\u201cno\u201d</em>."))
+    }
+
+    @Test
+    fun `a space before a closing mark or after an opening one is closed up`() {
+        // Some pages really do write the space in the markup ("word <em>,</em>"),
+        // and a non-breaking space decodes to one as well.
+        assertEquals("one, two", Html.text("one&nbsp;, two"))
+        assertEquals("(\u201cquoted\u201d)", Html.text("( \u201cquoted\u201d )"))
+    }
+
+    @Test
+    fun `block tags still separate the text around them`() {
+        // An inline tag is deleted, but a block element marks a real boundary: the
+        // two sides must not run together into one word.
+        assertEquals("one two", Html.text("<p>one</p><p>two</p>"))
+        assertEquals("a b", Html.text("a<br/>b"))
+    }
+
+    @Test
+    fun `screen-reader-only text does not reach the body`() {
+        // The BBC hides ", external" after every outbound link, so a finished
+        // sentence arrived as "…in a post on X., external".
+        val html = """
+            <html><body><p>Democratic Senator Chris Murphy told CNN that the idea was
+            disgusting and reminiscent of executions carried out by the Islamic State
+            group, he added<a href="/x"> in a post on X.
+            <span class="visually-hidden">, external</span></a></p>
+            <p>${"Officials said more details would follow. ".repeat(4)}</p>
+            <p>${"The public will be able to watch the execution. ".repeat(4)}</p>
+            </body></html>
+        """.trimIndent()
+        val body = ArticleExtractor.extract(html).body
+        assertFalse(body.contains("external"))
+        assertTrue(body.contains("in a post on X."))
+    }
+
+    @Test
+    fun `a caption is not a body paragraph`() {
+        // Both sites wrap captions in <figcaption> with an ordinary <p> inside, and
+        // the extractor used to keep them as if they were prose.
+        val html = """
+            <html><body>
+            <figure><img src="a.jpg"><figcaption><p>An undated handout image of Hasan
+            that was released by authorities in 2012</p></figcaption></figure>
+            <p>${"The public will be able to watch the execution. ".repeat(4)}</p>
+            <p>${"Officials said more details would follow. ".repeat(4)}</p>
+            <p>${"The decision was unprecedented in the modern era. ".repeat(4)}</p>
+            </body></html>
+        """.trimIndent()
+        val body = ArticleExtractor.extract(html).body
+        assertFalse(body.contains("undated handout image"))
+        assertTrue(body.contains("watch the execution"))
+    }
+
+    @Test
+    fun `the page footer is not a body paragraph`() {
+        val html = """
+            <html><body>
+            <p>${"The public will be able to watch the execution. ".repeat(4)}</p>
+            <p>${"Officials said more details would follow. ".repeat(4)}</p>
+            <p>${"The decision was unprecedented in the modern era. ".repeat(4)}</p>
+            <footer><p>Copyright © 2026 BBC. The BBC is not responsible for the content
+            of external sites. Read about our approach to external linking.</p></footer>
+            </body></html>
+        """.trimIndent()
+        val body = ArticleExtractor.extract(html).body
+        assertFalse(body.contains("Copyright"))
+    }
+
+    @Test
+    fun `a related-story card headline is not a body paragraph`() {
+        // "Read next" blocks are ordinary <p> inside <a>, so they read as prose to a
+        // length filter: the body carried them as if they were sentences.
+        val html = """
+            <html><body>
+            <p>${"The public will be able to watch the execution. ".repeat(4)}</p>
+            <p>${"Officials said more details would follow. ".repeat(4)}</p>
+            <p>${"The decision was unprecedented in the modern era. ".repeat(4)}</p>
+            <ul><li><a href="/other"><p>Fort Hood attacker to be executed by firing squad
+            - a first for US military since World War Two</p></a></li></ul>
+            </body></html>
+        """.trimIndent()
+        val body = ArticleExtractor.extract(html).body
+        assertFalse(body.contains("a first for US military"))
+        assertTrue(body.contains("watch the execution"))
+    }
+
+    @Test
     fun `uppercase hex numeric entities are decoded`() {
         assertEquals("it's here", Html.decode("it&#X27;s here"))
         assertEquals("it's here", Html.decode("it&#x27;s here"))
