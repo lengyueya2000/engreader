@@ -15,8 +15,10 @@ import com.engreader.app.nlp.Sentence
 import com.engreader.app.nlp.SentenceAnalysis
 import com.engreader.app.nlp.Sentences
 import com.engreader.app.nlp.VocabularyProfile
+import com.engreader.app.tts.SpeechBackend
 import com.engreader.app.tts.SpeechEvent
 import com.engreader.app.tts.SpeechState
+import com.engreader.app.tts.VoiceCatalog
 import com.engreader.app.ui.theme.ReadingTheme
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -59,6 +61,8 @@ data class ReaderState(
     val highlightSaved: Boolean = true,
     val speechRate: Float = 0.95f,
     val speechLocale: String = "en-GB",
+    /** Bundled voice the reader picked, or blank to use the accent's default. */
+    val speechVoice: String = "",
     val speakingSentence: Int = -1,
     val listening: Boolean = false,
     /** Flattened sentence list used by listening mode and by next/prev navigation. */
@@ -138,6 +142,15 @@ class ReaderViewModel(
 
     val speechState: StateFlow<SpeechState> get() = container.speaker.state
 
+    /** Which engine is speaking, so the settings sheet can say so. */
+    val speechBackend: StateFlow<SpeechBackend> get() = container.speaker.backend
+
+    /** The bundled voices, for the picker. */
+    val voices: StateFlow<List<VoiceCatalog.BundledVoice>> get() = container.speaker.voices
+
+    /** The voice in use, shown so the reader can see what is loaded. */
+    val activeVoice: StateFlow<VoiceCatalog.BundledVoice?> get() = container.speaker.activeVoice
+
     private var lookups = 0
     private var sessionStart = 0L
     private var speechJob: Job? = null
@@ -183,10 +196,15 @@ class ReaderViewModel(
             highlightSaved = settings.highlightSavedWords,
             speechRate = settings.speechRate,
             speechLocale = settings.speechLocale,
+            speechVoice = settings.speechVoice,
         )
         container.articles.markOpened(articleId)
         sessionStart = System.currentTimeMillis()
-        container.speaker.prepare(settings.speechRate, settings.speechLocale)
+        container.speaker.prepare(
+            rate = settings.speechRate,
+            localeTag = settings.speechLocale,
+            voiceId = settings.speechVoice,
+        )
         // A previous session may have left the switch on with nothing behind it (an
         // article read before translations existed, or one whose run failed).
         if (settings.showTranslation && article.translation.isEmpty()) requestTranslation()
@@ -421,9 +439,22 @@ class ReaderViewModel(
 
     fun setSpeechLocale(tag: String) {
         container.settings.speechLocale = tag
-        container.speaker.selectVoice(tag)
-        state = state.copy(speechLocale = tag)
+        // A voice belongs to the accent it was chosen for, so switching accent clears
+        // the pick and lets the accent's own default take over.
+        container.settings.speechVoice = ""
+        container.speaker.selectVoice(tag, "")
+        state = state.copy(speechLocale = tag, speechVoice = "")
     }
+
+    /** Pins a bundled voice by id; blank returns to the accent's default. */
+    fun setSpeechVoice(id: String) {
+        container.settings.speechVoice = id
+        container.speaker.selectVoice(state.speechLocale, id)
+        state = state.copy(speechVoice = id)
+    }
+
+    /** Speaks a sample of the current voice without touching the reading queue. */
+    fun previewVoice() = container.speaker.preview()
 
     // ------------------------------------------------------------ listening
 

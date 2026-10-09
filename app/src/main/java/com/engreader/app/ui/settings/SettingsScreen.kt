@@ -38,6 +38,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import com.engreader.app.tts.VoiceCatalog
 import com.engreader.app.ui.LocalContainer
 import com.engreader.app.ui.components.HairLine
 import com.engreader.app.ui.theme.ReadingTheme
@@ -58,11 +59,16 @@ fun SettingsScreen(onBack: () -> Unit) {
     var dailyGoal by remember { mutableStateOf(settings.dailyGoalMinutes) }
     var speechRate by remember { mutableStateOf(settings.speechRate) }
     var speechLocale by remember { mutableStateOf(settings.speechLocale) }
+    var speechVoice by remember { mutableStateOf(settings.speechVoice) }
     var theme by remember { mutableStateOf(settings.readingTheme) }
     var showTranslation by remember { mutableStateOf(settings.showTranslation) }
 
     LaunchedEffect(Unit) {
-        container.speaker.prepare(settings.speechRate, settings.speechLocale)
+        container.speaker.prepare(
+            rate = settings.speechRate,
+            localeTag = settings.speechLocale,
+            voiceId = settings.speechVoice,
+        )
     }
 
     Column(
@@ -168,13 +174,69 @@ fun SettingsScreen(onBack: () -> Unit) {
             )
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf("en-GB" to "英式", "en-US" to "美式", "en-AU" to "澳式").forEach { (tag, label) ->
+                VoiceCatalog.accents.forEach { (tag, label) ->
                     ChoiceChip(label, speechLocale == tag) {
                         speechLocale = tag
                         settings.speechLocale = tag
-                        container.speaker.selectVoice(tag)
+                        // The stored voice belongs to the old accent, so it is cleared
+                        // and the new accent's own default takes over.
+                        settings.speechVoice = ""
+                        speechVoice = ""
+                        container.speaker.selectVoice(tag, "")
                     }
                 }
+            }
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = "语音随应用一起安装，不依赖手机自带的朗读引擎，" +
+                    "因此在任何设备上听起来都一样。切换口音需要重新载入模型，约一两秒。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            Spacer(Modifier.height(14.dp))
+            Text(
+                text = "音色",
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Spacer(Modifier.height(8.dp))
+            VoiceCatalog.forLocale(speechLocale).forEach { voice ->
+                val selected = if (speechVoice.isBlank()) {
+                    voice == VoiceCatalog.defaultFor(speechLocale)
+                } else {
+                    voice.id == speechVoice
+                }
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(
+                            if (selected) MaterialTheme.colorScheme.primaryContainer
+                            else MaterialTheme.colorScheme.surfaceContainer
+                        )
+                        .clickable {
+                            speechVoice = voice.id
+                            settings.speechVoice = voice.id
+                            container.speaker.selectVoice(speechLocale, voice.id)
+                        }
+                        .padding(vertical = 10.dp, horizontal = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            text = voice.title,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        Text(
+                            text = voice.detail,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
             }
 
             Spacer(Modifier.height(22.dp))
@@ -247,8 +309,9 @@ fun SettingsScreen(onBack: () -> Unit) {
 
             Spacer(Modifier.height(14.dp))
             Text(
-                text = "朗读使用 Android 系统自带的文字转语音引擎。若没有声音，" +
-                    "请在系统设置 → 无障碍 → 文字转语音中安装英语语音包。",
+                text = "朗读用的是内置神经网络语音（Piper VITS），随安装包提供，" +
+                    "不需要系统语音引擎，也不需要联网。只有在内置模型无法载入时，" +
+                    "才会退回系统自带的朗读引擎。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

@@ -26,8 +26,21 @@ android {
         applicationId = "com.engreader.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.0.1"
+    }
+
+    // One APK per ABI rather than one fat APK: the speech engine's native library is
+    // ~25 MB per architecture, so a phone would otherwise download a copy it can
+    // never execute. armeabi-v7a and x86 are left out — the voice models alone are
+    // 37 MB, and a 32-bit process has no room for a 19 MB graph beside its runtime.
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "x86_64")
+            isUniversalApk = false
+        }
     }
 
     signingConfigs {
@@ -76,6 +89,11 @@ android {
 }
 
 dependencies {
+    // sherpa-onnx has no Maven artifact, so the AAR is vendored under app/libs.
+    // It carries the offline VITS speech engine used for reading aloud; see
+    // app/src/main/java/com/engreader/app/tts/NeuralTts.kt.
+    implementation(files("libs/sherpa-onnx.aar"))
+
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.lifecycle.runtime.compose)

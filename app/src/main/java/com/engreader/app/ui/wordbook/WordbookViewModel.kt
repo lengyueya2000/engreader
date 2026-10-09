@@ -136,7 +136,11 @@ class WordbookViewModel(private val container: AppContainer) : ViewModel() {
         container.wordbook.distractors(word, count = 3)
 
     fun speak(word: String) {
-        container.speaker.prepare(container.settings.speechRate, container.settings.speechLocale)
+        container.speaker.prepare(
+            rate = container.settings.speechRate,
+            localeTag = container.settings.speechLocale,
+            voiceId = container.settings.speechVoice,
+        )
         container.speaker.sayWord(word)
     }
 }

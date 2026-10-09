@@ -37,6 +37,17 @@ class SettingsRepository(context: Context) {
         get() = prefs.getString(KEY_SPEECH_LOCALE, "en-GB").orEmpty()
         set(value) = prefs.edit().putString(KEY_SPEECH_LOCALE, value).apply()
 
+    /**
+     * Which bundled voice to read with, e.g. `en_GB-alan-medium`.
+     *
+     * Blank means "use the accent's own voice", which is what a reader who has never
+     * opened the picker gets. Stored by id rather than by index because the picker's
+     * order is presentational and could change between versions.
+     */
+    var speechVoice: String
+        get() = prefs.getString(KEY_SPEECH_VOICE, "").orEmpty()
+        set(value) = prefs.edit().putString(KEY_SPEECH_VOICE, value).apply()
+
     /** Whether a word is saved to the wordbook automatically on look-up. */
     var autoSaveLookups: Boolean
         get() = prefs.getBoolean(KEY_AUTO_SAVE, false)
@@ -68,6 +79,7 @@ class SettingsRepository(context: Context) {
         const val KEY_THEME = "reading_theme"
         const val KEY_SPEECH_RATE = "speech_rate"
         const val KEY_SPEECH_LOCALE = "speech_locale"
+        const val KEY_SPEECH_VOICE = "speech_voice"
         const val KEY_AUTO_SAVE = "auto_save"
         const val KEY_HIGHLIGHT = "highlight_saved"
         const val KEY_SHOW_TRANSLATION = "show_translation"

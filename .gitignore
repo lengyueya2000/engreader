@@ -9,3 +9,5 @@ keystore.properties
 .cxx/
 captures/
 tools/raw/
+
+.verify/

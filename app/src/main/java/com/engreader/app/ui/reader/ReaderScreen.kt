@@ -62,6 +62,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.engreader.app.nlp.Paragraph
 import com.engreader.app.nlp.Sentence
+import com.engreader.app.tts.SpeechState
 import com.engreader.app.ui.components.EmptyState
 import com.engreader.app.ui.components.HairLine
 import com.engreader.app.ui.containerScopedViewModel
@@ -92,6 +93,8 @@ fun ReaderScreen(
     var showTypography by remember { mutableStateOf(false) }
     var showQuiz by remember { mutableStateOf(false) }
     val liveSpeechState by viewModel.speechState.collectAsStateCompat()
+    val liveVoice by viewModel.activeVoice.collectAsStateCompat()
+    val liveBackend by viewModel.speechBackend.collectAsStateCompat()
 
     LaunchedEffect(articleId) { viewModel.load() }
 
@@ -327,7 +330,7 @@ fun ReaderScreen(
                     title = state.article?.title.orEmpty(),
                     saved = state.article?.saved == true,
                     listening = state.listening,
-                    speechAvailable = liveSpeechState != com.engreader.app.tts.SpeechState.Unavailable,
+                    speechAvailable = liveSpeechState != SpeechState.Unavailable,
                     theme = theme,
                     onBack = {
                         viewModel.flushProgress()
@@ -401,6 +404,10 @@ fun ReaderScreen(
             showTranslation = state.showTranslation,
             speechRate = state.speechRate,
             speechLocale = state.speechLocale,
+            speechVoice = state.speechVoice,
+            activeVoice = liveVoice,
+            backend = liveBackend,
+            speechReady = liveSpeechState == SpeechState.Ready,
             onFontSize = viewModel::setFontSize,
             onLineHeight = viewModel::setLineHeight,
             onTheme = viewModel::setTheme,
@@ -408,6 +415,8 @@ fun ReaderScreen(
             onShowTranslation = viewModel::setShowTranslation,
             onSpeechRate = viewModel::setSpeechRate,
             onSpeechLocale = viewModel::setSpeechLocale,
+            onSpeechVoice = viewModel::setSpeechVoice,
+            onPreviewVoice = viewModel::previewVoice,
             onDismiss = { showTypography = false },
         )
     }
