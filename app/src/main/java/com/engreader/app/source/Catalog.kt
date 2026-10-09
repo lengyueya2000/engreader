@@ -74,6 +74,9 @@ object Catalog {
 
     fun source(id: String): Source? = sources.firstOrNull { it.id == id }
 
+    /** `sourceId` written on every chapter of an imported book. */
+    const val BOOK_SOURCE = "book"
+
     /**
      * Display name for any feed id, whether it names a source or a topic.
      *
@@ -84,5 +87,5 @@ object Catalog {
     fun displayName(id: String): String =
         sources.firstOrNull { it.id == id }?.name
             ?: topics.firstOrNull { it.id == id }?.let { "${it.name} · 外刊" }
-            ?: ""
+            ?: if (id == BOOK_SOURCE) "导入书籍" else ""
 }

@@ -30,6 +30,15 @@ data class Article(
      * without re-tokenising the body; empty until it is first needed.
      */
     val vocabProfile: String = "",
+    /**
+     * Id of the imported book this is a chapter of, or 0 for a standalone article.
+     *
+     * Chapters are ordinary article rows so the reader, dictionary, grammar panel
+     * and quiz need no book-specific code; this is the only thing that marks them.
+     */
+    val bookId: Long = 0,
+    /** Position of this chapter inside its book, from 0. Meaningless when [bookId] is 0. */
+    val chapterIndex: Int = 0,
 ) {
     /** Cached content lemmas, or an empty list when the profile has not been built yet. */
     val contentLemmas: List<String>

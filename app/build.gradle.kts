@@ -26,8 +26,8 @@ android {
         applicationId = "com.engreader.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.0.1"
+        versionCode = 3
+        versionName = "1.1.0"
     }
 
     // One APK per ABI rather than one fat APK: the speech engine's native library is
@@ -112,4 +112,19 @@ dependencies {
     testImplementation(libs.junit)
 
     debugImplementation(libs.androidx.compose.ui.tooling)
+}
+
+/**
+ * Full-size books for [com.engreader.app.book.BookRealFileTest], which are far too
+ * large to commit. Point `-Pengreader.bookFixtures=<dir>` at a directory holding
+ * `pride.epub`, `pride.mobi` and `pride.azw3` to run those tests; without it they
+ * skip, and the synthetic fixtures under `src/test/resources/book` still cover every
+ * branch of both parsers.
+ */
+tasks.withType<Test>().configureEach {
+    // A project property, not a system property: `-P` does not reach System.getProperty
+    // in the build script, and the test JVM needs its own copy.
+    (project.findProperty("engreader.bookFixtures") as String?)?.let {
+        systemProperty("engreader.bookFixtures", it)
+    }
 }

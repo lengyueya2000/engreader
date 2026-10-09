@@ -20,10 +20,12 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.AutoStories
 import androidx.compose.material.icons.outlined.LocalFireDepartment
 import androidx.compose.material.icons.outlined.Schedule
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -35,6 +37,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.engreader.app.model.Article
+import com.engreader.app.model.Book
+import com.engreader.app.ui.books.BookCover
+import com.engreader.app.ui.books.rememberCover
 import com.engreader.app.ui.components.DifficultyChip
 import com.engreader.app.ui.components.EmptyState
 import com.engreader.app.ui.components.HairLine
@@ -48,6 +53,9 @@ fun HomeScreen(
     refreshKey: Int,
     onOpenArticle: (Long) -> Unit,
     onBrowse: () -> Unit,
+    onOpenBook: (Long) -> Unit,
+    onOpenShelf: () -> Unit,
+    onImportBook: () -> Unit,
 ) {
     val viewModel = containerViewModel(key = "home") { HomeViewModel(it) }
     val scope = rememberCoroutineScope()
@@ -69,12 +77,34 @@ fun HomeScreen(
         ),
     ) {
         item {
-            Header(state)
+            Header(state, onOpenShelf, onImportBook)
         }
 
         if (state.loading) {
             item { LoadingBlock(label = "正在准备词库与文章…") }
         } else {
+            if (state.books.isNotEmpty()) {
+                item {
+                    SectionHeader(
+                        title = "在读的书",
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
+                        action = {
+                            Text(
+                                "全部 ${state.books.size} 本",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.clickable(onClick = onOpenShelf),
+                            )
+                        },
+                    )
+                }
+                items(state.books.take(3), key = { "book-${it.id}" }) { book ->
+                    BookShelfRow(book) { onOpenBook(book.id) }
+                    HairLine(Modifier.padding(start = 20.dp, end = 20.dp))
+                }
+                item { Spacer(Modifier.height(20.dp)) }
+            }
+
             state.continueReading?.let { article ->
                 item {
                     val started = article.lastReadAt > 0
@@ -148,14 +178,31 @@ fun HomeScreen(
 }
 
 @Composable
-private fun Header(state: HomeState) {
+private fun Header(state: HomeState, onOpenShelf: () -> Unit, onImportBook: () -> Unit) {
     val progress = state.progress
     Column(Modifier.padding(horizontal = 20.dp)) {
-        Text(
-            text = "今天读点什么",
-            style = MaterialTheme.typography.headlineMedium,
-            color = MaterialTheme.colorScheme.onBackground,
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = "今天读点什么",
+                style = MaterialTheme.typography.headlineMedium,
+                color = MaterialTheme.colorScheme.onBackground,
+                modifier = Modifier.weight(1f),
+            )
+            IconButton(onClick = onImportBook) {
+                Icon(
+                    Icons.Outlined.Add,
+                    contentDescription = "导入书籍",
+                    tint = MaterialTheme.colorScheme.primary,
+                )
+            }
+            IconButton(onClick = onOpenShelf) {
+                Icon(
+                    Icons.Outlined.AutoStories,
+                    contentDescription = "我的书",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
         Spacer(Modifier.height(6.dp))
         Text(
             text = if (progress == null || progress.streakDays == 0) {
@@ -271,6 +318,57 @@ private fun ContinueCard(
                     color = MaterialTheme.colorScheme.onPrimaryContainer,
                 )
             }
+        }
+    }
+}
+
+/**
+ * One imported book on the home screen.
+ *
+ * Deliberately thinner than the shelf's row: the cover is the only decoration, and
+ * the progress line says which chapter rather than showing a bar, because on the home
+ * screen the book is a link back into the text, not something to manage.
+ */
+@Composable
+private fun BookShelfRow(book: Book, onClick: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 20.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        BookCover(cover = rememberCover(book), title = book.title)
+        Spacer(Modifier.width(14.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = book.title,
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onBackground,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (book.author.isNotBlank()) {
+                Spacer(Modifier.height(3.dp))
+                Text(
+                    text = book.author,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = if (book.lastReadAt > 0) {
+                    "读到第 ${book.lastChapter + 1} / ${book.chapterCount} 章"
+                } else {
+                    "未开始 · ${book.chapterCount} 章"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = if (book.lastReadAt > 0) Palette.Pine
+                else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }

@@ -25,6 +25,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.outlined.List
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.Headphones
 import androidx.compose.material.icons.filled.Pause
@@ -81,6 +82,14 @@ fun ReaderScreen(
     articleId: Long,
     onBack: () -> Unit,
     onSavedChanged: () -> Unit,
+    /**
+     * Opens another chapter in place of this one.
+     *
+     * Replacing rather than stacking is deliberate: walking from chapter one to
+     * chapter twelve should still leave the reader one back-press from the shelf, not
+     * twelve. The caller owns the navigation, so this screen stays unaware of it.
+     */
+    onOpenChapter: (Long) -> Unit = {},
 ) {
     // Scoped to this article rather than to the activity: the reader is opened once
     // per article, and an activity-scoped ViewModel would keep serving the first one.
@@ -322,21 +331,46 @@ fun ReaderScreen(
                                 accent = if (theme.isDark) Palette.Mint else Palette.Pine,
                             ) { showTypography = true }
                         }
+                        if (state.book != null) {
+                            Spacer(Modifier.height(20.dp))
+                            ChapterNav(
+                                theme = theme,
+                                previous = viewModel.chapterNeighbour(-1),
+                                next = viewModel.chapterNeighbour(1),
+                                index = article.chapterIndex,
+                                total = state.chapters.size,
+                                onOpen = { chapter ->
+                                    // The bookmark moves before the new chapter is even
+                                    // opened, so a jump that fails to render still counts
+                                    // as having read up to here.
+                                    scope.launch {
+                                        viewModel.articleIdOfChapter(
+                                            state.book!!.id, chapter.index,
+                                        )?.let { onOpenChapter(it) }
+                                    }
+                                },
+                            )
+                        }
                         Spacer(Modifier.height(16.dp))
                     }
                 }
 
                 ReaderTopBar(
-                    title = state.article?.title.orEmpty(),
+                    // A chapter is titled by its book, not by itself: "第 12 章" alone
+                    // does not tell the reader which of several open books this is.
+                    title = state.book?.let { "${it.title} · ${article.title}" }
+                        ?: article.title,
                     saved = state.article?.saved == true,
                     listening = state.listening,
                     speechAvailable = liveSpeechState != SpeechState.Unavailable,
+                    hasContents = state.book != null,
                     theme = theme,
                     onBack = {
                         viewModel.flushProgress()
                         viewModel.stopListening()
                         onBack()
                     },
+                    onOpenContents = { viewModel.setContentsVisible(true) },
                     onToggleSave = {
                         val article = state.article ?: return@ReaderTopBar
                         scope.launch {
@@ -393,6 +427,27 @@ fun ReaderScreen(
             onSaveAll = { scope.launch { viewModel.saveUnknownWords() } },
             onSpeak = { viewModel.speakWord(it) },
         )
+    }
+
+    if (state.contentsVisible) {
+        val book = state.book
+        if (book != null) {
+            ContentsSheet(
+                book = book,
+                chapters = state.chapters,
+                currentIndex = state.article?.chapterIndex ?: 0,
+                onOpen = { chapter ->
+                    viewModel.setContentsVisible(false)
+                    if (chapter.articleId != articleId) {
+                        scope.launch {
+                            viewModel.articleIdOfChapter(book.id, chapter.index)
+                                ?.let { onOpenChapter(it) }
+                        }
+                    }
+                },
+                onDismiss = { viewModel.setContentsVisible(false) },
+            )
+        }
     }
 
     if (showTypography) {
@@ -600,9 +655,12 @@ private fun ReaderTopBar(
     saved: Boolean,
     listening: Boolean,
     speechAvailable: Boolean,
+    /** True when this article is a chapter, i.e. when a table of contents exists. */
+    hasContents: Boolean,
     /** The reading surface: the bar sits on it, so its colours must follow it. */
     theme: com.engreader.app.ui.theme.ReadingTheme,
     onBack: () -> Unit,
+    onOpenContents: () -> Unit,
     onToggleSave: () -> Unit,
     onToggleListen: () -> Unit,
 ) {
@@ -633,6 +691,15 @@ private fun ReaderTopBar(
             overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
+        if (hasContents) {
+            IconButton(onClick = onOpenContents) {
+                Icon(
+                    Icons.AutoMirrored.Outlined.List,
+                    contentDescription = "目录",
+                    tint = onSurface,
+                )
+            }
+        }
         if (speechAvailable) {
             IconButton(onClick = onToggleListen) {
                 Icon(
@@ -649,6 +716,90 @@ private fun ReaderTopBar(
                 tint = if (saved) accent else onSurface,
             )
         }
+    }
+}
+
+/**
+ * Previous / next chapter, at the foot of a chapter.
+ *
+ * Placed after the article rather than pinned to the screen: the reader reaches it by
+ * finishing the chapter, which is exactly when the next one is wanted. A fixed bar
+ * would also fight the listening bar for the same edge of the screen.
+ */
+@Composable
+private fun ChapterNav(
+    theme: com.engreader.app.ui.theme.ReadingTheme,
+    previous: com.engreader.app.model.ChapterRef?,
+    next: com.engreader.app.model.ChapterRef?,
+    index: Int,
+    total: Int,
+    onOpen: (com.engreader.app.model.ChapterRef) -> Unit,
+) {
+    val surface = if (theme.isDark) Color(0xFF262A2E) else Color(0xFFF0EBE1)
+    Column(Modifier.fillMaxWidth().padding(horizontal = 22.dp)) {
+        Text(
+            text = "第 ${index + 1} / $total 章",
+            style = MaterialTheme.typography.labelSmall,
+            color = theme.subtle,
+        )
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            ChapterNavButton(
+                label = "上一章",
+                enabled = previous != null,
+                surface = surface,
+                content = theme.body,
+                onClick = { previous?.let(onOpen) },
+                modifier = Modifier.weight(1f),
+            )
+            ChapterNavButton(
+                label = "下一章",
+                enabled = next != null,
+                surface = surface,
+                content = theme.body,
+                onClick = { next?.let(onOpen) },
+                modifier = Modifier.weight(1f),
+            )
+        }
+        if (previous != null || next != null) {
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = next?.title ?: previous?.title.orEmpty(),
+                style = MaterialTheme.typography.labelSmall.copy(
+                    fontFamily = FontFamily.Serif,
+                ),
+                color = theme.subtle,
+                maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ChapterNavButton(
+    label: String,
+    enabled: Boolean,
+    surface: Color,
+    content: Color,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(surface)
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(vertical = 12.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelLarge,
+            // A disabled button keeps its shape but drops to a whisper: removing it
+            // would make the row jump at the first and last chapter.
+            color = if (enabled) content else content.copy(alpha = 0.35f),
+        )
     }
 }
 

@@ -41,7 +41,15 @@ object Html {
         return out
     }
 
-    private fun decodeOnce(input: String): String {
+    /**
+     * Decodes entities exactly once.
+     *
+     * [decode] deliberately runs a second pass, because feeds double-encode. Book
+     * text must not: EPUB and MOBI bodies are well-formed XML, where `&amp;amp;`
+     * means the literal characters `&amp;`, and decoding twice would silently change
+     * what the author wrote.
+     */
+    fun decodeOnce(input: String): String {
         if ('&' !in input) return input
         var out = NUMERIC.replace(input) { m ->
             val code = m.groupValues[2].toIntOrNull(if (m.groupValues[1].isEmpty()) 10 else 16)

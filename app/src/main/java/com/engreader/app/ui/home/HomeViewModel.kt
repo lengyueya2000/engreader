@@ -7,6 +7,7 @@ import androidx.lifecycle.ViewModel
 import com.engreader.app.data.AppContainer
 import com.engreader.app.data.ProgressSnapshot
 import com.engreader.app.model.Article
+import com.engreader.app.model.Book
 import com.engreader.app.nlp.VocabularyProfile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -17,6 +18,14 @@ data class HomeState(
     val continueReading: Article? = null,
     val recent: List<Article> = emptyList(),
     val saved: List<Article> = emptyList(),
+    /**
+     * Imported books, the one being read first.
+     *
+     * Books are kept out of [recent] — a novel would swamp a list of articles — but
+     * they are what a reader returns to night after night, so the home screen shows
+     * the one in progress rather than hiding it behind another screen.
+     */
+    val books: List<Book> = emptyList(),
     val progress: ProgressSnapshot? = null,
     val dueWords: Int = 0,
     /**
@@ -52,6 +61,7 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
             continueReading = list.firstOrNull(),
             recent = list,
             saved = saved,
+            books = container.books.all(),
             progress = progress,
             dueWords = progress.dueNow,
         )
@@ -80,8 +90,7 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
     }
 
     /** Installs the bundled passages on first launch so there is always something to read. */
-    suspend fun installSeedIfEmpty() {
-        val hasAny = withContext(Dispatchers.IO) { container.articles.all().isNotEmpty() }
+    suspend fun installSeedIfEmpty() {        val hasAny = withContext(Dispatchers.IO) { container.articles.all().isNotEmpty() }
         if (hasAny) return
         val seeds = container.seedLibrary.load()
         seeds.forEach { seed ->

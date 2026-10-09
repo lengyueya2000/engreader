@@ -40,7 +40,12 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
                 -- Newline-joined distinct content lemmas. Cached so the personal
                 -- unknown rate can be recomputed as the wordbook grows without
                 -- re-tokenising and re-grading the body every time.
-                vocabProfile TEXT    NOT NULL DEFAULT ''
+                vocabProfile TEXT    NOT NULL DEFAULT '',
+                -- Set when the row is a chapter of an imported book. A plain article
+                -- leaves both at zero, which is what keeps the two kinds apart in
+                -- every query that lists one or the other.
+                bookId       INTEGER NOT NULL DEFAULT 0,
+                chapterIndex INTEGER NOT NULL DEFAULT 0
             )
             """.trimIndent()
         )
@@ -111,6 +116,38 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
             )
             """.trimIndent()
         )
+
+        createBookTable(db)
+    }
+
+    /**
+     * An imported book.
+     *
+     * Chapters are rows in `article` with `bookId` pointing here, so the reader, the
+     * dictionary and the quiz all work on a book chapter without knowing it is one.
+     * `lastChapter` is on the book because "where was I" has to survive the reader
+     * opening another chapter to check something.
+     */
+    private fun createBookTable(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE book (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                title        TEXT    NOT NULL,
+                author       TEXT    NOT NULL DEFAULT '',
+                format       TEXT    NOT NULL DEFAULT '',
+                fileName     TEXT    NOT NULL DEFAULT '',
+                coverFile    TEXT    NOT NULL DEFAULT '',
+                chapterCount INTEGER NOT NULL DEFAULT 0,
+                addedAt      INTEGER NOT NULL DEFAULT 0,
+                lastReadAt   INTEGER NOT NULL DEFAULT 0,
+                readSeconds  INTEGER NOT NULL DEFAULT 0,
+                lastChapter  INTEGER NOT NULL DEFAULT 0
+            )
+            """.trimIndent()
+        )
+        db.execSQL("CREATE INDEX idx_book_recent ON book(lastReadAt DESC)")
+        db.execSQL("CREATE INDEX idx_article_book ON article(bookId, chapterIndex)")
     }
 
     /**
@@ -130,6 +167,11 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
                 "CREATE INDEX IF NOT EXISTS idx_lookup_lemma ON lookup(lemma, lookedUpAt DESC)"
             )
         }
+        if (oldVersion < 3) {
+            addColumn(db, "article", "bookId", "INTEGER NOT NULL DEFAULT 0")
+            addColumn(db, "article", "chapterIndex", "INTEGER NOT NULL DEFAULT 0")
+            createBookTable(db)
+        }
     }
 
     private fun addColumn(db: SQLiteDatabase, table: String, column: String, spec: String) {
@@ -148,6 +190,6 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
 
     companion object {
         const val NAME = "engreader.db"
-        const val VERSION = 2
+        const val VERSION = 3
     }
 }

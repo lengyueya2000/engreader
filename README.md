@@ -7,6 +7,7 @@
 | 模块 | 说明 |
 | --- | --- |
 | **划词查词** | 点单词弹出释义卡片：音标、词性分组的释义、考频分级、发音。点按偏移量由文本布局反查，点到标点不会误判 |
+| **导入书籍** | 从手机里选 EPUB / MOBI / AZW3 整本导入，自动拆成章节存进本机，之后离线按章阅读。划词、翻译、朗读、长难句、自测对导入的书同样可用 |
 | **段落中文翻译** | 每段英文下方附中文译文，可随时开关。首次打开某篇需联网获取，之后存在本机；内置选段的译文随包提供，离线也能看 |
 | **多义消歧** | `found` 既是"建立"又是 `find` 的过去式，`left` 既是"左边的"又是 `leave`。按语料词频排序，主释义之外提供"另一种理解"一键切换 |
 | **生词本** | 一键收藏，正文中已收藏的词带下划线高亮；支持搜索、按待复习/常错/已掌握筛选；每个词可写笔记，复习时一并显示 |
@@ -28,6 +29,24 @@
 - **外刊全文**：各媒体公开发布的 RSS 与网页（卫报、BBC、纽约时报、经济学人），仅用于个人学习阅读
 - **段落译文**：Google 翻译的公开接口，失败时降级到 MyMemory；需要网络，译文保存在本机
 - **朗读语音**：[Piper](https://github.com/rhasspy/piper) 的 VITS 模型，用 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 推理。英式 `en_GB-alan-medium`（[mimic3-voices](https://github.com/MycroftAI/mimic3-voices) 的 apope 录音）、美式 `en_US-lessac-medium`（LibriTTS/Blizzard 系公开录音）、纪录片解说音色来自 [VCTK](https://datashare.ed.ac.uk/handle/10283/3443) 语料的 p274 说话人（CC BY 4.0）。音素化用 espeak-ng 的英语数据
+
+## 导入书籍
+
+首页右上角的加号选一个文件，整本书会被拆成章节写进本机数据库，之后不联网也能读。格式按**文件内容**判断，不看扩展名：认不出就明确拒绝，不会把乱码当正文存进来。
+
+| 格式 | 容器 | 正文压缩 |
+| --- | --- | --- |
+| EPUB | zip + OPF manifest/spine | 直接是 XHTML |
+| MOBI | PalmDB + PalmDOC header | 不压缩 / PalmDOC LZ77 / HUFF-CDIC |
+| AZW3 (KF8) | 同上，MOBI header version ≥ 8 | 同上，正文按 FDST 分片裁剪 |
+
+解析器是纯 JVM 的（`book/` 目录不碰 Android SDK），所以 `app/src/test/` 能直接对着真实文件跑：仓库里的合成 fixture 覆盖每种压缩方式与错误路径，另有 4 个用例对着 25 MB 的《傲慢与偏见》EPUB / MOBI / AZW3 跑（用 `-Pengreader.bookFixtures=<目录>` 指定书所在目录，没有就跳过）。
+
+设计上有一个决定值得说明：**一章就是一条普通的 `article` 行**，只是多了 `bookId` / `chapterIndex` 两个字段。因此阅读器、词库、语法面板、自测、朗读全都不需要为书写一份分支——书和文章的差别只剩"有没有下一章"。反过来，`ArticleRepository.recent()/saved()/all()` 会过滤 `bookId = 0`，一本小说不会把首页的文章列表冲掉。
+
+目录标签是脏活。同一本《傲慢与偏见》，三个格式给出三种东西：EPUB 的 NCX 里每章写的是 `I hope Mr. Bingley will like it. CHAPTER II.`（插图的说明文字加章节号），MOBI 把 `CHAPTER II.` 排成一个居中段落而不是 `<h2>`，AZW3 又换了一套。所以标签的取法是有序降级：真实标题（`<h1>`–`<h3>`）优先，其次在章节开头 400 字符里找章节标记，标记前若是 `Heading to` / `Tailpiece to` 这类插图说明则跳过。反过来，导航文档里带的标签也会被同样清理，`... CHAPTER II.` 只留 `CHAPTER II`。这一条有单测，因为靠肉眼在七十条目录里发现问题并不现实。
+
+正文换行也踩过一次坑：转换过的书把段落按 72 列硬换行，所以一个段落横跨多行源码。如果按源码换行切段，一句话会被切成两半，阅读器里段落碎掉、语法拆解拿到的是残句。现在的做法是先把块级标签替换成一个哨兵字符，再把所有空白（含源码换行）压平，最后按哨兵分段——段落的边界只来自标签，不来自排版。
 
 ## 朗读语音
 
@@ -80,13 +99,17 @@ python tools/build_translations.py  # 为内置选段补中文译文（写回同
 ./gradlew :app:assembleDebug      # 调试包（每个 ABI 一个）
 ./gradlew :app:testDebugUnitTest  # 单元测试
 ./gradlew :app:assembleRelease    # 发布包（需 keystore.properties）
+
+# 拿真实电子书跑解析器的单测（可选，没有就跳过这些用例）
+./gradlew :app:testDebugUnitTest -Pengreader.bookFixtures=/path/to/books
 ```
 
 语音模型与 sherpa-onnx 引擎已随仓库提供，无需额外步骤：模型在 `app/src/main/assets/tts/`，引擎是 `app/libs/sherpa-onnx.aar`（sherpa-onnx 没有 Maven 产物，因此随仓库提供）。构建按 ABI 拆包，`arm64-v8a` 给真机、`x86_64` 给模拟器；`armeabi-v7a` 与 `x86` 被排除，因为语音模型 60 MB，32 位进程放不下。
 
-`tools/build_dict.py` 与 `tools/build_seed.py` 需要把原始数据放在 `tools/raw/`（该目录已 git-ignore）：
-`ecdict.csv`、`lemma.en.txt` 来自 ECDICT 仓库，`pg*.txt` 来自 Project Gutenberg。
+`tools/build_dict.py` 与 `tools/build_seed.py` 需要把原始数据放在 `tools/raw/`（该目录已 git-ignore）：`ecdict.csv`、`lemma.en.txt` 来自 ECDICT 仓库，`pg*.txt` 来自 Project Gutenberg。
 `build_translations.py` 只处理内置选段（8 篇、约 70 段），需要网络；外刊译文由 App 在运行时按需获取。
+
+`tools/book/` 下的两个脚本是解析器的对拍工具：`reference_mobi.py` 是一份独立的 Python MOBI 解压实现，用来给 Kotlin 端口产出期望值；`build_fixtures.py` 生成 `app/src/test/resources/book/` 里的合成 fixture（每种压缩方式、尾随条目、加密、截断各一份）。改动 MOBI 解析后先跑一遍单测，比对着真书肉眼检查快得多。
 
 ### 发布签名
 
@@ -113,9 +136,10 @@ keyPassword=...
 
 ```
 app/src/main/java/com/engreader/app/
-├── data/           SQLite 存储与仓储（文章、生词本、进度、设置）
+├── data/           SQLite 存储与仓储（文章、书籍、生词本、进度、设置）
 │   ├── UserDb              用户数据表结构
 │   ├── ArticleRepository   抓取→存储→列表
+│   ├── BookRepository      导入→拆章入库→封面落盘→删除与进度
 │   ├── WordbookRepository  生词本与 Leitner 调度
 │   └── ProgressRepository  跨表统计汇总
 ├── dict/           离线词库
@@ -123,6 +147,12 @@ app/src/main/java/com/engreader/app/
 │   ├── WordEntry           词条、CEFR 近似分级、英文释义行
 │   ├── WordFamily          解析 `exchange` 列的屈折形式，按词干补全派生词
 │   └── PartOfSpeechParser  词性标记解析、后缀启发式与缩写展开表
+├── book/           导入书籍解析（纯 JVM，可单测）
+│   ├── BookFormat          按文件内容识别 EPUB / MOBI / AZW3，认不出或加密则明确报错
+│   ├── BookText            HTML → 段落文本；章节标题的降级取法
+│   ├── EpubParser          zip + OPF manifest/spine + NCX/nav 目录
+│   ├── MobiParser          PalmDB + PalmDOC + HUFF-CDIC + KF8（FDST 分片）
+│   └── BookPicker          系统文件选择器的 MIME 类型与文件名回查
 ├── nlp/            文本分析（纯 JVM，可单测）
 │   ├── Sentences           句子切分（处理缩写、小数、引号）
 │   ├── Paragraphs          段落与词元偏移
@@ -151,17 +181,18 @@ app/src/main/java/com/engreader/app/
 
 ## 数据库
 
-用户数据在本机 SQLite（`engreader.db`），当前 schema 版本 **2**。
+用户数据在本机 SQLite（`engreader.db`），当前 schema 版本 **3**。
 
 | 表 | 内容 |
 | --- | --- |
-| `article` | 抓取与内置的文章；`vocabProfile` 缓存该篇的实词表（换行分隔），换设备重算即可 |
+| `article` | 抓取与内置的文章，以及导入书籍的章节（`bookId > 0`）；`vocabProfile` 缓存该篇的实词表（换行分隔），换设备重算即可 |
+| `book` | 导入的书：标题、作者、格式、原文件名、封面文件名、章节数、阅读进度与累计时长 |
 | `word` | 生词本：Leitner 盒号、到期时间、正确/错误次数、个人笔记 |
 | `lookup` | 每次查词；`sentence`/`surface` 记下当时的原句与词形，供复习卡还原语境 |
 | `session` | 每次退出阅读器写入一条，用于时长、连续天数与阅读速度 |
 | `quiz` | 自测成绩 |
 
-升级走 `onUpgrade` 里的 `ALTER TABLE`，不清表：v1 → v2 只是给 `lookup` 加 `sentence`/`surface`、给 `article` 加 `vocabProfile` 并建 `idx_lookup_lemma`。每条语句前都查一次 `PRAGMA table_info`，所以中途失败后重跑是安全的。早期版本直接 drop 重建，在只有测试数据时无所谓，但会连生词本和阅读历史一起清掉。
+升级走 `onUpgrade` 里的 `ALTER TABLE`，不清表：v1 → v2 给 `lookup` 加 `sentence`/`surface`、给 `article` 加 `vocabProfile` 并建 `idx_lookup_lemma`；v2 → v3 给 `article` 加 `bookId`/`chapterIndex`（默认 0，所以旧文章自动都是"非书籍"）、建 `book` 表与 `idx_article_book`。每条语句前都查一次 `PRAGMA table_info`，所以中途失败后重跑是安全的。早期版本直接 drop 重建，在只有测试数据时无所谓，但会连生词本和阅读历史一起清掉。
 
 ## 设计
 
@@ -183,3 +214,6 @@ app/src/main/java/com/engreader/app/
 - 阅读速度是估算：`session` 存的是文章总词数，读到一半也按全文计入，所以数值偏快；看两周之间的趋势比看绝对值有意义
 - 生词本的"已掌握/答对过"只按本机记录判断，换设备或清数据后需要重新积累
 - 理解题为自动生成，考察词汇与指代，不覆盖全文主旨理解
+- **导入的书只保留文字**：插图、表格与排版样式都不会进入正文，一本书导入后就是"章节 + 段落"。这是刻意的——正文进的是 `article` 表，阅读器只认识段落，把图片接进来等于为书再写一套渲染
+- **加密书（DRM）会被拒绝**：MOBI 的 `encryptionType` 非 0、或 EPUB 带加密清单，都会明确提示而不是解出乱码
+- **导入是本机行为**：解析在设备上完成，不联网、不上传；但一本书按章节全量入库，几十 MB 的书导入要几秒到几十秒，期间界面会显示正在导入

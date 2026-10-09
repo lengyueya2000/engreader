@@ -52,6 +52,8 @@ class AppContainer(context: Context) {
 
     val articles = ArticleRepository(userDb, fetcher, grader, vocabulary)
 
+    val books = BookRepository(appContext, userDb, grader)
+
     val wordbook = WordbookRepository(userDb, dictionary)
 
     val progress = ProgressRepository(userDb, dictionary)

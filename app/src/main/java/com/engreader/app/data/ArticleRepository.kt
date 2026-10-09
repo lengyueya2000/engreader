@@ -122,22 +122,51 @@ class ArticleRepository(
             .use { if (it.moveToFirst()) it.toArticle() else null }
     }
 
-    /** Recently opened or saved articles, most recent first. */
+    /** Recently opened or saved articles, most recent first. Book chapters are excluded. */
     suspend fun recent(limit: Int = 40): List<Article> = withContext(Dispatchers.IO) {
         db.readableDatabase.rawQuery(
-            "$SELECT WHERE lastReadAt > 0 ORDER BY lastReadAt DESC LIMIT ?",
+            "$SELECT WHERE lastReadAt > 0 AND bookId = 0 ORDER BY lastReadAt DESC LIMIT ?",
             arrayOf(limit.toString()),
         ).use { it.toArticles() }
     }
 
     suspend fun saved(): List<Article> = withContext(Dispatchers.IO) {
-        db.readableDatabase.rawQuery("$SELECT WHERE saved = 1 ORDER BY fetchedAt DESC", null)
-            .use { it.toArticles() }
+        db.readableDatabase.rawQuery(
+            "$SELECT WHERE saved = 1 AND bookId = 0 ORDER BY fetchedAt DESC", null,
+        ).use { it.toArticles() }
     }
 
-    /** Every stored article, used by the stats screen and by the quiz generator. */
+    /**
+     * Every stored article, used by the stats screen and by the quiz generator.
+     *
+     * Book chapters are left out: they are listed through their book, and including
+     * them would make the shelf look like it held four hundred articles the moment a
+     * novel was imported.
+     */
     suspend fun all(): List<Article> = withContext(Dispatchers.IO) {
-        db.readableDatabase.rawQuery("$SELECT ORDER BY fetchedAt DESC", null).use { it.toArticles() }
+        db.readableDatabase.rawQuery(
+            "$SELECT WHERE bookId = 0 ORDER BY fetchedAt DESC", null,
+        ).use { it.toArticles() }
+    }
+
+    /**
+     * Chapters of one book, in reading order.
+     *
+     * Chapters are ordered by `chapterIndex`, never by `fetchedAt`: they are written
+     * in one transaction and would otherwise be at the mercy of how the insert loop
+     * happened to time them.
+     */
+    suspend fun bookChapters(bookId: Long): List<Article> = withContext(Dispatchers.IO) {
+        db.readableDatabase.rawQuery(
+            "$SELECT WHERE bookId = ? ORDER BY chapterIndex ASC", arrayOf(bookId.toString()),
+        ).use { it.toArticles() }
+    }
+
+    suspend fun chapterAt(bookId: Long, index: Int): Article? = withContext(Dispatchers.IO) {
+        db.readableDatabase.rawQuery(
+            "$SELECT WHERE bookId = ? AND chapterIndex = ? LIMIT 1",
+            arrayOf(bookId.toString(), index.toString()),
+        ).use { if (it.moveToFirst()) it.toArticle() else null }
     }
 
     suspend fun setSaved(id: Long, saved: Boolean) = withContext(Dispatchers.IO) {
@@ -269,6 +298,8 @@ class ArticleRepository(
             quiz = parseQuiz(getString(getColumnIndexOrThrow("quizJson"))),
             translation = decodeTranslation(getString(getColumnIndexOrThrow("translation"))),
             vocabProfile = getString(getColumnIndexOrThrow("vocabProfile")),
+            bookId = getLong(getColumnIndexOrThrow("bookId")),
+            chapterIndex = getInt(getColumnIndexOrThrow("chapterIndex")),
         )
     }
 
@@ -300,7 +331,8 @@ class ArticleRepository(
     private companion object {
         const val SELECT =
             "SELECT id, sourceId, title, subtitle, url, author, publishedAt, difficulty, body, " +
-                "saved, fetchedAt, lastReadAt, readSeconds, quizJson, translation, vocabProfile " +
+                "saved, fetchedAt, lastReadAt, readSeconds, quizJson, translation, vocabProfile, " +
+                "bookId, chapterIndex " +
                 "FROM article"
     }
 }

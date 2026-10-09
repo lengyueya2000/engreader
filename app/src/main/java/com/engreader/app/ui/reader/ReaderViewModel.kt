@@ -7,6 +7,8 @@ import androidx.lifecycle.ViewModel
 import com.engreader.app.data.AppContainer
 import com.engreader.app.dict.WordEntry
 import com.engreader.app.model.Article
+import com.engreader.app.model.Book
+import com.engreader.app.model.ChapterRef
 import com.engreader.app.model.QuizQuestion
 import com.engreader.app.nlp.NewWord
 import com.engreader.app.nlp.Paragraph
@@ -79,6 +81,16 @@ data class ReaderState(
     val newWords: List<NewWord> = emptyList(),
     /** True while the pre-study list of the article's new words is open. */
     val newWordsVisible: Boolean = false,
+    /**
+     * Set when this article is a chapter of an imported book.
+     *
+     * A chapter reads exactly like an article — that is the whole design — so this is
+     * only used for the extras that need the book around it: the table-of-contents
+     * sheet, the previous/next chapter buttons and the progress write-back.
+     */
+    val book: Book? = null,
+    val chapters: List<ChapterRef> = emptyList(),
+    val contentsVisible: Boolean = false,
 )
 
 /** A sentence with its position in the flattened article, for TTS queueing. */
@@ -200,6 +212,15 @@ class ReaderViewModel(
         )
         container.articles.markOpened(articleId)
         sessionStart = System.currentTimeMillis()
+        // A chapter of a book also advances the book: this is what makes "continue
+        // reading" on the shelf point at the chapter the reader actually stopped in,
+        // rather than at whatever chapter was opened most recently by any route.
+        if (article.bookId > 0) {
+            val book = container.books.bookOfChapter(articleId)
+            val chapters = container.books.chapters(article.bookId)
+            state = state.copy(book = book, chapters = chapters)
+            container.books.markOpened(article.bookId, article.chapterIndex)
+        }
         container.speaker.prepare(
             rate = settings.speechRate,
             localeTag = settings.speechLocale,
@@ -262,12 +283,43 @@ class ReaderViewModel(
         if (seconds <= 0) return
         sessionStart = now
         val words = state.article?.wordCount ?: 0
+        val bookId = state.article?.bookId ?: 0
         val count = lookups
         lookups = 0
         container.appScope.launch {
             container.wordbook.recordSession(articleId, seconds, words, count)
             container.articles.addReadSeconds(articleId, seconds)
+            // Time on a chapter is time on the book: without this the shelf would show
+            // a book that was read for an hour as never having been opened.
+            if (bookId > 0) container.books.addReadSeconds(bookId, seconds)
         }
+    }
+
+    // ------------------------------------------------------------- chapters
+
+    fun setContentsVisible(visible: Boolean) {
+        state = state.copy(contentsVisible = visible)
+    }
+
+    /** Chapter before or after this one, for the reader's footer buttons. */
+    fun chapterNeighbour(offset: Int): ChapterRef? {
+        val article = state.article ?: return null
+        if (article.bookId <= 0) return null
+        return state.chapters.firstOrNull { it.index == article.chapterIndex + offset }
+    }
+
+    /**
+     * Resolves a chapter index to the article that holds it.
+     *
+     * The screen navigates by pushing a new reader overlay for the target chapter, so
+     * this only has to answer "which article is that"; the reading position is written
+     * here rather than left to the new chapter's own load, so that opening a chapter
+     * and immediately backing out still moves the bookmark.
+     */
+    suspend fun articleIdOfChapter(bookId: Long, index: Int): Long? {
+        val id = container.books.chapterIdAt(bookId, index) ?: return null
+        container.books.markOpened(bookId, index)
+        return id
     }
 
     // ------------------------------------------------------------- look-ups
