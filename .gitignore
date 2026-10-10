@@ -11,3 +11,7 @@ captures/
 tools/raw/
 
 .verify/
+
+# Release APKs are published to GitHub Releases, not committed:
+# https://github.com/lengyueya2000/engreader/releases
+dist/
