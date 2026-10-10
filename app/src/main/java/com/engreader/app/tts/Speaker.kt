@@ -168,6 +168,19 @@ class Speaker(private val context: Context) {
     }
 
     /**
+     * Prepares [text] so the next [speak] for it starts without a wait.
+     *
+     * Called for the sentence after the one being spoken. Synthesis runs at roughly a
+     * seventh of real time, so without this the reader hears the whole synthesis as a
+     * pause between sentences.
+     */
+    fun prefetch(text: String) {
+        if (_state.value != SpeechState.Ready || oneShot) return
+        if (_backend.value != SpeechBackend.Bundled) return
+        neural.prefetch(text, rate)
+    }
+
+    /**
      * Speaks one sentence.
      *
      * [utteranceId] comes back on the matching [SpeechEvent], which is how the reader

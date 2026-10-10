@@ -34,6 +34,17 @@ object BookText {
     )
 
     private val ANY_TAG = Regex("(?is)</?[A-Za-z]${Html.ATTRS}>")
+
+    /**
+     * XML declarations and the doctype, which are not elements.
+     *
+     * An XHTML chapter file opens with `<?xml version="1.0" encoding="utf-8"?>` and
+     * `<!DOCTYPE html>`. [ANY_TAG] requires a letter after the optional `/`, so neither
+     * matched and both were left in the chapter text — every imported book opened with
+     * a line of markup, which the translator then dutifully turned into Chinese.
+     */
+    private val DECLARATION = Regex("(?is)<\\?.*?\\?>|<!DOCTYPE\\b[^>]*>")
+
     private val COMMENT = Regex("(?s)<!--.*?-->")
     private val SENTENCE_END = Regex("[.!?][\"'\\u201D\\u2019)]*\\s*$")
 
@@ -98,6 +109,7 @@ object BookText {
      */
     fun fromHtml(html: String): String {
         var s = COMMENT.replace(html, " ")
+        s = DECLARATION.replace(s, " ")
         s = dropElements(s)
         s = BLOCK_OPEN.replace(s, BREAK)
         s = BLOCK_CLOSE.replace(s, BREAK)

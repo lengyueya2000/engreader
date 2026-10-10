@@ -318,6 +318,26 @@ class BookParserTest {
         assertEquals("&amp;", BookText.fromHtml("<p>&amp;amp;</p>"))
     }
 
+    @Test
+    fun `an xml declaration and doctype are not left in the chapter text`() {
+        // Every XHTML chapter file opens with these, and neither is an element, so the
+        // tag pattern missed them: each imported chapter began with a line of markup,
+        // which the translator then turned into Chinese.
+        val text = BookText.fromHtml(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<!DOCTYPE html>\n" +
+                "<html><body><p>Mr. Bennet was among the earliest.</p></body></html>"
+        )
+        assertEquals("Mr. Bennet was among the earliest.", text)
+    }
+
+    @Test
+    fun `a processing instruction is dropped wherever it appears`() {
+        assertEquals(
+            "before after",
+            BookText.fromHtml("<p>before <?php echo 1 ?> after</p>"),
+        )
+    }
+
     // ---------------------------------------------------- review regressions
 
     @Test

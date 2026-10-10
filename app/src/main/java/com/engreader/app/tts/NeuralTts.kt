@@ -71,9 +71,27 @@ class NeuralTts(private val context: Context) {
     @Volatile
     private var loadedSid: Int = 0
 
-    /** Serialises synthesis; sherpa's generate is blocking and CPU-bound. */
-    private val worker = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "neural-tts").apply { priority = Thread.NORM_PRIORITY + 1 }
+    /**
+     * Owns the native engine: loading, synthesis and release all run here.
+     *
+     * One thread is what keeps the engine safe — `generate` and `release` must never
+     * overlap, and sherpa's engine is not documented as reentrant.
+     */
+    private val engineWorker = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "neural-tts-engine").apply { priority = Thread.NORM_PRIORITY + 1 }
+    }
+
+    /**
+     * Owns the [AudioTrack].
+     *
+     * Deliberately not [engineWorker]. When both lived on one thread the engine only
+     * started on a sentence once the previous one had finished playing, so the
+     * synthesis time — 1.5 s for a short sentence, over 5 s for a long one — was
+     * heard as a pause between sentences. Splitting them lets [prefetch] generate the
+     * next sentence while the current one is still coming out of the speaker.
+     */
+    private val playbackWorker = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "neural-tts-play")
     }
 
     /**
@@ -85,6 +103,45 @@ class NeuralTts(private val context: Context) {
      * shared flag that a later utterance could clear by accident.
      */
     private val generation = AtomicInteger(0)
+
+    /**
+     * Bumped whenever the engine or the voice changes.
+     *
+     * A prefetch is generated without an utterance token of its own, so it cannot use
+     * [generation]: it belongs to the voice, not to the sentence that happens to be
+     * playing. This is what makes a voice switch discard a clip recorded for the old
+     * one.
+     */
+    private val engineGeneration = AtomicInteger(0)
+
+    /**
+     * One synthesised sentence.
+     *
+     * [generation] is the [engineGeneration] it was made under, so a clip recorded for
+     * a voice that has since been replaced is never played.
+     */
+    private class Clip(
+        val text: String,
+        val rate: Float,
+        val sid: Int,
+        val samples: FloatArray,
+        val sampleRate: Int,
+        val generation: Int,
+    ) {
+        /** True when this clip is the audio for exactly this request. */
+        fun matches(text: String, rate: Float, sid: Int, engineGen: Int): Boolean =
+            this.text == text && this.rate == rate && this.sid == sid && generation == engineGen
+    }
+
+    /** The one-sentence look-ahead, or null. See [prefetch]. */
+    @Volatile
+    private var prefetched: Clip? = null
+
+    /** Text of the clip currently being generated, so a repeat is not queued twice. */
+    private var prefetchingText: String? = null
+
+    /** Guards [prefetched] and [prefetchingText], which two threads touch. */
+    private val prefetchLock = Any()
 
     /** The track currently playing, so [stop] can silence it. */
     @Volatile
@@ -112,7 +169,12 @@ class NeuralTts(private val context: Context) {
         // process rather than throw. Queueing behind the worker means the load cannot
         // start until the previous utterance has left the engine alone.
         stop()
-        val task = worker.submit<Boolean> {
+        // Invalidates anything recorded for the voice being replaced. `stop` clears the
+        // clip already held, but a prefetch queued before this call is still ahead of
+        // the load on the worker, so it would otherwise finish and store a clip of the
+        // old voice that a later `speak` would happily play.
+        engineGeneration.incrementAndGet()
+        val task = engineWorker.submit<Boolean> {
             releaseLocked()
             runCatching {
                 espeakDir = ensureEspeakData()
@@ -151,10 +213,14 @@ class NeuralTts(private val context: Context) {
     /**
      * Speaks [text], reporting progress through the callbacks.
      *
-     * Returns immediately; synthesis and playback both run on [worker]. [onDone]
-     * fires only after the audio has finished playing, which is what keeps the
-     * reader's sentence highlight in step with the voice. Callbacks arrive on a
-     * background thread, so a caller that touches UI must hop to the main thread.
+     * Returns immediately; synthesis runs on [engineWorker] and playback on
+     * [playbackWorker]. [onDone] fires only after the audio has finished playing,
+     * which is what keeps the reader's sentence highlight in step with the voice.
+     * Callbacks arrive on a background thread, so a caller that touches UI must hop
+     * to the main thread.
+     *
+     * A clip recorded by [prefetch] is played straight away; without that, the wait
+     * between two sentences would be the whole synthesis time.
      */
     fun speak(
         text: String,
@@ -170,32 +236,109 @@ class NeuralTts(private val context: Context) {
         }
         val token = generation.incrementAndGet()
         val sid = loadedSid
-        worker.execute { runUtterance(engine, text, rate, sid, token, onStart, onDone, onError) }
+        val engineGen = engineGeneration.get()
+        takePrefetched(text, rate, sid, engineGen)?.let { clip ->
+            playbackWorker.execute { play(clip, token, onStart, onDone, onError) }
+            return
+        }
+        engineWorker.execute {
+            // A prefetch for this very sentence may have been queued ahead of this
+            // task; the FIFO worker means it has finished by now, so look again
+            // before paying for a second synthesis of the same text.
+            takePrefetched(text, rate, sid, engineGen)?.let { clip ->
+                playbackWorker.execute { play(clip, token, onStart, onDone, onError) }
+                return@execute
+            }
+            // `release` runs on this same worker, so an engine that is no longer the
+            // current one has already been freed and must not be touched.
+            if (tts !== engine) {
+                onError()
+                return@execute
+            }
+            val audio = try {
+                engine.generate(text = text, sid = sid, speed = rate)
+            } catch (error: Throwable) {
+                Log.w(TAG, "synthesis failed", error)
+                onError()
+                return@execute
+            }
+            if (audio.samples.isEmpty()) {
+                Log.w(TAG, "synthesis produced no audio for ${text.length} chars")
+                onError()
+                return@execute
+            }
+            val clip = Clip(text, rate, sid, audio.samples, audio.sampleRate, engineGen)
+            playbackWorker.execute { play(clip, token, onStart, onDone, onError) }
+        }
     }
 
-    private fun runUtterance(
-        engine: OfflineTts,
-        text: String,
-        rate: Float,
-        sid: Int,
+    /**
+     * Synthesises [text] ahead of time, so [speak] can start it without a wait.
+     *
+     * The reader calls this for the sentence after the one it just started, which is
+     * what removes the silence between sentences: synthesis takes 0.3 s for a short
+     * sentence and over 5 s for a long one, and that whole time used to sit between
+     * two sentences as an audible pause.
+     *
+     * One sentence is held at a time — a novel's paragraph is a handful of sentences,
+     * so a deeper queue would buy nothing and hold megabytes of samples. A request
+     * that arrives while the engine is busy with an earlier one is dropped rather
+     * than queued: the next [speak] will synthesise it if it is still wanted.
+     */
+    fun prefetch(text: String, rate: Float) {
+        val engine = tts ?: return
+        if (text.isBlank()) return
+        val sid = loadedSid
+        val engineGen = engineGeneration.get()
+        synchronized(prefetchLock) {
+            if (prefetched?.matches(text, rate, sid, engineGen) == true) return
+            if (prefetchingText == text) return
+            prefetchingText = text
+        }
+        engineWorker.execute {
+            // The engine was replaced while this was queued; generating now would
+            // either use a freed native handle or record a clip for the wrong voice.
+            if (engineGeneration.get() != engineGen || tts !== engine) {
+                synchronized(prefetchLock) { if (prefetchingText == text) prefetchingText = null }
+                return@execute
+            }
+            val audio = runCatching { engine.generate(text = text, sid = sid, speed = rate) }.getOrNull()
+            synchronized(prefetchLock) {
+                if (prefetchingText == text) prefetchingText = null
+                val samples = audio?.samples
+                // A clip nobody asked for is harmless — `speak` only takes the one
+                // whose text and voice match — so no utterance token is checked here.
+                // Checking one would drop the clip in the normal case, because the
+                // next `speak` bumps the token while this generation is still running.
+                if (samples != null && samples.isNotEmpty() && engineGeneration.get() == engineGen) {
+                    prefetched = Clip(text, rate, sid, samples, audio.sampleRate, engineGen)
+                }
+            }
+        }
+    }
+
+    /** Removes and returns the held clip when it is the one asked for. */
+    private fun takePrefetched(text: String, rate: Float, sid: Int, engineGen: Int): Clip? =
+        synchronized(prefetchLock) {
+            val held = prefetched ?: return@synchronized null
+            if (!held.matches(text, rate, sid, engineGen)) return@synchronized null
+            prefetched = null
+            held
+        }
+
+    /**
+     * Plays one synthesised clip to the end.
+     *
+     * Runs on [playbackWorker]; the token is checked between chunks so a skip cuts
+     * the audio within tens of milliseconds.
+     */
+    private fun play(
+        clip: Clip,
         token: Int,
         onStart: () -> Unit,
         onDone: () -> Unit,
         onError: () -> Unit,
     ) {
-        val audio = try {
-            engine.generate(text = text, sid = sid, speed = rate)
-        } catch (error: Throwable) {
-            Log.w(TAG, "synthesis failed", error)
-            onError()
-            return
-        }
-        val samples = audio.samples
-        if (samples.isEmpty()) {
-            Log.w(TAG, "synthesis produced no audio for ${text.length} chars")
-            onError()
-            return
-        }
         // Superseded before a single sample played: this is a skip, not a failure.
         // Reporting it as one stopped playback outright, because the reader treats a
         // failure as "the voice is gone" while a skip is just the next sentence
@@ -204,14 +347,13 @@ class NeuralTts(private val context: Context) {
             onDone()
             return
         }
-
         var output: AudioTrack? = null
         try {
-            output = openTrack(audio.sampleRate)
+            output = openTrack(clip.sampleRate)
             track = output
             output.play()
             onStart()
-            writeInChunks(output, samples, token)
+            writeInChunks(output, clip.samples, token)
             if (!stale(token)) waitForDrain(output)
             // Reported as finished either way. A superseded utterance is not a
             // failure — the reader's `Finished` handler already ignores an id it has
@@ -237,26 +379,33 @@ class NeuralTts(private val context: Context) {
      */
     fun stop() {
         generation.incrementAndGet()
-        // Pause and flush rather than release: the worker owns the track and releases
-        // it, so releasing here would leave that thread writing to a freed handle.
+        // Pause and flush rather than release: the playback worker owns the track and
+        // releases it, so releasing here would leave that thread writing to a freed
+        // handle.
         runCatching { track?.pause() }
         runCatching { track?.flush() }
+        // A held clip belongs to the utterance just abandoned; keeping it would play
+        // the wrong sentence if the reader resumes on the same text.
+        synchronized(prefetchLock) { prefetched = null }
     }
 
     /**
      * Releases the engine, waiting for any utterance in flight to leave it.
      *
      * `release` on the caller's thread used to free the native `OfflineTts` while the
-     * worker could still be inside its blocking `generate`, which is a native
+     * engine worker could still be inside its blocking `generate`, which is a native
      * use-after-free — a crash no `runCatching` can catch. Queueing the release behind
-     * the worker means the engine is only freed once the worker has finished with it.
+     * the engine worker means the engine is only freed once that worker has finished
+     * with it. The playback worker is not waited on: it touches samples that are
+     * already a plain `FloatArray` in Kotlin, not the native engine.
      */
     fun release() {
         stop()
-        runCatching { worker.submit { releaseLocked() }.get() }
+        engineGeneration.incrementAndGet()
+        runCatching { engineWorker.submit { releaseLocked() }.get() }
     }
 
-    /** Frees the engine. Must run on [worker] only. */
+    /** Frees the engine. Must run on [engineWorker] only. */
     private fun releaseLocked() {
         runCatching { tts?.release() }
         tts = null
@@ -266,8 +415,10 @@ class NeuralTts(private val context: Context) {
 
     fun shutdown() {
         stop()
-        runCatching { worker.submit { releaseLocked() }.get() }
-        worker.shutdown()
+        engineGeneration.incrementAndGet()
+        runCatching { engineWorker.submit { releaseLocked() }.get() }
+        engineWorker.shutdown()
+        playbackWorker.shutdown()
     }
 
     /** True once this utterance has been superseded by a stop or a newer one. */

@@ -587,6 +587,11 @@ class ReaderViewModel(
         lastSpokenIndex = index
         state = state.copy(speakingSentence = index, listening = true)
         container.speaker.speak(sentences[index].text, "sentence:$index")
+        // The next sentence is synthesised while this one plays. Synthesis takes a
+        // sizeable fraction of the sentence's own duration, and that time used to be
+        // heard as a pause between sentences; the engine generates on its own thread,
+        // so this overlaps with playback rather than delaying it.
+        sentences.getOrNull(index + 1)?.let { container.speaker.prefetch(it.text) }
     }
 
     private fun observeSpeech(scope: CoroutineScope) {
