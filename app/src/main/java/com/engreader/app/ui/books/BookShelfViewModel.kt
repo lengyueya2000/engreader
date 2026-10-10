@@ -8,6 +8,7 @@ import android.net.Uri
 import com.engreader.app.book.BookPicker
 import com.engreader.app.data.AppContainer
 import com.engreader.app.model.Book
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -50,12 +51,29 @@ class BookShelfViewModel(private val container: AppContainer) : ViewModel() {
         val picked = withContext(Dispatchers.IO) { BookPicker.describe(container.appContext, uri) }
         state = state.copy(importing = picked.name, message = null, error = null)
         try {
+            // Importing the same file twice used to add a second copy: the URL
+            // uniqueness that protects articles is scoped per book id, so the chapters
+            // did not collide either and the shelf quietly grew a duplicate. The
+            // existing book is reported instead of parsed again.
+            val already = container.books.findByFileName(picked.name)
+            if (already != null) {
+                state = state.copy(
+                    importing = null,
+                    books = container.books.all(),
+                    message = "《${already.title}》已经导入过了",
+                )
+                return
+            }
             val book = container.books.import(uri, picked.name)
             state = state.copy(
                 importing = null,
                 books = container.books.all(),
                 message = "已导入《${book.title}》，共 ${book.chapterCount} 章",
             )
+        } catch (e: CancellationException) {
+            // The coroutine was cancelled, not the import: swallowing this would leave
+            // the shelf showing a spinner that never resolves.
+            throw e
         } catch (e: Exception) {
             state = state.copy(
                 importing = null,

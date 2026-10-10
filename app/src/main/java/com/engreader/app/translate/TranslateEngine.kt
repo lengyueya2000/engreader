@@ -230,9 +230,33 @@ class MyMemoryEngine : TranslateEngine {
     override fun translate(paragraphs: List<String>): List<String> {
         val bodies = paragraphs.map { it.trim() }
         return bodies.map { text ->
-            if (text.isEmpty()) text else splitForLimit(text, MAX_CHARS).joinToString("") { request(it) }
+            if (text.isEmpty()) text else joinPieces(splitForLimit(text, MAX_CHARS).map { request(it) })
         }
     }
+
+    /**
+     * Puts the pieces of one paragraph back together.
+     *
+     * Chinese needs no separator, so the pieces are joined directly. The exception is
+     * a boundary where the service echoed the English back untranslated: the split
+     * consumed the space between the two words, and gluing them together corrupts the
+     * sentence rather than merely spacing it oddly.
+     */
+    internal fun joinPieces(pieces: List<String>): String {
+        val out = StringBuilder()
+        for (piece in pieces) {
+            val last = out.lastOrNull()
+            val first = piece.firstOrNull()
+            if (last != null && first != null && isAsciiWordChar(last) && isAsciiWordChar(first)) {
+                out.append(' ')
+            }
+            out.append(piece)
+        }
+        return out.toString()
+    }
+
+    private fun isAsciiWordChar(c: Char): Boolean =
+        c in 'a'..'z' || c in 'A'..'Z' || c in '0'..'9'
 
     private fun request(text: String): String {
         val form = "q=" + TranslateHttp.encode(text) + "&langpair=en%7Czh-CN"

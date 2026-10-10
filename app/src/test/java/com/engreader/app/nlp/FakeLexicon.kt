@@ -83,6 +83,17 @@ class FakeLexicon(
             .distinct()
             .take(count)
 
+    /**
+     * Headwords, not glosses, mirroring the real dictionary's split: a reading-quiz
+     * option has to be an English word because the blank is in an English sentence.
+     */
+    override fun englishDistractors(entry: WordEntry, pos: PartOfSpeech, count: Int): List<String> =
+        entries.entries
+            .filter { it.value.first == pos && it.key != entry.lemma }
+            .map { it.key }
+            .distinct()
+            .take(count)
+
     private fun posMarker(pos: PartOfSpeech): String = when (pos) {
         PartOfSpeech.Noun -> "n."
         PartOfSpeech.Verb -> "v."

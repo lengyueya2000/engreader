@@ -61,6 +61,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.engreader.app.nlp.Paragraph
 import com.engreader.app.nlp.Sentence
 import com.engreader.app.tts.SpeechState
@@ -101,9 +105,9 @@ fun ReaderScreen(
     val listState = rememberLazyListState()
     var showTypography by remember { mutableStateOf(false) }
     var showQuiz by remember { mutableStateOf(false) }
-    val liveSpeechState by viewModel.speechState.collectAsStateCompat()
-    val liveVoice by viewModel.activeVoice.collectAsStateCompat()
-    val liveBackend by viewModel.speechBackend.collectAsStateCompat()
+    val liveSpeechState by viewModel.speechState.collectAsStateWithLifecycle()
+    val liveVoice by viewModel.activeVoice.collectAsStateWithLifecycle()
+    val liveBackend by viewModel.speechBackend.collectAsStateWithLifecycle()
 
     LaunchedEffect(articleId) { viewModel.load() }
 
@@ -111,12 +115,33 @@ fun ReaderScreen(
         onDispose { viewModel.flushProgress() }
     }
 
-    // Keep the sentence being read on screen during listening mode.
+    // Reading time and playback follow the app's own foreground state, not just this
+    // screen's: a reader who pockets the phone is not reading, and the wall clock used
+    // to keep counting. The listener is registered on the activity's lifecycle, which
+    // is the one that actually changes when the app is backgrounded.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_STOP -> viewModel.onEnterBackground()
+                Lifecycle.Event.ON_START -> viewModel.onEnterForeground()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // Keep the sentence being read on screen during listening mode. The list is the
+    // article header, an optional translation-failure notice, then one item per
+    // paragraph, so the paragraph's own index is offset by however many of those lead
+    // it — without the notice this used to scroll one item past the spoken sentence.
     LaunchedEffect(state.speakingSentence) {
         val index = state.speakingSentence
         if (index >= 0 && state.listening) {
             val paragraphIndex = state.flatSentences.getOrNull(index)?.paragraphIndex ?: return@LaunchedEffect
-            runCatching { listState.animateScrollToItem(paragraphIndex + 1) }
+            val leading = 1 + if (state.showTranslation && state.translationStatus == TranslationStatus.Failed) 1 else 0
+            runCatching { listState.animateScrollToItem(leading + paragraphIndex) }
         }
     }
 
@@ -261,6 +286,7 @@ fun ReaderScreen(
                             sentences = rp.sentences,
                             savedLemmas = state.savedLemmas,
                             highlightSaved = state.highlightSaved,
+                            listening = state.listening,
                             speakingText = state.flatSentences
                                 .getOrNull(state.speakingSentence)
                                 ?.takeIf { state.listening && it.paragraphIndex == index }
@@ -343,10 +369,10 @@ fun ReaderScreen(
                                     // The bookmark moves before the new chapter is even
                                     // opened, so a jump that fails to render still counts
                                     // as having read up to here.
+                                    val bookId = state.book?.id ?: return@ChapterNav
                                     scope.launch {
-                                        viewModel.articleIdOfChapter(
-                                            state.book!!.id, chapter.index,
-                                        )?.let { onOpenChapter(it) }
+                                        viewModel.articleIdOfChapter(bookId, chapter.index)
+                                            ?.let { onOpenChapter(it) }
                                     }
                                 },
                             )
@@ -373,10 +399,8 @@ fun ReaderScreen(
                     onOpenContents = { viewModel.setContentsVisible(true) },
                     onToggleSave = {
                         val article = state.article ?: return@ReaderTopBar
-                        scope.launch {
-                            viewModel.setSaved(!article.saved)
-                            onSavedChanged()
-                        }
+                        viewModel.setSaved(!article.saved)
+                        onSavedChanged()
                     },
                     onToggleListen = { viewModel.toggleListening(scope) },
                 )
@@ -424,7 +448,7 @@ fun ReaderScreen(
         NewWordsSheet(
             words = state.newWords,
             onDismiss = { viewModel.setNewWordsVisible(false) },
-            onSaveAll = { scope.launch { viewModel.saveUnknownWords() } },
+            onSaveAll = { viewModel.saveUnknownWords() },
             onSpeak = { viewModel.speakWord(it) },
         )
     }
@@ -480,19 +504,9 @@ fun ReaderScreen(
         QuizSheet(
             questions = state.quiz,
             onDismiss = { showQuiz = false },
-            onFinish = { correct, total ->
-                scope.launch { viewModel.recordQuiz(correct, total) }
-            },
+            onFinish = { correct, total -> viewModel.recordQuiz(correct, total) },
         )
     }
-}
-
-/** Bridges `StateFlow` into Compose state without pulling in collectAsStateWithLifecycle. */
-@Composable
-private fun <T> kotlinx.coroutines.flow.StateFlow<T>.collectAsStateCompat(): androidx.compose.runtime.State<T> {
-    val state = remember { mutableStateOf(value) }
-    LaunchedEffect(this) { collect { state.value = it } }
-    return state
 }
 
 @Composable
@@ -543,6 +557,8 @@ private fun ParagraphBlock(
     sentences: List<Sentence>,
     savedLemmas: Set<String>,
     highlightSaved: Boolean,
+    /** True while the article is being read aloud, so a tap jumps playback. */
+    listening: Boolean,
     speakingText: String?,
     translation: String?,
     translationLoading: Boolean,
@@ -599,18 +615,24 @@ private fun ParagraphBlock(
             fontFamily = FontFamily.Serif,
             modifier = Modifier
                 .fillMaxWidth()
-                .pointerInput(paragraph, sentences, speakingText) {
+                .pointerInput(paragraph, sentences, listening) {
                     detectTapGestures(
                         onTap = { position ->
                             val textLayout = layout ?: return@detectTapGestures
                             val offset = textLayout.getOffsetForPosition(position)
-                            val sentence = sentences.firstOrNull { offset in it.start until it.end }
-                            val word = com.engreader.app.nlp.Paragraphs.wordAt(paragraph, offset)
-                            if (speakingText != null && sentence != null) {
-                                val index = sentences.indexOf(sentence)
-                                if (index >= 0) onSentenceTapWhileListening(index)
-                            } else if (word != null) {
-                                onWordTap(word, sentence?.text ?: paragraph.text)
+                            // Matched by index rather than by the sentence object: two
+                            // sentences in one paragraph can be textually equal, and
+                            // `indexOf` would then always resolve to the first of them.
+                            val sentenceIndex = sentences.indexOfFirst { offset in it.start until it.end }
+                            val sentence = sentences.getOrNull(sentenceIndex)
+                            if (listening) {
+                                // While listening a tap is a request to jump playback to
+                                // that sentence, anywhere in the paragraph — not only
+                                // inside the one currently being spoken.
+                                if (sentenceIndex >= 0) onSentenceTapWhileListening(sentenceIndex)
+                            } else {
+                                val word = com.engreader.app.nlp.Paragraphs.wordAt(paragraph, offset)
+                                if (word != null) onWordTap(word, sentence?.text ?: paragraph.text)
                             }
                         },
                         onLongPress = { position ->

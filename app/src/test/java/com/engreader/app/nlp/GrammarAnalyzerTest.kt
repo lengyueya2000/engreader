@@ -3,6 +3,7 @@ package com.engreader.app.nlp
 import com.engreader.app.dict.PartOfSpeech
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -118,6 +119,43 @@ class GrammarAnalyzerTest {
             "The decision that the minister announced affected thousands of people.",
         )
         assertEquals(ClauseKind.Main, analysis.clauses.first().kind)
+    }
+
+    @Test
+    fun `a finite verb after a comma is not read as a non-finite clause`() {
+        // `published` is a participle marker by shape, so the tail of the sentence was
+        // cut off as a non-finite clause and the main verb disappeared with it.
+        val analysis = analyzer.analyze(
+            "The study, published in 2020, revealed the evidence.",
+        )
+        val main = analysis.clauses.first { it.kind == ClauseKind.Main && it.verb == "revealed" }
+        assertEquals("revealed", main.verb)
+        assertTrue("the backbone must carry the real predicate", analysis.backbone.contains("revealed"))
+    }
+
+    @Test
+    fun `a relative clause does not absorb the main verb`() {
+        // "announced affected" are two predicates; merging them left the relative
+        // clause holding both and the main clause with no verb at all.
+        val analysis = analyzer.analyze(
+            "The decision that the minister announced affected thousands of people.",
+        )
+        val relative = analysis.clauses.first { it.kind == ClauseKind.Relative }
+        assertEquals("announced", relative.verb)
+        val main = analysis.clauses.first { it.kind == ClauseKind.Main && it.verb == "affected" }
+        assertEquals("affected", main.verb)
+    }
+
+    @Test
+    fun `a fronted clause without a comma leaves the main subject with the main clause`() {
+        // The split fell in the middle of a clause, so the main clause was reported as
+        // starting at "the government" but carrying no verb of its own.
+        val analysis = analyzer.analyze(
+            "Because the plan was late the government announced the delay.",
+        )
+        val main = analysis.clauses.first { it.kind == ClauseKind.Main && it.verb.isNotBlank() }
+        assertEquals("the government", main.subject)
+        assertEquals("announced", main.verb)
     }
 
     @Test
@@ -340,6 +378,24 @@ class QuizBuilderTest {
             assertTrue(
                 "blank must not run into the next word: ${cloze.question}",
                 !Regex("_{2,}[A-Za-z]").containsMatchIn(cloze.question),
+            )
+        }
+    }
+
+    @Test
+    fun `options under an english blank are english words, not chinese glosses`() {
+        // When the article itself supplied fewer than three same-part-of-speech words
+        // the pool fell back to the *gloss* distractors, so the question offered a
+        // Chinese option under an English blank — which is not a wrong answer but a
+        // giveaway, since only one option is even in the right language.
+        val text = "The barrage was relentless throughout the long afternoon. " +
+            "Another barrage followed the first barrage, and the barrage continued."
+        val cloze = builder.build(text, maxQuestions = 3).firstOrNull { it.question.contains("______") }
+        assertNotNull("expected a cloze question", cloze)
+        cloze!!.options.forEach { option ->
+            assertTrue(
+                "option must be an English word: $option",
+                option.all { it.code < 0x2E80 },
             )
         }
     }

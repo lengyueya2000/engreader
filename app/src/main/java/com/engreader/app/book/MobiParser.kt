@@ -45,7 +45,6 @@ object MobiParser {
     /** MOBI header, immediately after the PalmDOC header. */
     private const val MOBI_TYPE = 24
     private const val MOBI_ENCODING = 28
-    private const val MOBI_VERSION = 36
     private const val MOBI_FULL_NAME_OFFSET = 84
     private const val MOBI_FULL_NAME_LENGTH = 88
     private const val MOBI_FIRST_IMAGE = 108
@@ -72,10 +71,23 @@ object MobiParser {
     fun parse(bytes: ByteArray): Book {
         val records = splitRecords(bytes)
         if (records.isEmpty()) throw BookFormat.Companion.Unsupported("这个 MOBI 文件是空的")
-        val header = records[0]
+        val header0 = records[0]
+        if (header0.size < PALMDOC_HEADER_LENGTH + 24) {
+            throw BookFormat.Companion.Unsupported("MOBI 头不完整")
+        }
+
+        // A joint MOBI6+KF8 file carries two complete books, each with its own record 0
+        // and its own PalmDOC/MOBI header. The first one describes the MOBI6 half; the
+        // text this parser reads is the KF8 half, so every field has to come from the
+        // KF8 header. Reading the record count and text length from the MOBI6 header
+        // truncated the book and made the FDST cut look for its pieces in the wrong
+        // stream.
+        val kf8Offset = kf8RecordOffset(header0, readInt(header0, PALMDOC_HEADER_LENGTH + 4), records)
+        val header = if (kf8Offset > 0) records.getOrNull(kf8Offset) ?: header0 else header0
         if (header.size < PALMDOC_HEADER_LENGTH + 24) {
             throw BookFormat.Companion.Unsupported("MOBI 头不完整")
         }
+        val textStart = if (kf8Offset > 0) kf8Offset + 1 else 1
 
         val compression = readShort(header, PALMDOC_COMPRESSION)
         val textLength = readInt(header, PALMDOC_TEXT_LENGTH)
@@ -86,19 +98,13 @@ object MobiParser {
                 "这本书带 DRM 加密，应用无法解开；请先去掉 DRM 再导入。"
             )
         }
-        if (recordCount <= 0 || recordCount >= records.size) {
+        if (recordCount <= 0 || textStart + recordCount > records.size) {
             throw BookFormat.Companion.Unsupported("MOBI 的正文记录数不对（$recordCount）")
         }
 
         val mobiHeaderLength = readInt(header, PALMDOC_HEADER_LENGTH + 4)
         val encoding = readInt(header, MOBI_ENCODING)
-        val version = readInt(header, MOBI_VERSION)
         val extraFlags = if (mobiHeaderLength >= 0xE4) readShort(header, MOBI_EXTRA_DATA_FLAGS) else 0
-
-        // The text of a joint MOBI6+KF8 file sits after the BOUNDARY record, and the
-        // MOBI header names it through EXTH 121. A standalone AZW3 has no boundary and
-        // starts at record 1, so the offset is zero and everything below is unchanged.
-        val textStart = 1 + kf8RecordOffset(header, mobiHeaderLength, records)
 
         val huffRecord = readInt(header, MOBI_HUFF_RECORD)
         val huffCount = readInt(header, MOBI_HUFF_COUNT)
@@ -111,7 +117,11 @@ object MobiParser {
             throw BookFormat.Companion.Unsupported("MOBI 用了 HUFF/CDIC 压缩，但压缩表缺失")
         }
 
-        val text = ByteArrayOutputStream(textLength.coerceAtLeast(0).coerceAtMost(MAX_TEXT_LENGTH))
+        // A modest initial capacity: `ByteArrayOutputStream(n)` allocates n bytes up
+        // front, so a header claiming a huge length would reserve it before a single
+        // record has been read. The stream grows on its own as the text arrives.
+        val initial = textLength.coerceIn(0, MAX_TEXT_LENGTH).coerceAtMost(1 shl 20)
+        val text = ByteArrayOutputStream(initial)
         for (i in textStart until textStart + recordCount) {
             val raw = records.getOrNull(i) ?: break
             val trimmed = trimTrailingEntries(raw, extraFlags)
@@ -142,11 +152,7 @@ object MobiParser {
             chapters = chapters,
             cover = cover?.first,
             coverExtension = cover?.second.orEmpty(),
-        ).also {
-            // Version is only read to keep the KF8 branch honest; a file that claims
-            // KF8 but has no boundary record is handled by textStart being 0.
-            if (version < 0) Unit
-        }
+        )
     }
 
     // ------------------------------------------------------------ container
@@ -198,7 +204,11 @@ object MobiParser {
     private fun fullName(header: ByteArray): String? {
         val offset = readInt(header, MOBI_FULL_NAME_OFFSET)
         val length = readInt(header, MOBI_FULL_NAME_LENGTH)
-        if (offset <= 0 || length <= 0 || offset + length > header.size) return null
+        // Both fields are attacker-controlled 32-bit values, so the sum is checked in
+        // 64 bits: `offset + length` in `Int` wraps to a negative number for a large
+        // length, sails past the bound check, and `String(…)` then throws.
+        if (offset <= 0 || length <= 0) return null
+        if (offset.toLong() + length > header.size) return null
         return String(header, offset, length, Charsets.UTF_8).trim().takeIf { it.isNotEmpty() }
     }
 
@@ -401,7 +411,15 @@ object MobiParser {
             }
         }
 
-        fun decode(data: ByteArray): ByteArray {
+        fun decode(data: ByteArray): ByteArray = decode(data, depth = 0)
+
+        private fun decode(data: ByteArray, depth: Int): ByteArray {
+            // A phrase is allowed to be compressed, but a table that refers to itself —
+            // corrupt, or crafted — would recurse until the stack runs out. A
+            // `StackOverflowError` is an `Error`, so it escapes the import path's
+            // `catch (Exception)` and kills the app; the reference implementation stops
+            // at a depth of 20, and no real book nests anywhere near that.
+            if (depth > MAX_PHRASE_DEPTH) return ByteArray(0)
             val out = ByteArrayOutputStream(data.size * 4)
             // Eight zero bytes so the 64-bit window can be read four bytes past the end.
             val padded = data.copyOf(data.size + 8)
@@ -432,11 +450,15 @@ object MobiParser {
                 val (bytes, plain) = phrases[index]
                 if (plain) {
                     out.write(bytes)
+                } else if (depth >= MAX_PHRASE_DEPTH) {
+                    // Deeper than any real book nests, so the table refers to itself.
+                    // Stopping here keeps the output bounded; the phrase is left
+                    // uncached so a shallower occurrence can still expand it.
+                    break
                 } else {
-                    // A phrase that is itself compressed; the cache is not kept across
-                    // calls, so this recurses at most once per occurrence.
-                    phrases[index] = decode(bytes) to true
-                    out.write(phrases[index].first)
+                    val expanded = decode(bytes, depth + 1)
+                    phrases[index] = expanded to true
+                    out.write(expanded)
                 }
             }
             return out.toByteArray()
@@ -488,7 +510,11 @@ object MobiParser {
         val text = if (encoding == ENCODING_UTF8) {
             String(usable, Charsets.UTF_8)
         } else {
-            String(usable, Charsets.ISO_8859_1)
+            // Not plain ISO-8859-1: the encoding MOBI calls "1252" is windows-1252,
+            // which fills the 0x80..0x9F range with the punctuation books actually
+            // use. Decoding as Latin-1 leaves a curly apostrophe as a C1 control
+            // character, which renders as a box and breaks word look-ups.
+            fromWindows1252(String(usable, Charsets.ISO_8859_1))
         }
         return text.removePrefix("\uFEFF")
     }
@@ -581,12 +607,12 @@ object MobiParser {
     // -------------------------------------------------------------- helpers
 
     private fun readShort(b: ByteArray, at: Int): Int {
-        if (at + 2 > b.size) return 0
+        if (at < 0 || at + 2 > b.size) return 0
         return ((b[at].toInt() and 0xFF) shl 8) or (b[at + 1].toInt() and 0xFF)
     }
 
     private fun readInt(b: ByteArray, at: Int): Int {
-        if (at + 4 > b.size) return 0
+        if (at < 0 || at + 4 > b.size) return 0
         return ((b[at].toInt() and 0xFF) shl 24) or
             ((b[at + 1].toInt() and 0xFF) shl 16) or
             ((b[at + 2].toInt() and 0xFF) shl 8) or
@@ -596,14 +622,37 @@ object MobiParser {
     private fun readLong(b: ByteArray, at: Int): Long {
         var value = 0L
         for (i in 0 until 8) {
-            val byte = if (at + i < b.size) b[at + i].toInt() and 0xFF else 0
+            val byte = if (at + i in b.indices) b[at + i].toInt() and 0xFF else 0
             value = (value shl 8) or byte.toLong()
         }
         return value
     }
 
+    /**
+     * Replaces the C1 characters Latin-1 leaves behind with their windows-1252 ones.
+     *
+     * The JDK does not ship windows-1252 everywhere, so the 0x80..0x9F half is mapped
+     * by hand over a Latin-1 base: those are the bytes carrying the curly quotes,
+     * dashes and ellipsis, and unmapped they render as boxes.
+     */
+    internal fun fromWindows1252(text: String): String {
+        if (text.none { it.code in 0x80..0x9F }) return text
+        val table = charArrayOf(
+            '\u20AC', '\uFFFD', '\u201A', '\u0192', '\u201E', '\u2026', '\u2020', '\u2021',
+            '\u02C6', '\u2030', '\u0160', '\u2039', '\u0152', '\uFFFD', '\u017D', '\uFFFD',
+            '\uFFFD', '\u2018', '\u2019', '\u201C', '\u201D', '\u2022', '\u2013', '\u2014',
+            '\u02DC', '\u2122', '\u0161', '\u203A', '\u0153', '\uFFFD', '\u017E', '\u0178',
+        )
+        return buildString(text.length) {
+            for (c in text) append(if (c.code in 0x80..0x9F) table[c.code - 0x80] else c)
+        }
+    }
+
     /** A record count above this is a corrupt directory, not a book. */
     private const val MAX_RECORDS = 100_000
+
+    /** How deep a compressed phrase may nest before the table is treated as broken. */
+    private const val MAX_PHRASE_DEPTH = 20
 
     /** Upper bound on the declared text length, so a bad header cannot allocate GBs. */
     private const val MAX_TEXT_LENGTH = 64 * 1024 * 1024

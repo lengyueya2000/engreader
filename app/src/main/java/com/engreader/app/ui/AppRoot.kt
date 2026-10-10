@@ -15,6 +15,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -143,12 +144,14 @@ fun AppRoot(container: AppContainer) {
             val overlay = current
             Box(Modifier.fillMaxSize()) {
                 when (overlay) {
-                    is Overlay.Reading -> ReaderScreen(
-                        articleId = overlay.articleId,
-                        onBack = pop,
-                        onSavedChanged = { refreshKey++ },
-                        onOpenChapter = openChapter,
-                    )
+                    is Overlay.Reading -> key(overlay.articleId) {
+                        ReaderScreen(
+                            articleId = overlay.articleId,
+                            onBack = pop,
+                            onSavedChanged = { refreshKey++ },
+                            onOpenChapter = openChapter,
+                        )
+                    }
                     Overlay.Review -> com.engreader.app.ui.wordbook.ReviewScreen(onBack = pop)
                     Overlay.Settings -> SettingsScreen(onBack = pop)
                     Overlay.BookShelf -> BookShelfScreen(

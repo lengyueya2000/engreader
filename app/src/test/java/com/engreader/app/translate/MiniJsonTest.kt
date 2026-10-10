@@ -100,3 +100,42 @@ class SplitForLimitTest {
         assertTrue(pieces.all { it.isNotBlank() })
     }
 }
+
+/**
+ * Rejoining the pieces MyMemory answers in.
+ *
+ * The service caps a request at 500 characters, so one paragraph is sent as several
+ * sentence-sized pieces. Chinese needs no separator between them, but a boundary
+ * where the service echoed the English back untranslated does: the split consumed the
+ * space between the two words, and gluing them produced `thegovernment`.
+ */
+class MyMemoryJoinTest {
+
+    @Test
+    fun `chinese pieces are joined without a separator`() {
+        assertEquals("中国政府宣布了这一决定", MyMemoryEngine().joinPieces(listOf("中国政府", "宣布了", "这一决定")))
+    }
+
+    @Test
+    fun `two ascii words split apart are not glued together`() {
+        assertEquals("the government", MyMemoryEngine().joinPieces(listOf("the", "government")))
+    }
+
+    @Test
+    fun `an ascii word before chinese needs no separator`() {
+        // Chinese sets no space between words, so a boundary that is only half ASCII
+        // is left alone; adding one here would put a gap inside a Chinese phrase.
+        assertEquals("the政府", MyMemoryEngine().joinPieces(listOf("the", "政府")))
+    }
+
+    @Test
+    fun `punctuation does not attract a separator`() {
+        assertEquals("政府，宣布", MyMemoryEngine().joinPieces(listOf("政府", "，宣布")))
+        assertEquals("end.开始", MyMemoryEngine().joinPieces(listOf("end.", "开始")))
+    }
+
+    @Test
+    fun `a single piece is returned unchanged`() {
+        assertEquals("中国政府", MyMemoryEngine().joinPieces(listOf("中国政府")))
+    }
+}

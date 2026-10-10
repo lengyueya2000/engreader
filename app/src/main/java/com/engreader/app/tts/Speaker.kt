@@ -7,6 +7,7 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -41,9 +42,24 @@ enum class SpeechBackend {
  */
 class Speaker(private val context: Context) {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    /**
+     * Kept as a handle so [shutdown] can cancel it. A bare `CoroutineScope(SupervisorJob())`
+     * is never cancelled, so every `launch` on it outlived the speaker and kept this
+     * object — and the native engine it holds — reachable for the rest of the process.
+     */
+    private val job = SupervisorJob()
+    private val scope = CoroutineScope(job + Dispatchers.Main.immediate)
 
     private val neural = NeuralTts(context)
+
+    /** Bumped on every [prepare]; a load whose generation is stale is discarded. */
+    @Volatile private var loadGeneration = 0
+
+    /** The voice the in-flight load is for, so a repeat request is not a reload. */
+    @Volatile private var loadingVoiceId: String? = null
+
+    /** Set by [shutdown], so a callback arriving after it cannot revive the state. */
+    @Volatile private var closed = false
 
     private var engine: TextToSpeech? = null
 
@@ -75,29 +91,47 @@ class Speaker(private val context: Context) {
     private var localeTag: String = "en-GB"
     private var voiceId: String = ""
 
-    /** Set while [preview] or [sayWord] speaks, so the reading queue does not advance. */
-    private var oneShot = false
+    /**
+     * Set while [preview] or [sayWord] speaks, so the reading queue does not advance.
+     *
+     * Written from the caller's thread and read from the engine's callback thread, so
+     * a plain `Boolean` would let the callback miss the flag and report a preview as
+     * a finished sentence, skipping the reader forward.
+     */
+    @Volatile private var oneShot = false
 
     /**
      * Loads the voice, or reconfigures it when it is already up.
      *
      * The first call reads a 19 MB model, so it is done off the main thread and the
      * state flow reports progress. Idempotent; safe to call from `LaunchedEffect`.
+     *
+     * A request that arrives while a load is in flight is not dropped: it is either
+     * recognised as the same voice (nothing to do) or starts a fresh load whose
+     * generation supersedes the one running, so picking a new voice mid-load ends on
+     * the voice last picked rather than the one that happened to be loading.
      */
     fun prepare(rate: Float, localeTag: String, voiceId: String = "") {
         this.rate = rate
         this.localeTag = localeTag
         this.voiceId = voiceId
-        if (_state.value == SpeechState.Preparing) return
+        if (closed) return
         val voice = VoiceCatalog.resolve(localeTag, voiceId)
         if (neural.ready && _backend.value == SpeechBackend.Bundled && _activeVoice.value?.id == voice.id) {
             _state.value = SpeechState.Ready
             return
         }
+        // Already loading this exact voice: the in-flight load will finish it.
+        if (_state.value == SpeechState.Preparing && loadingVoiceId == voice.id) return
+        val generation = ++loadGeneration
+        loadingVoiceId = voice.id
         _state.value = SpeechState.Preparing
         scope.launch(Dispatchers.Default) {
             val loaded = neural.prepare(localeTag, voiceId)
             scope.launch {
+                // A newer request superseded this one while the model was loading.
+                if (generation != loadGeneration || closed) return@launch
+                loadingVoiceId = null
                 if (loaded) {
                     _backend.value = SpeechBackend.Bundled
                     _activeVoice.value = voice
@@ -207,8 +241,20 @@ class Speaker(private val context: Context) {
         _speaking.value = false
     }
 
+    /**
+     * Releases the engine and stops accepting work.
+     *
+     * Cancelling the scope is the part that was missing: without it the native voice
+     * and this object stayed alive for the life of the process, and a load that was
+     * still in flight would land afterwards and set [state] back to `Ready` on a
+     * speaker nobody owns any more.
+     */
     fun shutdown() {
+        if (closed) return
+        closed = true
+        loadGeneration++
         stop()
+        job.cancel()
         neural.shutdown()
         engine?.shutdown()
         engine = null

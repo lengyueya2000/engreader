@@ -260,27 +260,33 @@ class WordbookRepository(
     /**
      * Applies a review outcome. [correct] promotes the word; a miss demotes it so
      * it reappears in the same session's queue.
+     *
+     * One statement, so the counters cannot lose an update. The previous
+     * read-then-write pair was not atomic: two answers arriving together — a fast
+     * double tap, or the session flush racing the UI — both read the same `box` and
+     * both wrote the same next value, so one of them vanished and the interval was
+     * computed from a stale box.
      */
     suspend fun review(lemma: String, correct: Boolean) = withContext(Dispatchers.IO) {
-        val row = db.readableDatabase.rawQuery(
-            "SELECT box, correct, wrong FROM word WHERE lemma = ?", arrayOf(lemma),
-        ).use {
-            if (it.moveToFirst()) Triple(it.getInt(0), it.getInt(1), it.getInt(2)) else null
-        } ?: return@withContext
-        val (box, ok, bad) = row
-        val nextBox = if (correct) (box + 1).coerceAtMost(MAX_BOX) else 1
-        val interval = INTERVALS_MS[nextBox]
         val now = System.currentTimeMillis()
-        db.writableDatabase.update(
-            "word",
-            ContentValues().apply {
-                put("box", nextBox)
-                put("dueAt", now + interval)
-                put("correct", if (correct) ok + 1 else ok)
-                put("wrong", if (correct) bad else bad + 1)
-                if (nextBox >= MAX_BOX) put("mastered", 1)
-            },
-            "lemma = ?", arrayOf(lemma),
+        // The box and the interval are derived inside SQL, from the row's own value.
+        // The expressions are built from a Kotlin boolean and a constant table, so
+        // nothing user-supplied reaches the statement text.
+        val nextBox = if (correct) "MIN(box + 1, $MAX_BOX)" else "1"
+        val intervals = INTERVALS_MS.withIndex()
+            .joinToString(" ") { (index, ms) -> "WHEN ${index + 1} THEN ? + $ms" }
+        db.writableDatabase.execSQL(
+            """
+            UPDATE word SET
+                box = $nextBox,
+                dueAt = CASE $nextBox $intervals ELSE ? END,
+                correct = correct + ${if (correct) 1 else 0},
+                wrong = wrong + ${if (correct) 0 else 1},
+                mastered = CASE WHEN $nextBox >= $MAX_BOX THEN 1 ELSE mastered END
+            WHERE lemma = ?
+            """.trimIndent(),
+            // One `?` per interval branch, then the fallback, then the lemma.
+            Array(INTERVALS_MS.size + 1) { now.toString() } + lemma,
         )
         Unit
     }

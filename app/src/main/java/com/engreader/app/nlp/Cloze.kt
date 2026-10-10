@@ -52,10 +52,27 @@ object Cloze {
      */
     private fun replace(sentence: String, start: Int, end: Int): String {
         var after = end
-        while (after < sentence.length && isWordTrailing(sentence[after])) after++
+        while (after < sentence.length && isWordTrailing(sentence[after])) {
+            // A closing quote is only absorbed when the word is not itself quoted:
+            // eating the `”` of `He said “hello” loudly` left the opener dangling and
+            // the blank read as `He said “______ loudly`.
+            if (isQuote(sentence[after]) && isQuoted(sentence, start)) break
+            after++
+        }
         val tail = sentence.substring(after)
-        val separator = if (tail.isNotEmpty() && !tail.first().isWhitespace()) " " else ""
+        // A separator is only needed before a word. Before punctuation it would push
+        // the mark off the blank — `“______ ”` instead of `“______”`.
+        val separator = if (tail.firstOrNull()?.isLetterOrDigit() == true) " " else ""
         return sentence.substring(0, start) + BLANK + separator + tail
+    }
+
+    private fun isQuote(c: Char): Boolean = c == '"' || c == '\u201D'
+
+    /** True when an unclosed opening quote stands immediately before [start]. */
+    private fun isQuoted(sentence: String, start: Int): Boolean {
+        var i = start - 1
+        while (i >= 0 && sentence[i] == ' ') i--
+        return i >= 0 && (sentence[i] == '\u201C' || sentence[i] == '\u2018')
     }
 
     /**

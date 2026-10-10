@@ -16,7 +16,14 @@ import kotlinx.coroutines.withContext
  */
 class ParagraphTranslator(private val engines: List<TranslateEngine> = DEFAULT_ENGINES) {
 
-    /** Engine that produced the last successful result, for reporting. */
+    /**
+     * Engine that produced the last successful result, for reporting.
+     *
+     * Written on [Dispatchers.IO] and read from wherever the UI asks, so the field is
+     * volatile: without it the write is free to stay in the worker's cache and the
+     * reader can keep seeing the previous engine — or none at all.
+     */
+    @Volatile
     var lastEngine: String? = null
         private set
 

@@ -43,6 +43,15 @@ object Sentences {
         "co", "who", "bbc", "cnn", "nato",
     )
 
+    /**
+     * Abbreviations that are also ordinary words a sentence can end on.
+     *
+     * `etc.` and `Inc.` are in [ABBREVIATIONS], which suppresses the boundary
+     * unconditionally, so "Bring pens, etc. She had none." came back as one sentence.
+     * They only suppress it when the next word continues the phrase.
+     */
+    private val SENTENCE_FINAL = setOf("etc", "inc", "ltd", "co", "vs", "al")
+
     fun split(paragraph: String): List<Sentence> {
         if (paragraph.isBlank()) return emptyList()
         val out = mutableListOf<Sentence>()
@@ -86,7 +95,7 @@ object Sentences {
             text = text,
             start = realStart,
             end = realStart + text.length,
-            wordCount = Regex("[A-Za-z][A-Za-z'\\u2019-]*").findAll(text).count(),
+            wordCount = Tokenizer.countWords(text),
         )
     }
 
@@ -106,9 +115,18 @@ object Sentences {
         if (s[terminator] != '.') return true
 
         val word = wordBefore(s, terminator)
-        if (word.length == 1 && word[0].isUpperCase()) return false      // initial: "J. Smith"
+        // `A.` is an initial in "J. Smith" but a one-letter word in "The grade is A."
+        // Suppressing the boundary for any single capital merged the second sentence
+        // into the first. What separates them is what comes before: an initial follows
+        // the start of the sentence or another capitalised word (a first name, a
+        // title), never a lowercase word.
+        if (word.length == 1 && word[0].isUpperCase()) return !followsCapital(s, terminator)
         // Dotted abbreviations ("p.m.", "U.S.") only match once the dots are removed.
         val bare = word.replace(".", "").lowercase()
+        // `etc.` and `Inc.` also end sentences ("pens, etc. She left."), so they are
+        // tested before the unconditional list: they only suppress the boundary when
+        // what follows continues the same sentence.
+        if (bare in SENTENCE_FINAL) return !continuesPhrase(s, after)
         if (bare in ABBREVIATIONS) return false
         if (bare in AMBIGUOUS && continuesPhrase(s, after)) return false
         // Decimal or version number: digit on both sides.
@@ -141,5 +159,23 @@ object Sentences {
         var i = index - 1
         while (i >= 0 && (s[i].isLetter() || s[i] == '.')) i--
         return s.substring(i + 1, index)
+    }
+
+    /**
+     * True when the word before the one-letter word ending at [terminator] is
+     * capitalised, or the one-letter word opens the sentence.
+     *
+     * An initial is preceded by a first name or a title ("J. Smith", "Dr. J. Smith").
+     * A one-letter word ending a sentence ("The grade is A.") is preceded by an
+     * ordinary lowercase word, which is the case this separates out.
+     */
+    private fun followsCapital(s: String, terminator: Int): Boolean {
+        var i = terminator - 2
+        while (i >= 0 && (s[i].isWhitespace() || s[i] == '.')) i--
+        if (i < 0) return true
+        val end = i + 1
+        while (i >= 0 && (s[i].isLetter() || s[i] == '\'' || s[i] == '\u2019' || s[i] == '-')) i--
+        val before = s.substring(i + 1, end)
+        return before.isEmpty() || before.first().isUpperCase()
     }
 }

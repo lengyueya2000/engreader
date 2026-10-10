@@ -11,9 +11,17 @@ import com.engreader.app.nlp.Tokenizer
  */
 object PartOfSpeechParser {
 
+    /**
+     * ECDICT's leading part-of-speech marker.
+     *
+     * The two-part abbreviations are listed before the one-part ones they start with:
+     * the marker is followed by a literal dot, and with `aux` ahead of `aux\.v` the
+     * engine matched `aux` + `.` and never reached the longer branch, so `aux.v` was
+     * dead. The same ordering made `pl.` unreachable behind `pl`.
+     */
     private val PREFIX = Regex(
-        "^\\s*(n|u|c|v|vt|vi|a|adj|ad|adv|prep|conj|pron|art|num|int|aux|abbr|pl|pl\\.|" +
-            "pref|suf|comb|aux\\.v)\\.\\s*",
+        "^\\s*(aux\\.v|pl\\.|n|u|c|vt|vi|v|adj|ad|adv|a|prep|conj|pron|art|num|int|" +
+            "aux|abbr|pl|pref|suf|comb)\\.\\s*",
         RegexOption.IGNORE_CASE,
     )
 
@@ -38,11 +46,17 @@ object PartOfSpeechParser {
     /**
      * Last-resort guess from the word's shape, used for words ECDICT does not tag
      * and for context highlighting in the sentence panel.
+     *
+     * Shape alone cannot decide: `morning`, `red` and `family` have the same endings
+     * as `walking`, `walked` and `quickly`. The frequent misfires are listed in
+     * [SHAPE_EXCEPTIONS] rather than guessed at, because a wrong part of speech here
+     * changes what the grammar panel highlights.
      */
     fun guess(word: String): PartOfSpeech {
         val w = word.lowercase()
         return when {
             w in FUNCTION_WORDS -> FUNCTION_WORDS.getValue(w)
+            w in SHAPE_EXCEPTIONS -> SHAPE_EXCEPTIONS.getValue(w)
             w.endsWith("ly") && w.length > 4 -> PartOfSpeech.Adverb
             // Hyphenated compounds are almost always adjectives in news prose:
             // "good-looking", "gentleman-like", "state-owned".
@@ -59,17 +73,54 @@ object PartOfSpeechParser {
         }
     }
 
+    /**
+     * Words whose ending points the wrong way.
+     *
+     * Every one of these is a common word whose shape matches a suffix rule but whose
+     * part of speech is different — `morning` and `red` are not verbs, `family` is not
+     * an adverb, `capital` is not an adjective in the sense a news reader meets it.
+     * The list is short because only frequent words matter: a rare misfire costs
+     * nothing, a frequent one colours the wrong word in every article.
+     */
+    private val SHAPE_EXCEPTIONS: Map<String, PartOfSpeech> = buildMap {
+        listOf(
+            "morning", "evening", "thing", "things", "king", "ring", "spring", "string",
+            "building", "wedding", "meeting", "clothing", "ceiling", "darling", "offering",
+            "red", "bed", "shed", "sled", "wed", "hundred", "sacred", "naked", "wicked",
+            "hatred", "kindred", "speed", "breed", "indeed", "feed", "need", "seed", "weed",
+        ).forEach { put(it, PartOfSpeech.Noun) }
+        listOf(
+            "family", "supply", "apply", "reply", "multiply", "assembly", "ally", "rally",
+            "bully", "folly", "jelly", "tally", "july", "italy", "monopoly", "holy", "ugly",
+            "silly", "melancholy", "anomaly", "panoply", "statistically", "italy's",
+        ).forEach { put(it, PartOfSpeech.Noun) }
+        listOf("early", "likely", "only", "daily", "weekly", "monthly", "yearly", "friendly",
+            "lovely", "lonely", "costly", "deadly", "elderly", "silly", "holy", "ugly")
+            .forEach { put(it, PartOfSpeech.Adjective) }
+        listOf("capital", "general", "local", "total", "final", "legal", "medical",
+            "national", "personal", "several", "animal", "hospital", "material")
+            .forEach { put(it, PartOfSpeech.Noun) }
+    }
+
     private val COMPOUND_ADJECTIVE_SUFFIXES = listOf(
         "looking", "like", "shaped", "sized", "owned", "based", "led", "made",
         "known", "wearing", "going", "born", "driven", "backed", "funded",
         "related", "wide", "long", "term", "hand", "class", "year",
     )
 
+    /**
+     * Closed-class words, each filed under the reading that matters most.
+     *
+     * The lists overlap on purpose — `each`, `some`, `all`, `both`, `that` and `no` are
+     * determiners *and* prepositions *and* pronouns — and a plain `put` let the last
+     * list win, so `each`/`some`/`all` came back as prepositions. [putIfAbsent] keeps
+     * the first (most specific) reading instead.
+     */
     private val FUNCTION_WORDS: Map<String, PartOfSpeech> = buildMap {
         listOf(
             "a", "an", "the", "this", "that", "these", "those", "some", "any", "each",
             "every", "both", "either", "neither", "no", "all", "such",
-        ).forEach { put(it, PartOfSpeech.Determiner) }
+        ).forEach { putIfAbsent(it, PartOfSpeech.Determiner) }
         listOf(
             "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us",
             "them", "my", "your", "his", "its", "our", "their", "mine", "yours",
@@ -77,13 +128,13 @@ object PartOfSpeechParser {
             "itself", "ourselves", "themselves", "who", "whom", "whose", "which",
             "what", "that", "these", "those", "someone", "anyone", "everyone",
             "nobody", "something", "anything", "everything", "nothing",
-        ).forEach { put(it, PartOfSpeech.Pronoun) }
+        ).forEach { putIfAbsent(it, PartOfSpeech.Pronoun) }
         listOf(
             "and", "or", "but", "nor", "for", "yet", "so", "because", "although",
             "though", "while", "whereas", "if", "unless", "until", "since", "as",
             "whether", "than", "that", "when", "whenever", "where", "wherever",
             "after", "before", "once", "both", "either", "neither",
-        ).forEach { put(it, PartOfSpeech.Conjunction) }
+        ).forEach { putIfAbsent(it, PartOfSpeech.Conjunction) }
         listOf(
             "in", "on", "at", "by", "for", "with", "about", "against", "between",
             "into", "through", "during", "before", "after", "above", "below", "to",
@@ -93,17 +144,17 @@ object PartOfSpeechParser {
             "own", "same", "so", "than", "too", "very", "of", "per", "via",
             "despite", "during", "among", "within", "without", "toward", "towards",
             "upon", "across", "along", "around", "behind", "beyond", "beside",
-        ).forEach { put(it, PartOfSpeech.Preposition) }
+        ).forEach { putIfAbsent(it, PartOfSpeech.Preposition) }
         listOf(
             "be", "am", "is", "are", "was", "were", "been", "being", "have", "has",
             "had", "do", "does", "did", "will", "would", "shall", "should", "can",
             "could", "may", "might", "must", "ought", "need", "dare", "let",
-        ).forEach { put(it, PartOfSpeech.Verb) }
+        ).forEach { putIfAbsent(it, PartOfSpeech.Verb) }
         listOf("not", "never", "always", "often", "sometimes", "usually", "rarely",
             "already", "still", "just", "even", "also", "however", "therefore",
             "thus", "hence", "moreover", "furthermore", "nevertheless", "instead",
             "otherwise", "meanwhile", "eventually", "recently", "currently")
-            .forEach { put(it, PartOfSpeech.Adverb) }
+            .forEach { putIfAbsent(it, PartOfSpeech.Adverb) }
     }
 
     /** A contraction read as the subject it hides plus the auxiliary it stands for. */

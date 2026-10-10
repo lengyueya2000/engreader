@@ -90,8 +90,17 @@ class ProgressRepository(
             streakDays = streak(days.map { it.day }),
             todaySeconds = byDay[today]?.seconds ?: 0,
             weekSeconds = week,
-            articlesStarted = count("SELECT COUNT(*) FROM article WHERE lastReadAt > 0"),
-            articlesFinished = count("SELECT COUNT(DISTINCT articleId) FROM session WHERE seconds > 60"),
+            // Book chapters are excluded, as [ArticleRepository] excludes them from
+            // every list it returns: a chapter is an `article` row, so a 400-chapter
+            // novel otherwise reported 400 "articles started" the moment it was
+            // imported, and the same for finished.
+            articlesStarted = count(
+                "SELECT COUNT(*) FROM article WHERE lastReadAt > 0 AND bookId = 0"
+            ),
+            articlesFinished = count(
+                "SELECT COUNT(DISTINCT articleId) FROM session " +
+                    "WHERE seconds > 60 AND articleId IN (SELECT id FROM article WHERE bookId = 0)"
+            ),
             wordsRead = wordsRead,
             lookups = lookups,
             wordbookTotal = count("SELECT COUNT(*) FROM word"),

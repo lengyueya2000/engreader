@@ -6,6 +6,7 @@ import android.database.sqlite.SQLiteDatabase
 import com.engreader.app.model.Article
 import com.engreader.app.model.FeedItem
 import com.engreader.app.model.QuizQuestion
+import com.engreader.app.nlp.Tokenizer
 import com.engreader.app.nlp.VocabularyGrader
 import com.engreader.app.nlp.VocabularyProfile
 import com.engreader.app.source.ArticleExtractor
@@ -96,16 +97,27 @@ class ArticleRepository(
             put("difficulty", difficulty)
             // The feed summary is often repeated verbatim as the article's opening
             // paragraph; keeping both shows the reader the same sentence twice.
-            put("body", stripDuplicateLead(extracted.body, extracted.summary.ifBlank { item.summary }))
+            val body = stripDuplicateLead(extracted.body, extracted.summary.ifBlank { item.summary })
+            put("body", body)
+            put("wordCount", Tokenizer.countWords(body))
+            // The body may have changed under a re-fetch, so the cached lemma list no
+            // longer describes it. Left in place, the personal unknown rate and the new
+            // words panel would report the previous version of the article forever.
+            put("vocabProfile", "")
             put("fetchedAt", now)
         }
         val id = if (existingId != null) {
             db.writableDatabase.update("article", values, "id = ?", arrayOf(existingId.toString()))
             existingId
         } else {
-            db.writableDatabase.insertWithOnConflict(
+            val inserted = db.writableDatabase.insertWithOnConflict(
                 "article", null, values, SQLiteDatabase.CONFLICT_IGNORE,
             )
+            // `CONFLICT_IGNORE` returns -1 when another row already holds this URL,
+            // which happens when two fetches of the same headline race. The stored row
+            // is the right answer either way, so it is read back rather than treated as
+            // a failure.
+            if (inserted > 0) inserted else findByUrl(item.url)?.id ?: -1L
         }
         require(id > 0) { "Could not store article ${item.url}" }
         requireNotNull(get(id))

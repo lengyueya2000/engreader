@@ -273,13 +273,14 @@ fun ReviewScreen(onBack: () -> Unit) {
                             fill = Palette.ClaySoft,
                             modifier = Modifier.weight(1f),
                         ) {
-                            scope.launch {
-                                viewModel.review(word.lemma, correct = false)
-                                wrong++
-                                // A missed word returns at the end of this session's queue.
-                                queue = queue + current
-                                index++
-                            }
+                            // The write is detached so backing out of the session
+                            // immediately after answering still records the answer; the
+                            // queue advance below is local UI state and stays here.
+                            viewModel.reviewDetached(word.lemma, correct = false)
+                            wrong++
+                            // A missed word returns at the end of this session's queue.
+                            queue = queue + current
+                            index++
                         }
                         AnswerButton(
                             label = "记住了",
@@ -288,11 +289,9 @@ fun ReviewScreen(onBack: () -> Unit) {
                             fill = Palette.PineSoft,
                             modifier = Modifier.weight(1f),
                         ) {
-                            scope.launch {
-                                viewModel.review(word.lemma, correct = true)
-                                correct++
-                                index++
-                            }
+                            viewModel.reviewDetached(word.lemma, correct = true)
+                            correct++
+                            index++
                         }
                     }
                 }

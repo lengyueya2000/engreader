@@ -118,6 +118,10 @@ class QuizBuilder(private val dictionary: Lexicon) {
             if (answer < 0) continue
             val blanked = blankOut(candidate.sentence.text, candidate.start, candidate.end)
             if (blanked == candidate.sentence.text) continue
+            // The same word often appears twice in a sentence ("the barrage … the
+            // barrage"), and blanking one occurrence left the other on screen, so the
+            // question answered itself.
+            if (stillVisible(blanked, candidate.surface)) continue
 
             val gloss = dictionary.firstGloss(candidate.entry.translation)
             out += QuizQuestion(
@@ -155,7 +159,9 @@ class QuizBuilder(private val dictionary: Lexicon) {
         val pool = fromArticle.toMutableList()
         if (pool.size < 3) {
             val entry = dictionary.lookup(answer) ?: return null
-            pool += dictionary.distractors(entry, pos, count = 3 - pool.size)
+            // English words, not glosses: the blank sits in an English sentence, so a
+            // Chinese option is not a wrong answer but a giveaway.
+            pool += dictionary.englishDistractors(entry, pos, count = 3 - pool.size)
         }
         if (pool.size < 3) return null
 
@@ -188,6 +194,13 @@ class QuizBuilder(private val dictionary: Lexicon) {
      */
     private fun blankOut(sentence: String, start: Int, end: Int): String =
         Cloze.blankAt(sentence, start, end)
+
+    /** True when the answer is still readable somewhere else in the blanked sentence. */
+    private fun stillVisible(blanked: String, answer: String): Boolean =
+        Regex(
+            "(?<![A-Za-z'\\u2019-])" + Regex.escape(answer) + "(?![A-Za-z'\\u2019-])",
+            RegexOption.IGNORE_CASE,
+        ).containsMatchIn(blanked)
 
     // -------------------------------------------------------------- reference
 

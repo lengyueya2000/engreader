@@ -317,4 +317,79 @@ class BookParserTest {
         assertEquals("a & b", BookText.fromHtml("<p>a &amp; b</p>"))
         assertEquals("&amp;", BookText.fromHtml("<p>&amp;amp;</p>"))
     }
+
+    // ---------------------------------------------------- review regressions
+
+    @Test
+    fun `a plus in a manifest path is not decoded as a space`() {
+        // `URLDecoder` is form decoding: it turned `chapter+1.xhtml` into
+        // `chapter 1.xhtml`, and the zip entry lookup then found nothing.
+        assertEquals("chapter+1.xhtml", EpubParser.percentDecode("chapter+1.xhtml"))
+        assertEquals("a b/c.xhtml", EpubParser.percentDecode("a%20b%2Fc.xhtml"))
+        assertEquals("café.xhtml", EpubParser.percentDecode("caf%C3%A9.xhtml"))
+    }
+
+    @Test
+    fun `windows-1252 control bytes become their real characters`() {
+        // Latin-1 leaves 0x80..0x9F as C1 controls, so the curly quotes, dashes and
+        // ellipsis a converter wrote arrived as boxes.
+        assertEquals("a“b”c—d", MobiParser.fromWindows1252("a\u0093b\u0094c\u0097d"))
+        assertEquals("it\u2019s", MobiParser.fromWindows1252("it\u0092s"))
+        assertEquals("plain", MobiParser.fromWindows1252("plain"))
+    }
+
+    @Test
+    fun `an attribute is not matched inside a longer attribute name`() {
+        // A plain `\b` is a boundary between `-` and `i`, so asking for `id` matched
+        // the tail of `data-id` — which is what `epub:type`-style generators emit —
+        // and the manifest item was filed under the wrong id, so the spine's `idref`
+        // found nothing and the whole book came back empty.
+        val epub = singleChapterEpub(
+            """<item id="c1" data-id="decoy" href="c1.xhtml" media-type="application/xhtml+xml"/>""",
+        )
+        val book = EpubParser.parse(epub)
+        assertTrue("the spine item must still resolve", book.chapters.isNotEmpty())
+    }
+
+    /** A minimal EPUB whose manifest carries [itemTag] and whose content is one file. */
+    private fun singleChapterEpub(itemTag: String): ByteArray {
+        val opf = """
+            <?xml version="1.0" encoding="utf-8"?>
+            <package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="id">
+              <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+                <dc:title>Attr Book</dc:title><dc:language>en</dc:language>
+              </metadata>
+              <manifest>
+                $itemTag
+              </manifest>
+              <spine><itemref idref="c1"/></spine>
+            </package>
+        """.trimIndent()
+        val chapter = """
+            <?xml version="1.0" encoding="utf-8"?>
+            <html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <p>${"Officials said more details would follow. ".repeat(4)}</p>
+            <p>${"The decision was unprecedented in the modern era. ".repeat(4)}</p>
+            <p>${"The public will be able to watch the execution. ".repeat(4)}</p>
+            </body></html>
+        """.trimIndent()
+        val zip = java.io.ByteArrayOutputStream()
+        java.util.zip.ZipOutputStream(zip).use { out ->
+            fun put(name: String, body: String) {
+                out.putNextEntry(java.util.zip.ZipEntry(name))
+                out.write(body.toByteArray())
+                out.closeEntry()
+            }
+            put("mimetype", "application/epub+zip")
+            put(
+                "META-INF/container.xml",
+                """<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+                   <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+                   </container>""",
+            )
+            put("OEBPS/content.opf", opf)
+            put("OEBPS/c1.xhtml", chapter)
+        }
+        return zip.toByteArray()
+    }
 }

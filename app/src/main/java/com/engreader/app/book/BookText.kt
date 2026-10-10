@@ -1,5 +1,7 @@
 package com.engreader.app.book
 
+import com.engreader.app.source.Html
+
 /**
  * Turns a book chapter's markup into the plain text the reader stores.
  *
@@ -14,25 +16,62 @@ package com.engreader.app.book
 object BookText {
 
     /** Elements whose content is never prose. Dropped whole, not flattened. */
-    private val DROPPED = Regex(
-        "(?is)<(script|style|head|noscript|svg|math|object|iframe|video|audio)\\b[^>]*>.*?</\\1\\s*>"
+    private val DROPPED = setOf(
+        "script", "style", "head", "noscript", "svg", "math", "object", "iframe",
+        "video", "audio",
     )
 
     /** Block-level openers: a line break *before* the element's text. */
     private val BLOCK_OPEN = Regex(
         "(?is)<(p|div|section|article|blockquote|li|dd|dt|tr|h[1-6]|pre|figure|figcaption|" +
-            "td|th|table|ul|ol|dl|header|footer|main|aside|nav|hr)\\b[^>]*>"
+            "td|th|table|ul|ol|dl|header|footer|main|aside|nav|hr)\\b${Html.ATTRS}>"
     )
 
     /** Block-level closers, and `<br>`, which is a break on its own. */
     private val BLOCK_CLOSE = Regex(
         "(?is)</(p|div|section|article|blockquote|li|dd|dt|tr|h[1-6]|pre|figure|figcaption|" +
-            "td|th|table|ul|ol|dl|header|footer|main|aside|nav)\\s*>|<br\\b[^>]*/?>"
+            "td|th|table|ul|ol|dl|header|footer|main|aside|nav)\\s*>|<br\\b${Html.ATTRS}/?>"
     )
 
-    private val ANY_TAG = Regex("(?is)</?[A-Za-z][^>]*>")
+    private val ANY_TAG = Regex("(?is)</?[A-Za-z]${Html.ATTRS}>")
     private val COMMENT = Regex("(?s)<!--.*?-->")
     private val SENTENCE_END = Regex("[.!?][\"'\\u201D\\u2019)]*\\s*$")
+
+    /**
+     * Removes each [DROPPED] element with its content, in one pass per element name.
+     *
+     * The obvious regex, `<(script|…)\b[^>]*>.*?</\1\s*>`, is quadratic on markup that
+     * opens the element repeatedly without closing it: every one of the n openings
+     * makes the engine scan to the end of the document before giving up. A book with a
+     * thousand stray `<script>` tags — a corrupt conversion, or a file crafted to
+     * stall the importer — would take minutes. Scanning with `indexOf` instead keeps
+     * each pass linear, and an element with no closing tag at all is skipped up front
+     * rather than searched for once per opening.
+     */
+    private fun dropElements(html: String): String {
+        var out = html
+        for (name in DROPPED) {
+            if (!out.contains("</$name", ignoreCase = true)) continue
+            out = dropElement(out, name)
+        }
+        return out
+    }
+
+    private fun dropElement(html: String, name: String): String {
+        val open = Regex("(?is)<$name\\b${Html.ATTRS}>")
+        val close = Regex("(?is)</$name\\s*>")
+        val out = StringBuilder(html.length)
+        var at = 0
+        while (true) {
+            val start = open.find(html, at) ?: break
+            val end = close.find(html, start.range.last + 1) ?: break
+            out.append(html, at, start.range.first).append(' ')
+            // Past the closing tag, so the next search cannot re-find this element.
+            at = end.range.last + 1
+        }
+        out.append(html, at, html.length)
+        return out.toString()
+    }
 
     /**
      * Paragraph break sentinel.
@@ -59,7 +98,7 @@ object BookText {
      */
     fun fromHtml(html: String): String {
         var s = COMMENT.replace(html, " ")
-        s = DROPPED.replace(s, " ")
+        s = dropElements(s)
         s = BLOCK_OPEN.replace(s, BREAK)
         s = BLOCK_CLOSE.replace(s, BREAK)
         s = ANY_TAG.replace(s, "")
@@ -97,7 +136,7 @@ object BookText {
      * which is what keeps the opening paragraph of a chapter out of the title.
      */
     fun firstHeading(html: String): String? {
-        val match = Regex("(?is)<h([1-3])\\b[^>]*>(.*?)</h\\1\\s*>").find(html) ?: return null
+        val match = Regex("(?is)<h([1-3])\\b${Html.ATTRS}>(.*?)</h\\1\\s*>").find(html) ?: return null
         val text = fromHtml(match.groupValues[2]).replace("\n", " ").trim()
         if (text.isEmpty() || text.length > 90) return null
         if (SENTENCE_END.containsMatchIn(text)) return null

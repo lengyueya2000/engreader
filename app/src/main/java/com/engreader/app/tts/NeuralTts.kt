@@ -53,9 +53,11 @@ import java.util.concurrent.atomic.AtomicInteger
  */
 class NeuralTts(private val context: Context) {
 
+    @Volatile
     private var tts: OfflineTts? = null
 
     /** The voice the loaded engine was built for, so a switch forces a reload. */
+    @Volatile
     private var loadedVoiceId: String = ""
 
     /**
@@ -66,6 +68,7 @@ class NeuralTts(private val context: Context) {
      * two speakers of the same model still reloads and the two voices never share an
      * engine by accident.
      */
+    @Volatile
     private var loadedSid: Int = 0
 
     /** Serialises synthesis; sherpa's generate is blocking and CPU-bound. */
@@ -102,35 +105,44 @@ class NeuralTts(private val context: Context) {
      */
     fun prepare(localeTag: String, voiceId: String): Boolean {
         val voice = VoiceCatalog.resolve(localeTag, voiceId)
-        tts?.let { if (loadedVoiceId == voice.id) return true }
-        release()
-        return runCatching {
-            espeakDir = ensureEspeakData()
-            val engine = OfflineTts(
-                assetManager = context.assets,
-                config = OfflineTtsConfig(
-                    model = OfflineTtsModelConfig(
-                        vits = OfflineTtsVitsModelConfig(
-                            model = VoiceCatalog.modelPath(voice),
-                            tokens = VoiceCatalog.tokensPath(voice),
-                            dataDir = espeakDir,
+        if (tts != null && loadedVoiceId == voice.id) return true
+        // Interrupt whatever is being spoken, then do the load on the worker.
+        // Releasing the engine from the caller's thread would free the native object
+        // while `generate` is executing inside it, and the worker would then crash the
+        // process rather than throw. Queueing behind the worker means the load cannot
+        // start until the previous utterance has left the engine alone.
+        stop()
+        val task = worker.submit<Boolean> {
+            releaseLocked()
+            runCatching {
+                espeakDir = ensureEspeakData()
+                val engine = OfflineTts(
+                    assetManager = context.assets,
+                    config = OfflineTtsConfig(
+                        model = OfflineTtsModelConfig(
+                            vits = OfflineTtsVitsModelConfig(
+                                model = VoiceCatalog.modelPath(voice),
+                                tokens = VoiceCatalog.tokensPath(voice),
+                                dataDir = espeakDir,
+                            ),
+                            numThreads = threadCount(),
+                            debug = false,
+                            provider = "cpu",
                         ),
-                        numThreads = threadCount(),
-                        debug = false,
-                        provider = "cpu",
+                        maxNumSentences = 1,
+                        silenceScale = 0.2f,
                     ),
-                    maxNumSentences = 1,
-                    silenceScale = 0.2f,
-                ),
-            )
-            tts = engine
-            loadedVoiceId = voice.id
-            loadedSid = voice.sid
-            true
-        }.getOrElse { error ->
-            Log.w(TAG, "neural voice ${voice.id} unavailable", error)
-            false
+                )
+                tts = engine
+                loadedVoiceId = voice.id
+                loadedSid = voice.sid
+                true
+            }.getOrElse { error ->
+                Log.w(TAG, "neural voice ${voice.id} unavailable", error)
+                false
+            }
         }
+        return runCatching { task.get() }.getOrDefault(false)
     }
 
     /** True once [prepare] has succeeded. */
@@ -184,8 +196,12 @@ class NeuralTts(private val context: Context) {
             onError()
             return
         }
+        // Superseded before a single sample played: this is a skip, not a failure.
+        // Reporting it as one stopped playback outright, because the reader treats a
+        // failure as "the voice is gone" while a skip is just the next sentence
+        // arriving first.
         if (stale(token)) {
-            onError()
+            onDone()
             return
         }
 
@@ -197,7 +213,11 @@ class NeuralTts(private val context: Context) {
             onStart()
             writeInChunks(output, samples, token)
             if (!stale(token)) waitForDrain(output)
-            if (stale(token)) onError() else onDone()
+            // Reported as finished either way. A superseded utterance is not a
+            // failure — the reader's `Finished` handler already ignores an id it has
+            // moved past, while its `Failed` handler stops listening altogether, so
+            // calling `onError` here is what made a sentence skip kill playback.
+            onDone()
         } catch (error: Throwable) {
             Log.w(TAG, "playback failed", error)
             onError()
@@ -209,7 +229,12 @@ class NeuralTts(private val context: Context) {
         }
     }
 
-    /** Silences playback and abandons the utterance being synthesised. */
+    /**
+     * Silences playback and abandons the utterance being synthesised.
+     *
+     * Only ever called from the caller's thread; the engine itself is not touched, so
+     * this cannot free memory a worker is still using.
+     */
     fun stop() {
         generation.incrementAndGet()
         // Pause and flush rather than release: the worker owns the track and releases
@@ -218,9 +243,21 @@ class NeuralTts(private val context: Context) {
         runCatching { track?.flush() }
     }
 
-    /** Releases the engine. Safe to call repeatedly. */
+    /**
+     * Releases the engine, waiting for any utterance in flight to leave it.
+     *
+     * `release` on the caller's thread used to free the native `OfflineTts` while the
+     * worker could still be inside its blocking `generate`, which is a native
+     * use-after-free — a crash no `runCatching` can catch. Queueing the release behind
+     * the worker means the engine is only freed once the worker has finished with it.
+     */
     fun release() {
         stop()
+        runCatching { worker.submit { releaseLocked() }.get() }
+    }
+
+    /** Frees the engine. Must run on [worker] only. */
+    private fun releaseLocked() {
         runCatching { tts?.release() }
         tts = null
         loadedVoiceId = ""
@@ -228,8 +265,9 @@ class NeuralTts(private val context: Context) {
     }
 
     fun shutdown() {
-        release()
-        worker.shutdownNow()
+        stop()
+        runCatching { worker.submit { releaseLocked() }.get() }
+        worker.shutdown()
     }
 
     /** True once this utterance has been superseded by a stop or a newer one. */

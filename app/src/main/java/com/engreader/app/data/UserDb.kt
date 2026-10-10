@@ -41,6 +41,11 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
                 -- unknown rate can be recomputed as the wordbook grows without
                 -- re-tokenising and re-grading the body every time.
                 vocabProfile TEXT    NOT NULL DEFAULT '',
+                -- Word count, written when the body is. Cached because the shelf and
+                -- the table of contents need a total for a few hundred chapters
+                -- without loading a single body, and the SQL approximation they used
+                -- (counting spaces) disagreed with the reader's own count.
+                wordCount    INTEGER NOT NULL DEFAULT 0,
                 -- Set when the row is a chapter of an imported book. A plain article
                 -- leaves both at zero, which is what keeps the two kinds apart in
                 -- every query that lists one or the other.
@@ -50,6 +55,7 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
             """.trimIndent()
         )
         db.execSQL("CREATE UNIQUE INDEX idx_article_url ON article(url) WHERE url <> ''")
+        db.execSQL("CREATE INDEX idx_article_book ON article(bookId, chapterIndex)")
 
         db.execSQL(
             """
@@ -104,6 +110,7 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
             """.trimIndent()
         )
         db.execSQL("CREATE INDEX idx_session_day ON session(day)")
+        db.execSQL("CREATE INDEX idx_session_article ON session(articleId)")
 
         db.execSQL(
             """
@@ -116,6 +123,7 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
             )
             """.trimIndent()
         )
+        db.execSQL("CREATE INDEX idx_quiz_article ON quiz(articleId)")
 
         createBookTable(db)
     }
@@ -127,11 +135,15 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
      * dictionary and the quiz all work on a book chapter without knowing it is one.
      * `lastChapter` is on the book because "where was I" has to survive the reader
      * opening another chapter to check something.
+     *
+     * Every statement is `IF NOT EXISTS`: this runs from both `onCreate` and
+     * `onUpgrade`, and a half-applied upgrade has to be re-runnable, which the comment
+     * claimed but the plain `CREATE TABLE` did not deliver.
      */
     private fun createBookTable(db: SQLiteDatabase) {
         db.execSQL(
             """
-            CREATE TABLE book (
+            CREATE TABLE IF NOT EXISTS book (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 title        TEXT    NOT NULL,
                 author       TEXT    NOT NULL DEFAULT '',
@@ -146,8 +158,8 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
             )
             """.trimIndent()
         )
-        db.execSQL("CREATE INDEX idx_book_recent ON book(lastReadAt DESC)")
-        db.execSQL("CREATE INDEX idx_article_book ON article(bookId, chapterIndex)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_book_recent ON book(lastReadAt DESC)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_article_book ON article(bookId, chapterIndex)")
     }
 
     /**
@@ -172,6 +184,37 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
             addColumn(db, "article", "chapterIndex", "INTEGER NOT NULL DEFAULT 0")
             createBookTable(db)
         }
+        if (oldVersion < 4) {
+            // Backfilled with the reader's own word count rather than the space
+            // approximation the old queries used, so the shelf agrees with the article
+            // list from the first launch after the upgrade.
+            addColumn(db, "article", "wordCount", "INTEGER NOT NULL DEFAULT 0")
+            backfillWordCounts(db)
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_session_article ON session(articleId)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_quiz_article ON quiz(articleId)")
+        }
+    }
+
+    /**
+     * Fills [article.wordCount] for rows written before the column existed.
+     *
+     * The count comes from the same token rule the reader uses, so the shelf, the
+     * table of contents and the article list all report one number. `SQLiteOpenHelper`
+     * already runs the upgrade in a transaction, and the work is one pass over the
+     * stored bodies on a database the repositories only touch from a background
+     * dispatcher.
+     */
+    private fun backfillWordCounts(db: SQLiteDatabase) {
+        val rows = mutableListOf<Pair<Long, String>>()
+        db.rawQuery("SELECT id, body FROM article", null).use { c ->
+            while (c.moveToNext()) rows += c.getLong(0) to c.getString(1).orEmpty()
+        }
+        val update = db.compileStatement("UPDATE article SET wordCount = ? WHERE id = ?")
+        rows.forEach { (id, body) ->
+            update.bindLong(1, com.engreader.app.nlp.Tokenizer.countWords(body).toLong())
+            update.bindLong(2, id)
+            update.executeUpdateDelete()
+        }
     }
 
     private fun addColumn(db: SQLiteDatabase, table: String, column: String, spec: String) {
@@ -190,6 +233,6 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
 
     companion object {
         const val NAME = "engreader.db"
-        const val VERSION = 3
+        const val VERSION = 4
     }
 }

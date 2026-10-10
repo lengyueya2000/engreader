@@ -4,13 +4,22 @@ package com.engreader.app.source
 object Html {
 
     /**
+     * The inside of a start tag: everything up to the `>` that really closes it.
+     *
+     * `[^>]*` stops at the first `>`, including one inside a quoted attribute value:
+     * `<p title="5 > 3">alpha</p>` lost its tag and leaked `3">alpha` into the text.
+     * A quoted run is stepped over as a unit so the `>` inside it cannot end the tag.
+     */
+    internal const val ATTRS = "(?:[^>\"']|\"[^\"]*\"|'[^']*')*"
+
+    /**
      * A tag, requiring a tag name.
      *
      * `<[^>]+>` also matched prose comparisons: "x < y > z" lost everything between
      * the angle brackets. A name character after the `<` (or a closing `/`) is what
      * separates markup from arithmetic.
      */
-    private val TAGS = Regex("</?[A-Za-z][^>]*>")
+    private val TAGS = Regex("</?[A-Za-z]$ATTRS>")
 
     /**
      * Elements that end the text on either side of them.
@@ -27,7 +36,7 @@ object Html {
             "col|colgroup|dd|details|dialog|dir|div|dl|dt|embed|fieldset|figcaption|figure|" +
             "footer|form|h[1-6]|header|hgroup|hr|iframe|img|input|legend|li|main|menu|nav|" +
             "noframes|noscript|ol|optgroup|option|p|pre|select|section|summary|table|tbody|" +
-            "td|textarea|tfoot|th|thead|tr|ul|video)\\b[^>]*>",
+            "td|textarea|tfoot|th|thead|tr|ul|video)\\b$ATTRS>",
     )
 
     /**
@@ -53,7 +62,7 @@ object Html {
      * footer paragraph arrived as a final "Copyright © 2026 BBC…" paragraph and its
      * image captions arrived as stray sentences in the middle of the prose.
      */
-    private val CHROME = Regex("(?is)<(figure|figcaption|footer|template)\\b[^>]*>.*?</\\1\\s*>")
+    private val CHROME = Regex("(?is)<(figure|figcaption|footer|template)\\b$ATTRS>.*?</\\1\\s*>")
 
     /**
      * An element whose class marks its text as visible only to a screen reader.
@@ -66,9 +75,9 @@ object Html {
      */
     private val HIDDEN = Regex(
         "(?is)<(span|div|p|em|strong|i|b|a|small|sup|sub|label|td|li|h[1-6])\\b" +
-            "[^>]*class\\s*=\\s*(\"[^\"]*(?:visually-?hidden|sr-only|screen-?reader|" +
+            "$ATTRS class\\s*=\\s*(\"[^\"]*(?:visually-?hidden|sr-only|screen-?reader|" +
             "a11y-hidden|hidden-text)[^\"]*\"|'[^']*(?:visually-?hidden|sr-only|" +
-            "screen-?reader|a11y-hidden|hidden-text)[^']*')[^>]*>.{0,240}?</\\1\\s*>",
+            "screen-?reader|a11y-hidden|hidden-text)[^']*')$ATTRS>.{0,240}?</\\1\\s*>",
     )
 
     private val ENTITIES = mapOf(
@@ -78,12 +87,41 @@ object Html {
         "bull" to "•", "deg" to "°", "pound" to "£", "euro" to "€",
         "copy" to "©", "reg" to "®", "trade" to "™", "times" to "×",
         "laquo" to "«", "raquo" to "»", "prime" to "′", "Prime" to "″",
+        // Latin-1 letters that reach the app through real pages: a Guardian story
+        // about a café or a Reuters byline with an accent is otherwise left as
+        // literal `&eacute;` in the middle of the sentence.
+        "agrave" to "à", "aacute" to "á", "acirc" to "â", "atilde" to "ã",
+        "auml" to "ä", "aring" to "å", "aelig" to "æ", "ccedil" to "ç",
+        "egrave" to "è", "eacute" to "é", "ecirc" to "ê", "euml" to "ë",
+        "igrave" to "ì", "iacute" to "í", "icirc" to "î", "iuml" to "ï",
+        "ntilde" to "ñ", "ograve" to "ò", "oacute" to "ó", "ocirc" to "ô",
+        "otilde" to "õ", "ouml" to "ö", "oslash" to "ø", "ugrave" to "ù",
+        "uacute" to "ú", "ucirc" to "û", "uuml" to "ü", "yacute" to "ý",
+        "yuml" to "ÿ", "szlig" to "ß",
+        "Agrave" to "À", "Aacute" to "Á", "Acirc" to "Â", "Auml" to "Ä",
+        "Aring" to "Å", "AElig" to "Æ", "Ccedil" to "Ç", "Egrave" to "È",
+        "Eacute" to "É", "Ecirc" to "Ê", "Euml" to "Ë", "Iacute" to "Í",
+        "Ntilde" to "Ñ", "Ograve" to "Ò", "Oacute" to "Ó", "Ocirc" to "Ô",
+        "Ouml" to "Ö", "Oslash" to "Ø", "Ugrave" to "Ù", "Uacute" to "Ú",
+        "Uuml" to "Ü", "Yacute" to "Ý",
+        "sect" to "§", "para" to "¶", "dagger" to "†", "Dagger" to "‡",
+        "permil" to "‰", "frac12" to "½", "frac14" to "¼", "sup2" to "²",
+        "sup3" to "³", "ordf" to "ª", "ordm" to "º", "not" to "¬",
+        "shy" to "", "ensp" to " ", "emsp" to " ", "thinsp" to " ",
+        "minus" to "−", "plusmn" to "±", "divide" to "÷", "micro" to "µ",
+        "cent" to "¢", "curren" to "¤", "yen" to "¥", "brvbar" to "¦",
+        "iexcl" to "¡", "iquest" to "¿", "uml" to "¨", "acute" to "´",
+        "cedil" to "¸", "macr" to "¯", "circ" to "ˆ", "tilde" to "˜",
     )
 
-    private val NAMED = Regex("&([a-zA-Z][a-zA-Z0-9]{1,31});")
-
-    /** `&#39;` and `&#x27;`; the `x` may be either case, as HTML allows. */
-    private val NUMERIC = Regex("&#([xX]?)([0-9a-fA-F]+);")
+    /**
+     * One entity, numeric or named, matched in a single pass.
+     *
+     * Both forms have to be replaced together: decoding `&#38;lt;` with a numeric
+     * pass and then a named pass over the result turned the literal text `&lt;` into
+     * `<`, which is a second decode of the author's own characters.
+     */
+    private val ENTITY = Regex("&(#(?:[xX][0-9a-fA-F]+|[0-9]+)|[a-zA-Z][a-zA-Z0-9]{1,31});")
 
     /**
      * Decodes entities, twice when the first pass exposes another layer.
@@ -108,15 +146,29 @@ object Html {
      */
     fun decodeOnce(input: String): String {
         if ('&' !in input) return input
-        var out = NUMERIC.replace(input) { m ->
-            val code = m.groupValues[2].toIntOrNull(if (m.groupValues[1].isEmpty()) 10 else 16)
-            code?.takeIf { it in 0x1..0x10FFFF }?.let { String(Character.toChars(it)) } ?: m.value
+        return ENTITY.replace(input) { m ->
+            val body = m.groupValues[1]
+            if (body.startsWith("#")) decodeNumeric(body) ?: m.value else named(body) ?: m.value
         }
-        out = NAMED.replace(out) { m ->
-            ENTITIES[m.groupValues[1]] ?: ENTITIES[m.groupValues[1].lowercase()] ?: m.value
-        }
-        return out
     }
+
+    private fun decodeNumeric(body: String): String? {
+        val hex = body.length > 1 && (body[1] == 'x' || body[1] == 'X')
+        val digits = body.substring(if (hex) 2 else 1)
+        val code = digits.toIntOrNull(if (hex) 16 else 10) ?: return null
+        // A lone surrogate has no UTF-8 encoding and is not a character: the range
+        // 0xD800..0xDFFF would produce a String that later breaks encoding, so the
+        // reference is left as written rather than turned into an unpaired half.
+        if (code !in 0x1..0x10FFFF) return null
+        if (code in 0xD800..0xDFFF) return null
+        return String(Character.toChars(code))
+    }
+
+    private fun named(name: String): String? =
+        ENTITIES[name] ?: ENTITIES[name.lowercase()]
+
+    /** The character a named entity stands for, for callers that must rewrite markup. */
+    internal fun entity(name: String): String? = named(name)
 
     /** Decodes entities, drops markup, and collapses whitespace into single spaces. */
     fun text(html: String): String {

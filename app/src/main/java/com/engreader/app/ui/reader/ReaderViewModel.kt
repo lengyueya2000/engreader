@@ -126,14 +126,16 @@ private fun AppContainer.lookupState(
     entry: WordEntry?,
     saved: Boolean,
     sentence: String,
+    glosses: List<Pair<com.engreader.app.dict.PartOfSpeech, String>> = emptyList(),
+    family: List<com.engreader.app.dict.WordForm> = emptyList(),
 ) = LookupState(
     query = query,
     entry = entry,
     saved = saved,
     loading = false,
-    glosses = entry?.let { dictionary.glosses(it.translation) } ?: emptyList(),
+    glosses = glosses,
     inSentence = sentence,
-    family = entry?.let { dictionary.family(it) } ?: emptyList(),
+    family = family,
 )
 
 /**
@@ -167,7 +169,6 @@ class ReaderViewModel(
     private var sessionStart = 0L
     private var speechJob: Job? = null
     private var translationJob: Job? = null
-    private var activeScope: CoroutineScope? = null
     private var lastSpokenIndex = -1
 
     suspend fun load() {
@@ -177,15 +178,21 @@ class ReaderViewModel(
             state = state.copy(loading = false, error = "文章已不存在")
             return
         }
-        val paragraphs = Paragraphs.split(article.body).map { p ->
-            ReaderParagraph(p, Sentences.split(p.text))
-        }
-        val flat = buildList {
-            paragraphs.forEachIndexed { pi, rp ->
-                rp.sentences.forEachIndexed { si, s ->
-                    add(FlatSentence(pi, si, s.text))
+        // Splitting a long article into paragraphs and sentences is pure CPU work over
+        // the whole body; on the main thread it is a visible stall when the reader
+        // opens, which is exactly the moment a stall is most obvious.
+        val (paragraphs, flat) = withContext(Dispatchers.Default) {
+            val split = Paragraphs.split(article.body).map { p ->
+                ReaderParagraph(p, Sentences.split(p.text))
+            }
+            val flat = buildList {
+                split.forEachIndexed { pi, rp ->
+                    rp.sentences.forEachIndexed { si, s ->
+                        add(FlatSentence(pi, si, s.text))
+                    }
                 }
             }
+            split to flat
         }
         val settings = container.settings
         state = state.copy(
@@ -254,15 +261,19 @@ class ReaderViewModel(
     }
 
     /** Saves every word in the article's new-word list, so a hard text can be pre-studied. */
-    suspend fun saveUnknownWords() {
+    fun saveUnknownWords() {
         val unknown = state.vocabulary?.unknown.orEmpty()
-        unknown.forEach { lemma ->
-            container.dictionary.lookup(lemma)?.let { container.wordbook.save(it) }
-        }
         state = state.copy(
             savedLemmas = state.savedLemmas + unknown.map { it.lowercase() },
             newWordsVisible = false,
         )
+        // The panel closes immediately and the writes continue on the container's
+        // scope, so dismissing it does not cancel the saves it just promised.
+        container.appScope.launch(Dispatchers.IO) {
+            unknown.forEach { lemma ->
+                container.dictionary.lookup(lemma)?.let { container.wordbook.save(it) }
+            }
+        }
     }
 
     fun setNewWordsVisible(visible: Boolean) {
@@ -293,6 +304,26 @@ class ReaderViewModel(
             // a book that was read for an hour as never having been opened.
             if (bookId > 0) container.books.addReadSeconds(bookId, seconds)
         }
+    }
+
+    // ------------------------------------------------------------ lifecycle
+
+    /**
+     * Called when the app leaves the foreground.
+     *
+     * Reading time used to be the wall-clock gap between opening the article and
+     * leaving it, so pocketing the phone for an hour added an hour of "reading". The
+     * clock is stopped here and restarted in [onEnterForeground]; playback is stopped
+     * too, because the neural engine keeps talking from the background.
+     */
+    fun onEnterBackground() {
+        flushProgress()
+        if (state.listening) stopListening()
+    }
+
+    /** Restarts the reading clock after [onEnterBackground] stopped it. */
+    fun onEnterForeground() {
+        if (state.article != null) sessionStart = System.currentTimeMillis()
     }
 
     // ------------------------------------------------------------- chapters
@@ -330,7 +361,16 @@ class ReaderViewModel(
         state = state.copy(
             lookup = LookupState(query = query, entry = null, saved = false, loading = true, inSentence = sentence),
         )
-        val entry = container.dictionary.lookup(query)
+        // The dictionary is a SQLite file and the gloss/family breakdown are two more
+        // queries; all of it used to run on the main thread under the sheet's spinner.
+        val (entry, glosses, family) = withContext(Dispatchers.IO) {
+            val found = container.dictionary.lookup(query)
+            Triple(
+                found,
+                found?.let { container.dictionary.glosses(it.translation) } ?: emptyList(),
+                found?.let { container.dictionary.family(it) } ?: emptyList(),
+            )
+        }
         val saved = entry?.let { container.wordbook.contains(it.lemma) } ?: false
         // Once a word has been answered correctly the Chinese gloss steps back and
         // the English definition leads, with the gloss still one tap away. Only when
@@ -341,7 +381,7 @@ class ReaderViewModel(
             container.wordbook.isKnown(entry.lemma)
         state = state.copy(
             lookup = container.lookupState(query, entry, saved, sentence)
-                .copy(englishFirst = englishFirst),
+                .copy(englishFirst = englishFirst, glosses = glosses, family = family),
         )
         if (entry != null) {
             lookups++
@@ -370,17 +410,28 @@ class ReaderViewModel(
      */
     suspend fun switchReading(headword: String) {
         val lookup = state.lookup ?: return
-        val entry = container.dictionary.lookupHeadword(headword, lookup.query) ?: return
+        // The reading being left is offered as the alternative, so the switch can be
+        // undone: without it the chip vanished and there was no way back.
+        val (entry, glosses, family) = withContext(Dispatchers.IO) {
+            val found = container.dictionary
+                .lookupHeadword(headword, lookup.query, previous = lookup.entry) ?: return@withContext null
+            Triple(
+                found,
+                container.dictionary.glosses(found.translation),
+                container.dictionary.family(found),
+            )
+        } ?: return
         val saved = container.wordbook.contains(entry.lemma)
         state = state.copy(
-            lookup = container.lookupState(lookup.query, entry, saved, lookup.inSentence)
-                .copy(
-                    englishFirst = entry.hasEnglishDefinition &&
-                        container.wordbook.isKnown(entry.lemma),
-                    // A deliberate switch to another reading is a request to see it;
-                    // keeping the gloss collapsed would hide the thing just asked for.
-                    showChinese = true,
-                ),
+            lookup = container.lookupState(
+                lookup.query, entry, saved, lookup.inSentence, glosses, family,
+            ).copy(
+                englishFirst = entry.hasEnglishDefinition &&
+                    container.wordbook.isKnown(entry.lemma),
+                // A deliberate switch to another reading is a request to see it;
+                // keeping the gloss collapsed would hide the thing just asked for.
+                showChinese = true,
+            ),
         )
     }
 
@@ -409,7 +460,9 @@ class ReaderViewModel(
     // -------------------------------------------------------------- grammar
 
     suspend fun analyze(sentence: String) {
-        val analysis = container.grammar.analyze(sentence)
+        // Parsing a sentence runs the tokeniser, the POS guesser and a dictionary
+        // lookup per word — tens of milliseconds of work that used to block the tap.
+        val analysis = withContext(Dispatchers.Default) { container.grammar.analyze(sentence) }
         state = state.copy(analysis = analysis, analysisSentence = sentence)
     }
 
@@ -519,7 +572,6 @@ class ReaderViewModel(
     fun startListening(scope: CoroutineScope, fromIndex: Int = 0) {
         val sentences = state.flatSentences
         if (sentences.isEmpty()) return
-        activeScope = scope
         lastSpokenIndex = fromIndex.coerceIn(0, sentences.lastIndex)
         state = state.copy(listening = true, speakingSentence = lastSpokenIndex)
         speakAt(lastSpokenIndex)
@@ -594,7 +646,11 @@ class ReaderViewModel(
     suspend fun prepareQuiz(): List<QuizQuestion> {
         state.quiz.takeIf { it.isNotEmpty() }?.let { return it }
         val article = state.article ?: return emptyList()
-        val questions = container.quiz.build(article.body, maxQuestions = 5)
+        // Building the questions re-reads the whole article and looks every candidate
+        // up in the dictionary; it is the heaviest thing the reader does on demand.
+        val questions = withContext(Dispatchers.Default) {
+            container.quiz.build(article.body, maxQuestions = 5)
+        }
         if (questions.isNotEmpty()) container.articles.saveQuiz(articleId, questions)
         state = state.copy(quiz = questions)
         return questions
@@ -604,14 +660,23 @@ class ReaderViewModel(
         state = state.copy(quizVisible = visible)
     }
 
-    suspend fun setSaved(saved: Boolean) {
+    /**
+     * Adds or removes the article from the saved list.
+     *
+     * The row is updated in place and the write is handed to the container's scope:
+     * the screen's own scope is cancelled the moment the reader leaves, and a bookmark
+     * that was tapped a moment before backing out still has to reach the database.
+     */
+    fun setSaved(saved: Boolean) {
         val article = state.article ?: return
-        container.articles.setSaved(article.id, saved)
         state = state.copy(article = article.copy(saved = saved))
+        container.appScope.launch(Dispatchers.IO) { container.articles.setSaved(article.id, saved) }
     }
 
-    suspend fun recordQuiz(correct: Int, total: Int) {
-        container.wordbook.recordQuiz(articleId, correct, total)
+    fun recordQuiz(correct: Int, total: Int) {
+        container.appScope.launch(Dispatchers.IO) {
+            container.wordbook.recordQuiz(articleId, correct, total)
+        }
     }
 
     override fun onCleared() {

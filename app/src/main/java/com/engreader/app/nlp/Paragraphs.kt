@@ -16,7 +16,15 @@ data class WordSpan(val start: Int, val end: Int, val text: String)
  */
 object Paragraphs {
 
-    private val WORD = Regex("[A-Za-z][A-Za-z'\\u2019-]*")
+    /**
+     * The same word class the tokenizer uses.
+     *
+     * A private ASCII-only copy lived here, so the reader split `café` into `caf` and
+     * a tap on the accented character landed outside every span. Sharing one pattern
+     * is what keeps the offsets a tap is matched against identical to the ones the
+     * word count is computed from.
+     */
+    private val WORD = Tokenizer.WORD
 
     fun split(body: String): List<Paragraph> =
         body.split(Regex("\n\\s*\n|\\n"))

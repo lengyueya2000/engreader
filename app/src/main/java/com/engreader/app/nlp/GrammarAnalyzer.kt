@@ -110,7 +110,14 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
             buildClause(seg, index, depth = if (seg.kind == ClauseKind.Main) 0 else 1)
         }
 
-        val main = clauses.firstOrNull { it.kind == ClauseKind.Main } ?: clauses.firstOrNull()
+        // A sentence whose subject is separated from its verb by a relative or
+        // participial phrase ("The report, published in 2020, revealed the evidence")
+        // segments as two main pieces, and the first one is a bare noun phrase. The
+        // backbone is the piece that actually carries a verb, or the panel would show
+        // "The report" as the whole sentence and drop what it says.
+        val main = clauses.firstOrNull { it.kind == ClauseKind.Main && it.verb.isNotBlank() }
+            ?: clauses.firstOrNull { it.kind == ClauseKind.Main }
+            ?: clauses.firstOrNull()
         val backbone = main?.let { backboneOf(it) } ?: sentence
         val chunks = main?.let { chunk(it) } ?: emptyList()
         val notes = buildNotes(sentence, clauses, main)
@@ -185,7 +192,7 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
                 }
 
                 // Participial phrase: `Faced with ...`, `Having said that ...`
-                i > 0 && isParticiple(tokens[i]) && isNonFiniteStart(sentence, offsets[i], i, lower) -> {
+                i > 0 && isParticipleMarker(sentence, offsets, i, lower) -> {
                     markers += Marker(offsets[i], offsets[i] + tokens[i].length, tokens[i], ClauseKind.NonFinite, true)
                 }
 
@@ -356,6 +363,31 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
         return (w.endsWith("ing") || w.endsWith("ed") || w.endsWith("en")) && isVerb(w)
     }
 
+    /**
+     * True when an `-ing`/`-ed` form here opens a participial phrase rather than being
+     * the sentence's own finite verb.
+     *
+     * `-ed` is both the past tense and the past participle, so "revealed" after a comma
+     * looked like a participial phrase: "The report, which was published on Monday,
+     * revealed the evidence." came back with a main clause of just "The report" and
+     * "revealed the evidence" labelled 非谓语. Two things tell the two apart. A form
+     * right after an auxiliary belongs to that verb phrase ("which was published"),
+     * so it is never a marker of its own. And a participle modifies a noun: if no
+     * finite verb follows it, then this word *is* the sentence's verb.
+     */
+    private fun isParticipleMarker(
+        sentence: String,
+        offsets: List<Int>,
+        index: Int,
+        lower: List<String>,
+    ): Boolean {
+        val word = lower.getOrNull(index).orEmpty()
+        if (!isParticiple(word)) return false
+        if (lower.getOrNull(index - 1) in AUXILIARIES) return false
+        if (!isNonFiniteStart(sentence, offsets[index], index, lower)) return false
+        return (index + 1 until lower.size).any { isFiniteVerb(lower, it) }
+    }
+
     private fun isLikelyNoun(word: String): Boolean = when (posOf(word)) {
         PartOfSpeech.Noun, PartOfSpeech.Pronoun, PartOfSpeech.Unknown -> true
         else -> false
@@ -400,9 +432,16 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
             // A subordinate clause at the front of the sentence is closed by the
             // comma that separates it from the main clause; everything after that
             // comma is the main clause, not part of the subordinate one.
-            val splitAt = if (out.isEmpty() || out.last().kind != ClauseKind.Main) {
-                frontedSplit(raw, marker)
-            } else -1
+            //
+            // A relative or participial phrase is attempted even once a main segment
+            // exists. Those attach to a noun and can be followed by the main clause's
+            // own verb, so in "The report, published in 2020, revealed the evidence"
+            // the head "The report" is already a main segment and the guard would
+            // otherwise leave the whole rest of the sentence inside the phrase.
+            val fronted = out.isEmpty() || out.last().kind != ClauseKind.Main
+            val attachesToNoun = marker.kind == ClauseKind.Relative ||
+                marker.kind == ClauseKind.NonFinite
+            val splitAt = if (fronted || attachesToNoun) frontedSplit(raw, marker) else -1
 
             if (splitAt > 0) {
                 val clauseText = raw.substring(0, splitAt).trim().trimEnd(',', ';', ':').trim()
@@ -426,7 +465,12 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
      * -1 when the clause is not fronted or no main clause can be located.
      */
     private fun frontedSplit(raw: String, marker: Marker): Int {
-        if (marker.kind != ClauseKind.Adverbial && marker.kind != ClauseKind.NonFinite) return -1
+        if (marker.kind != ClauseKind.Adverbial &&
+            marker.kind != ClauseKind.NonFinite &&
+            marker.kind != ClauseKind.Relative
+        ) {
+            return -1
+        }
         val comma = raw.indexOf(',')
         if (comma > 0) {
             val rest = raw.substring(comma + 1).trim()
@@ -462,15 +506,40 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
         var steps = 0
         while (start > firstVerb && steps < 5) {
             val prev = lower[start - 1]
+            // A determiner or a nominative pronoun opens the main clause's noun phrase,
+            // so it is the boundary: "…was late the government announced" has the
+            // subject "the government", not "late the government". Without this the
+            // subordinate clause's complement was swallowed into the main subject,
+            // because an adjective before a noun looks like any other modifier.
+            if (prev in NOUN_PHRASE_OPENERS) {
+                start--
+                break
+            }
             if (prev in COORDINATORS || prev in SUBORDINATORS) break
             if (posOf(prev) == PartOfSpeech.Preposition) break
             if (isFiniteVerb(lower, start - 1)) break
             start--
             steps++
         }
-        // The main clause needs at least one word before its verb.
+        // The main clause needs at least one word before its verb. The one exception is
+        // an object relative — "the decision that the minister announced affected
+        // thousands" — where the main clause's verb comes straight after the relative
+        // clause's own verb with no subject between them, because the subject is the
+        // head noun the relative clause hangs off. Splitting there at least keeps the
+        // main verb out of the relative clause.
+        if (start == secondVerb && isFiniteVerb(lower, start - 1)) {
+            return offsets[start]
+        }
         return if (start in (firstVerb + 1) until secondVerb) offsets[start] else -1
     }
+
+    /** Words that begin a noun phrase, i.e. where a main clause's subject starts. */
+    private val NOUN_PHRASE_OPENERS = setOf(
+        "a", "an", "the", "this", "that", "these", "those", "my", "your", "his",
+        "her", "its", "our", "their", "i", "you", "he", "she", "it", "we", "they",
+        "there", "who", "which", "what", "someone", "anyone", "everyone", "nobody",
+        "something", "anything", "everything", "nothing",
+    )
 
     private fun addSegment(
         out: MutableList<Segment>,
@@ -563,17 +632,26 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
         var i = verbStart
         var end = offsets[i] + tokens[i].length
         var i2 = i + 1
+        // An auxiliary takes whatever follows it as part of the same verb phrase, so
+        // "was published" and "had been gathered" stay whole. A second *lexical* verb
+        // does not: "announced affected" is two predicates, and merging them swallowed
+        // the main clause's verb into the relative clause before it.
+        var prevAux = tokens[i].lowercase() in AUXILIARIES ||
+            PartOfSpeechParser.contraction(tokens[i]) != null
         while (i2 < tokens.size) {
             val w = tokens[i2].lowercase()
             // A contraction that carries its own subject opens a new clause — in
             // "the minister said it's a problem", `it's` is the subject and verb of
             // what was said, not a tail of `said`.
             if (PartOfSpeechParser.contraction(w)?.subject != null) break
-            val isVerbLike = w in AUXILIARIES || posOf(w) == PartOfSpeech.Verb
+            val isAux = w in AUXILIARIES
+            val isVerbLike = isAux || posOf(w) == PartOfSpeech.Verb
             val isNegation = w == "not" || w == "n't" || w == "never"
             val isAdverb = posOf(w) == PartOfSpeech.Adverb && i2 == i + 1
-            if (isVerbLike || isNegation || isAdverb) {
+            val continuesVerbPhrase = isAux || (isVerbLike && prevAux)
+            if (continuesVerbPhrase || isNegation || isAdverb) {
                 end = offsets[i2] + tokens[i2].length
+                prevAux = isAux
                 i2++
                 i = i2 - 1
             } else break

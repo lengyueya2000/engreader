@@ -42,6 +42,12 @@ class BookRepository(
      * a 25 MB EPUB with a hundred illustrations is worth about a megabyte of text,
      * and storing the original would mean re-parsing it on every open. The cover is
      * the one binary asset kept, because the shelf shows it.
+     *
+     * The book row, its cover path and every chapter are written in one transaction.
+     * They used to be split — the row and the cover were committed before the chapter
+     * loop began — so a failure part way through left a book on the shelf with no
+     * chapters and an orphan image on disk, which is exactly what the comment on the
+     * transaction claimed could not happen.
      */
     suspend fun import(uri: Uri, displayName: String): Book = withContext(Dispatchers.IO) {
         val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
@@ -66,56 +72,70 @@ class BookRepository(
         val fileName = displayName.takeIf { it.isNotBlank() } ?: uri.lastPathSegment.orEmpty()
         val now = System.currentTimeMillis()
 
-        val id = db.writableDatabase.insertOrThrow(
-            "book", null,
-            ContentValues().apply {
-                put("title", title)
-                put("author", parsed.author)
-                put("format", format.label)
-                put("fileName", fileName)
-                put("chapterCount", parsed.chapters.size)
-                put("addedAt", now)
-                put("lastChapter", 0)
-            },
-        )
+        var coverFile = ""
+        val id = try {
+            db.writableDatabase.run {
+                beginTransaction()
+                try {
+                    val rowId = insertOrThrow(
+                        "book", null,
+                        ContentValues().apply {
+                            put("title", title)
+                            put("author", parsed.author)
+                            put("format", format.label)
+                            put("fileName", fileName)
+                            put("chapterCount", parsed.chapters.size)
+                            put("addedAt", now)
+                            put("lastChapter", 0)
+                        },
+                    )
+                    // The image is written while the row's id is known but before the
+                    // commit, so a failed write aborts the whole import rather than
+                    // leaving a book whose cover points at nothing.
+                    coverFile = parsed.cover?.let { writeCover(rowId, it, parsed.coverExtension) }.orEmpty()
+                    if (coverFile.isNotEmpty()) {
+                        update(
+                            "book",
+                            ContentValues().apply { put("coverFile", coverFile) },
+                            "id = ?", arrayOf(rowId.toString()),
+                        )
+                    }
 
-        val coverFile = parsed.cover?.let { writeCover(id, it, parsed.coverExtension) }.orEmpty()
-        if (coverFile.isNotEmpty()) {
-            db.writableDatabase.update(
-                "book",
-                ContentValues().apply { put("coverFile", coverFile) },
-                "id = ?", arrayOf(id.toString()),
-            )
-        }
-
-        // One transaction for the whole book: a novel is a few hundred inserts, and
-        // committing each one would make an import of Moby Dick take seconds. It also
-        // means a failure half way leaves no book at all rather than a partial one.
-        db.writableDatabase.beginTransaction()
-        try {
-            parsed.chapters.forEachIndexed { index, chapter ->
-                val values = ContentValues().apply {
-                    put("sourceId", BOOK_SOURCE)
-                    put("title", chapter.title.ifBlank { "第 ${index + 1} 节" })
-                    put("subtitle", parsed.author)
-                    put("url", chapterUrl(id, index))
-                    put("author", parsed.author)
-                    put("publishedAt", 0)
-                    put("difficulty", ArticleExtractor.estimateDifficulty(
-                        chapter.text, grader.grade(chapter.text).grade,
-                    ))
-                    put("body", chapter.text)
-                    put("fetchedAt", now)
-                    put("bookId", id)
-                    put("chapterIndex", index)
+                    // One transaction for the whole book: a novel is a few hundred
+                    // inserts, and committing each one would make an import of Moby
+                    // Dick take seconds.
+                    parsed.chapters.forEachIndexed { index, chapter ->
+                        val values = ContentValues().apply {
+                            put("sourceId", BOOK_SOURCE)
+                            put("title", chapter.title.ifBlank { "第 ${index + 1} 节" })
+                            put("subtitle", parsed.author)
+                            put("url", chapterUrl(rowId, index))
+                            put("author", parsed.author)
+                            put("publishedAt", 0)
+                            put("difficulty", ArticleExtractor.estimateDifficulty(
+                                chapter.text, grader.grade(chapter.text).grade,
+                            ))
+                            put("body", chapter.text)
+                            put("wordCount", chapter.wordCount)
+                            put("fetchedAt", now)
+                            put("bookId", rowId)
+                            put("chapterIndex", index)
+                        }
+                        insertWithOnConflict(
+                            "article", null, values,
+                            android.database.sqlite.SQLiteDatabase.CONFLICT_IGNORE,
+                        )
+                    }
+                    setTransactionSuccessful()
+                    rowId
+                } finally {
+                    endTransaction()
                 }
-                db.writableDatabase.insertWithOnConflict(
-                    "article", null, values, android.database.sqlite.SQLiteDatabase.CONFLICT_IGNORE,
-                )
             }
-            db.writableDatabase.setTransactionSuccessful()
-        } finally {
-            db.writableDatabase.endTransaction()
+        } catch (e: Exception) {
+            // The row was rolled back, so the image written above belongs to nothing.
+            if (coverFile.isNotEmpty()) File(coversDir(), coverFile).delete()
+            throw e
         }
 
         requireNotNull(get(id)) { "书籍写入失败" }
@@ -123,6 +143,13 @@ class BookRepository(
 
     suspend fun all(): List<Book> = withContext(Dispatchers.IO) {
         db.readableDatabase.rawQuery("$SELECT ORDER BY addedAt DESC", null).use { it.toBooks() }
+    }
+
+    /** The imported book with this file name, or null. */
+    suspend fun findByFileName(fileName: String): Book? = withContext(Dispatchers.IO) {
+        if (fileName.isBlank()) return@withContext null
+        db.readableDatabase.rawQuery("$SELECT WHERE fileName = ? LIMIT 1", arrayOf(fileName))
+            .use { if (it.moveToFirst()) it.toBook() else null }
     }
 
     /** Books the reader has opened, most recent first, for the "continue reading" card. */
@@ -147,9 +174,8 @@ class BookRepository(
      */
     suspend fun chapters(bookId: Long): List<ChapterRef> = withContext(Dispatchers.IO) {
         db.readableDatabase.rawQuery(
-            "SELECT id, chapterIndex, title, " +
-                "(LENGTH(body) - LENGTH(REPLACE(body, ' ', '')) + 1) AS words " +
-                "FROM article WHERE bookId = ? ORDER BY chapterIndex ASC",
+            "SELECT id, chapterIndex, title, wordCount FROM article " +
+                "WHERE bookId = ? ORDER BY chapterIndex ASC",
             arrayOf(bookId.toString()),
         ).use { c ->
             buildList {
@@ -210,20 +236,32 @@ class BookRepository(
         Unit
     }
 
-    /** Removes a book, its chapters and its cover image. */
+    /**
+     * Removes a book, its chapters, its cover image and the study rows that belong to
+     * its chapters.
+     *
+     * A chapter is an ordinary article, so a session or a quiz result for one would
+     * survive the delete and keep contributing to the stats screen's totals — and
+     * "articles started" would count a book that is no longer on the shelf. Look-ups
+     * are deliberately left alone: the word was still met while reading, and the
+     * wordbook's history should not lose it because the book it came from was deleted.
+     */
     suspend fun delete(id: Long) = withContext(Dispatchers.IO) {
         val cover = get(id)?.coverFile
         db.writableDatabase.beginTransaction()
         try {
-            // Look-ups reference an article by id and are kept: the word was still met
-            // while reading, and the wordbook's history should not lose it because the
-            // book it came from was deleted.
-            db.writableDatabase.delete("article", "bookId = ?", arrayOf(id.toString()))
-            db.writableDatabase.delete("book", "id = ?", arrayOf(id.toString()))
+            val chapters = "articleId IN (SELECT id FROM article WHERE bookId = ?)"
+            val args = arrayOf(id.toString())
+            db.writableDatabase.delete("session", chapters, args)
+            db.writableDatabase.delete("quiz", chapters, args)
+            db.writableDatabase.delete("article", "bookId = ?", args)
+            db.writableDatabase.delete("book", "id = ?", args)
             db.writableDatabase.setTransactionSuccessful()
         } finally {
             db.writableDatabase.endTransaction()
         }
+        // Deleted after the commit: a rolled-back delete must not take the image with
+        // it, or the book would come back with a broken cover.
         cover?.takeIf { it.isNotBlank() }?.let { File(coversDir(), it).delete() }
         Unit
     }
@@ -235,13 +273,15 @@ class BookRepository(
         return file.takeIf { it.isFile && it.length() > 0 }
     }
 
-    /** True when a book with this file name was already imported. */
-    suspend fun isImported(fileName: String): Boolean = withContext(Dispatchers.IO) {
-        if (fileName.isBlank()) return@withContext false
-        db.readableDatabase.rawQuery(
-            "SELECT COUNT(*) FROM book WHERE fileName = ?", arrayOf(fileName),
-        ).use { it.moveToFirst() && it.getInt(0) > 0 }
-    }
+    /**
+     * True when a book with this file name was already imported.
+     *
+     * Kept for callers that want to ask without importing; [import] itself uses
+     * [findByFileName], because a second import of the same file used to create a
+     * second book and a second set of chapter rows — the URL uniqueness that protects
+     * articles is scoped per book id, so the chapters did not collide either.
+     */
+    suspend fun isImported(fileName: String): Boolean = findByFileName(fileName) != null
 
     private fun writeCover(bookId: Long, bytes: ByteArray, extension: String): String {
         val dir = coversDir()
@@ -281,15 +321,14 @@ class BookRepository(
     /**
      * Word count of the whole book, summed from its chapters.
      *
-     * Computed on read rather than stored: a book's chapters are written once and
-     * never change, so this is a cheap `SUM` over an indexed column, and keeping a
-     * second copy of the number in the book row would be one more thing to keep in
-     * step with a body edit.
+     * Read from the stored column rather than computed: a book's chapters are written
+     * once and never change, so this is a cheap `SUM` over an indexed column, and the
+     * space-counting expression it replaced disagreed with [Article.wordCount] — which
+     * the reader and the article list both show.
      */
     private fun wordCountOf(bookId: Long): Int =
         db.readableDatabase.rawQuery(
-            "SELECT SUM(LENGTH(body) - LENGTH(REPLACE(body, ' ', '')) + 1) FROM article " +
-                "WHERE bookId = ?",
+            "SELECT SUM(wordCount) FROM article WHERE bookId = ?",
             arrayOf(bookId.toString()),
         ).use { if (it.moveToFirst() && !it.isNull(0)) it.getInt(0) else 0 }
 

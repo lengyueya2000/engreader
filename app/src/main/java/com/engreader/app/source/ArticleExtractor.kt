@@ -29,12 +29,12 @@ object ArticleExtractor {
         RegexOption.IGNORE_CASE,
     )
 
-    private val PARAGRAPH = Regex("(?is)<p\\b([^>]*)>(.*?)</p>")
-    private val HEADING = Regex("(?is)<h([12])\\b[^>]*>(.*?)</h\\1>")
-    private val TITLE_TAG = Regex("(?is)<title[^>]*>(.*?)</title>")
+    private val PARAGRAPH = Regex("(?is)<p\\b(${Html.ATTRS})>(.*?)</p>")
+    private val HEADING = Regex("(?is)<h([12])\\b${Html.ATTRS}>(.*?)</h\\1>")
+    private val TITLE_TAG = Regex("(?is)<title${Html.ATTRS}>(.*?)</title>")
 
     /** A whole link, so the text a card headline is made of can be told apart. */
-    private val ANCHOR = Regex("(?is)<a\\b[^>]*>.*?</a\\s*>")
+    private val ANCHOR = Regex("(?is)<a\\b${Html.ATTRS}>.*?</a\\s*>")
 
     /**
      * A whole `<meta>` tag, with quoted values allowed to contain `>`.
@@ -159,9 +159,8 @@ object ArticleExtractor {
         // document order. Sorting by `doc.indexOf(text)` does not work: the text has
         // been entity-decoded and whitespace-collapsed, so it usually does not appear
         // verbatim and `indexOf` returns -1 for every block.
-        val blocks = Regex("(?is)<(?:div|section|article|li|blockquote)\\b[^>]*>(.*?)</(?:div|section|article|li|blockquote)>")
-            .findAll(doc)
-            .map { it.range.first to Html.text(it.groupValues[1]) }
+        val blocks = blockTexts(doc)
+            .map { it.first to Html.text(it.second) }
             .filter { (_, text) -> text.length in 80..4000 }
             .filterNot { (_, text) -> JUNK.containsMatchIn(text) && text.length < 240 }
             .filterNot { (_, text) -> headings.contains(text) }
@@ -174,6 +173,39 @@ object ArticleExtractor {
             .sortedBy { it.first }
             .map { it.second }
         return if (merged.isEmpty()) seed else merged
+    }
+
+    /** Containers whose text is a candidate when the page has no usable `<p>`. */
+    private val CONTAINERS = setOf("div", "section", "article", "li", "blockquote")
+
+    private val ANY_TAG = Regex("(?is)<(/?)([A-Za-z][A-Za-z0-9]*)\\b${Html.ATTRS}>")
+
+    /**
+     * Content of each top-level container in [CONTAINERS], with its offset.
+     *
+     * A lazy regex ends the block at the first closing tag of *any* of the names, so
+     * `<div><div>a</div>b</div>` yielded `a` and dropped `b`. Tags are matched with a
+     * depth counter instead, which is what makes nesting come out whole.
+     */
+    private fun blockTexts(doc: String): List<Pair<Int, String>> {
+        val out = mutableListOf<Pair<Int, String>>()
+        // Name to the offset just past its opening tag, outermost first.
+        val open = ArrayDeque<Pair<String, Int>>()
+        for (tag in ANY_TAG.findAll(doc)) {
+            val name = tag.groupValues[2].lowercase()
+            if (name !in CONTAINERS) continue
+            if (tag.groupValues[1].isEmpty()) {
+                open.addLast(name to tag.range.last + 1)
+                continue
+            }
+            val depth = open.indexOfLast { it.first == name }
+            if (depth < 0) continue
+            // A tag left unclosed inside is dropped rather than kept on the stack.
+            while (open.size > depth + 1) open.removeLast()
+            val start = open.removeLast().second
+            out += start to doc.substring(start, tag.range.first)
+        }
+        return out
     }
 
     private fun firstGroup(regex: Regex, doc: String): String? =

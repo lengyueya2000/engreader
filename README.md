@@ -58,6 +58,10 @@
 
 **几类假段落要单独认出来。** BBC 用 `visually-hidden` 的 class 藏辅助阅读文字，其中 `, external` 跟在每个外链后面，会把一个已结束的句子变成 `…in a post on X., external`；图注和页脚都是普通 `<p>` 写的，页脚因此变成正文最后一段"Copyright © 2026 BBC…"，图注变成插在散文中间的孤立句子；"延伸阅读"卡片也是普通 `<p>`，只是整段被 `<a>` 包住，长度过滤拦不住。现在这三类分别按 class、按容器（`figure`/`figcaption`/`footer`）和按链接范围剔除。
 
+**标签里的 `>` 不能提前结束标签。** 早先的属性部分写成 `[^>]*`，遇到 `title="5 > 3"` 这种合法写法就在引号内的 `>` 处收尾，于是标签没被匹配、`3">alpha` 漏进正文。现在引号内的一整段被当作整体跳过，`>` 只有在引号外才算标签结束。同理，没有 `<p>` 可用的页面会回退到"块级容器之间的最长文本块"，取块用的是深度计数而不是惰性正则——`<div><div>a</div>b</div>` 以前只拿到 `a`，`b` 被丢掉。
+
+**命名空间前缀要剥掉。** RSS 解析器不处理命名空间，拿到的元素名是带前缀的 QName；直接和 `content`、`date` 比较，等于把 `media:content`、`media:thumbnail`、`dc:date` 全部丢掉——线上目录源里这些元素是配图与日期的唯一来源。
+
 ## 朗读语音
 
 语音模型在安装包里，不读设备上的系统 TTS——同一个应用在不同手机上会得到完全不同的音色，有的手机甚至没有英语语音包，而"听文章"是这个应用的主要功能之一。
@@ -192,18 +196,20 @@ app/src/main/java/com/engreader/app/
 
 ## 数据库
 
-用户数据在本机 SQLite（`engreader.db`），当前 schema 版本 **3**。
+用户数据在本机 SQLite（`engreader.db`），当前 schema 版本 **4**。
 
 | 表 | 内容 |
 | --- | --- |
-| `article` | 抓取与内置的文章，以及导入书籍的章节（`bookId > 0`）；`vocabProfile` 缓存该篇的实词表（换行分隔），换设备重算即可 |
+| `article` | 抓取与内置的文章，以及导入书籍的章节（`bookId > 0`）；`wordCount` 是该篇的词数，`vocabProfile` 缓存该篇的实词表（换行分隔），换设备重算即可 |
 | `book` | 导入的书：标题、作者、格式、原文件名、封面文件名、章节数、阅读进度与累计时长 |
 | `word` | 生词本：Leitner 盒号、到期时间、正确/错误次数、个人笔记 |
 | `lookup` | 每次查词；`sentence`/`surface` 记下当时的原句与词形，供复习卡还原语境 |
 | `session` | 每次退出阅读器写入一条，用于时长、连续天数与阅读速度 |
 | `quiz` | 自测成绩 |
 
-升级走 `onUpgrade` 里的 `ALTER TABLE`，不清表：v1 → v2 给 `lookup` 加 `sentence`/`surface`、给 `article` 加 `vocabProfile` 并建 `idx_lookup_lemma`；v2 → v3 给 `article` 加 `bookId`/`chapterIndex`（默认 0，所以旧文章自动都是"非书籍"）、建 `book` 表与 `idx_article_book`。每条语句前都查一次 `PRAGMA table_info`，所以中途失败后重跑是安全的。早期版本直接 drop 重建，在只有测试数据时无所谓，但会连生词本和阅读历史一起清掉。
+升级走 `onUpgrade` 里的 `ALTER TABLE`，不清表：v1 → v2 给 `lookup` 加 `sentence`/`surface`、给 `article` 加 `vocabProfile` 并建 `idx_lookup_lemma`；v2 → v3 给 `article` 加 `bookId`/`chapterIndex`（默认 0，所以旧文章自动都是"非书籍"）、建 `book` 表与 `idx_article_book`；v3 → v4 给 `article` 加 `wordCount` 并回填旧行（按正文现算，不再靠"空格个数"估）、给 `session`/`quiz` 的 `articleId` 建索引。每条语句前都查一次 `PRAGMA table_info`，所以中途失败后重跑是安全的。早期版本直接 drop 重建，在只有测试数据时无所谓，但会连生词本和阅读历史一起清掉。
+
+导入一本书是**一个事务**：书行、封面文件与全部章节一起提交，中途失败则整体回滚并删掉已落盘的封面，不会留下"架上有书、点开没章节"的空壳。删除一本书同时清掉它各章的 `session` 与 `quiz` 行。
 
 ## 设计
 

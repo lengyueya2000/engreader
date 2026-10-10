@@ -53,6 +53,27 @@ class SentencesRegressionTest {
         assertEquals(1, Sentences.split("J. R. R. Tolkien wrote the books.").size)
         assertEquals(2, Sentences.split("\"I will not go.\" She left.").size)
     }
+
+    @Test
+    fun `etc and Inc can end a sentence`() {
+        // Both sit in ABBREVIATIONS, which suppressed the boundary unconditionally, so
+        // the next sentence was swallowed into this one.
+        assertEquals(2, Sentences.split("Bring pens, etc. She had none.").size)
+        assertEquals(2, Sentences.split("It was made by Acme Inc. Nobody complained.").size)
+        // Still suppressed when the phrase continues.
+        assertEquals(1, Sentences.split("See chapter 3, etc. for the details.").size)
+    }
+
+    @Test
+    fun `a one-letter word ending a sentence is not read as an initial`() {
+        // Any single capital suppressed the boundary, so "The grade is A." merged with
+        // whatever followed.
+        val out = Sentences.split("The grade is A. She was pleased.")
+        assertEquals(2, out.size)
+        assertEquals("The grade is A.", out[0].text)
+        // A real initial is still suppressed: it follows a capitalised word.
+        assertEquals(1, Sentences.split("J. R. R. Tolkien wrote the books.").size)
+    }
 }
 
 class VocabularyGraderRegressionTest {
@@ -66,6 +87,7 @@ class VocabularyGraderRegressionTest {
         override fun suggest(prefix: String, limit: Int) = emptyList<Pair<String, String>>()
         override fun glosses(translation: String) = emptyList<Pair<PartOfSpeech, String>>()
         override fun distractors(entry: WordEntry, pos: PartOfSpeech, count: Int) = emptyList<String>()
+        override fun englishDistractors(entry: WordEntry, pos: PartOfSpeech, count: Int) = emptyList<String>()
         override fun firstGloss(translation: String) = "x"
         override fun definitions(headword: String) = emptyList<Pair<PartOfSpeech, String>>()
     }

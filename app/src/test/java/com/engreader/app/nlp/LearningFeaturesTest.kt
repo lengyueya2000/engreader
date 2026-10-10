@@ -90,6 +90,21 @@ class ClozeTest {
         assertEquals(sentence, Cloze.blankAt(sentence, 2, 2))
         assertEquals(sentence, Cloze.blankAt(sentence, -1, 4))
     }
+
+    @Test
+    fun `a quoted word does not leave its opening quote dangling`() {
+        // Absorbing the closing `”` of `He said “hello” loudly` left the opener with
+        // nothing to close, and the blank read as `He said “______ loudly`.
+        assertEquals("He said “______” loudly.", Cloze.blank("He said “hello” loudly.", "hello"))
+    }
+
+    @Test
+    fun `a separator is not inserted before punctuation`() {
+        // The old rule added a space before any non-whitespace tail, so the closing
+        // quote was pushed off the blank: `“______ ”`.
+        val out = Cloze.blank("He said “hello” loudly.", "hello")
+        assertFalse("no gap before the closing quote", out.contains("______ "))
+    }
 }
 
 class WordFamilyTest {

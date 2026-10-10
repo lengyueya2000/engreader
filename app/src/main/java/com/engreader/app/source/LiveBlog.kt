@@ -11,24 +11,45 @@ package com.engreader.app.source
  */
 object LiveBlog {
 
-    private val TITLE_MARKERS = listOf(
-        "– live", "— live", "- live",
-        "– latest", "— latest",
-        "live updates", "latest updates", "live blog", "liveblog",
+    /**
+     * Phrases that are a label in their own right, matched on word boundaries.
+     *
+     * A bare `contains` matched inside longer words: "- live" is a prefix of
+     * "- Liverpool", so "Man Utd - Liverpool" and "The Beatles - Live at the BBC"
+     * were both read as rolling coverage. The dash labels are not listed here at all —
+     * a trailing "– live" is [endsWithLiveLabel]'s job, and matching it anywhere in
+     * the title is exactly what flagged a band name.
+     */
+    private val TITLE_REGEX = listOf(
+        "latest updates", "live updates", "live blog", "liveblog",
         "as it happened", "rolling coverage",
-    )
+    ).map { bounded(it) }
 
-    private val URL_MARKERS = listOf("/live/", "live-blog", "liveblog", "/live-", "-live/")
+    /**
+     * URL shapes, anchored to a path segment.
+     *
+     * Anchoring is what keeps an unrelated path out: "olive-blog" has no `/` before
+     * `live` and "deliver-live/" has `-`, so neither is a `live` segment. The plain
+     * `contains` check flagged both.
+     */
+    private val URL_REGEX = listOf(
+        Regex("(?:^|/)live(?![A-Za-z0-9])"),
+        Regex("(?:^|/)live[-_]"),
+        Regex("(?:^|/)liveblog(?![A-Za-z0-9])"),
+    )
 
     /** Punctuation that sets a coverage label apart from the headline itself. */
     private val SEPARATORS = listOf("\u2013", "\u2014", "-", ":", "|", ",")
 
+    private fun bounded(marker: String) =
+        Regex("(?<![A-Za-z0-9])${Regex.escape(marker)}(?![A-Za-z0-9])")
+
     fun isLive(title: String, url: String = ""): Boolean {
         val t = title.lowercase().trim()
         if (endsWithLiveLabel(t)) return true
-        if (TITLE_MARKERS.any { t.contains(it) }) return true
+        if (TITLE_REGEX.any { it.containsMatchIn(t) }) return true
         val u = url.lowercase()
-        return URL_MARKERS.any { u.contains(it) }
+        return URL_REGEX.any { it.containsMatchIn(u) }
     }
 
     /**

@@ -86,7 +86,10 @@ fun BookDetailScreen(
             )
 
             else -> {
-                val book = state.book!!
+                // Bound once to a local: `state.book` is a snapshot read, and the
+                // deferred lambdas below run long after this frame, so asserting it
+                // again inside them could see a book that has since been cleared.
+                val book = state.book ?: return@Box
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
                     contentPadding = PaddingValues(

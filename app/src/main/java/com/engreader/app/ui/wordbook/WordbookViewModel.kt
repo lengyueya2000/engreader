@@ -10,6 +10,7 @@ import com.engreader.app.data.SavedWord
 import com.engreader.app.dict.DifficultyBand
 import com.engreader.app.dict.WordEntry
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 data class WordbookState(
@@ -126,6 +127,18 @@ class WordbookViewModel(private val container: AppContainer) : ViewModel() {
     /** Applies a review result, which moves the word along the Leitner boxes. */
     suspend fun review(lemma: String, correct: Boolean) {
         container.wordbook.review(lemma, correct)
+    }
+
+    /**
+     * Applies a review result without the caller having to stay alive for it.
+     *
+     * The review screen advances its queue as soon as the button is tapped, and it is
+     * often dismissed mid-session; the answer the reader already gave still has to
+     * reach the database, so the write goes to the container's scope rather than the
+     * screen's.
+     */
+    fun reviewDetached(lemma: String, correct: Boolean) {
+        container.appScope.launch(Dispatchers.IO) { container.wordbook.review(lemma, correct) }
     }
 
     /**

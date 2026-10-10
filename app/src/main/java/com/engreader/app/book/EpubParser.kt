@@ -48,7 +48,7 @@ object EpubParser {
 
         val opfPath = containerRootFile(entries)
             ?: throw BookFormat.Companion.Unsupported("EPUB 缺少 META-INF/container.xml")
-        val opf = entries[opfPath]?.toString(Charsets.UTF_8)
+        val opf = entries[opfPath]?.let { decodeXml(it) }
             ?: throw BookFormat.Companion.Unsupported("EPUB 里找不到 $opfPath")
 
         val base = opfPath.substringBeforeLast('/', "")
@@ -60,7 +60,7 @@ object EpubParser {
             val item = manifest[id] ?: return@mapNotNull null
             if (item.mediaType.isNotEmpty() && !item.mediaType.contains("html")) return@mapNotNull null
             val path = resolve(base, item.href)
-            val html = entries[path]?.toString(Charsets.UTF_8) ?: return@mapNotNull null
+            val html = entries[path]?.let { decodeXml(it) } ?: return@mapNotNull null
             Section(id, path, html)
         }
         if (sections.isEmpty()) {
@@ -97,28 +97,75 @@ object EpubParser {
      * after the OPF is parsed. Books are a few megabytes, so holding them is cheaper
      * than the seek-and-reopen a `ZipFile` would need — and `ZipFile` needs a real
      * path, which a content URI does not provide.
+     *
+     * The total is capped because a zip can expand far beyond its own size: a few
+     * hundred kilobytes of highly repetitive deflate streams become gigabytes, and
+     * the `OutOfMemoryError` that follows is an `Error`, so it escapes the import
+     * path's `catch (Exception)` and takes the app down instead of reporting a bad
+     * file. Real books are far below this.
      */
     private fun readEntries(bytes: ByteArray): Map<String, ByteArray> {
         val out = HashMap<String, ByteArray>()
+        var total = 0
         ZipInputStream(bytes.inputStream()).use { zip ->
             while (true) {
                 val entry = zip.nextEntry ?: break
                 if (entry.isDirectory) continue
                 val name = entry.name.replace('\\', '/')
-                out[name] = zip.readBytes()
+                // Read through the cap rather than with `readBytes()`: the whole point
+                // is to stop before the allocation happens, and a single entry is
+                // enough to exhaust the heap on its own.
+                val content = zip.readCapped(MAX_UNPACKED_BYTES - total)
+                    ?: throw BookFormat.Companion.Unsupported("这个 EPUB 解压后过大，可能不是电子书")
+                total += content.size
+                out[name] = content
             }
         }
         return out
     }
 
+    /** The entry's bytes, or null once [limit] is passed. */
+    private fun ZipInputStream.readCapped(limit: Int): ByteArray? {
+        val buffer = java.io.ByteArrayOutputStream()
+        val chunk = ByteArray(16 * 1024)
+        while (true) {
+            val read = read(chunk)
+            if (read < 0) break
+            if (buffer.size() + read > limit) return null
+            buffer.write(chunk, 0, read)
+        }
+        return buffer.toByteArray()
+    }
+
     /** `META-INF/container.xml` → the OPF's path inside the archive. */
     private fun containerRootFile(entries: Map<String, ByteArray>): String? {
-        val xml = entries["META-INF/container.xml"]?.toString(Charsets.UTF_8)
+        val xml = entries["META-INF/container.xml"]?.let { decodeXml(it) }
             ?: entries.entries.firstOrNull { it.key.endsWith("container.xml") }?.value
-                ?.toString(Charsets.UTF_8)
+                ?.let { decodeXml(it) }
             ?: return null
-        val full = Regex("<rootfile\\b[^>]*full-path\\s*=\\s*\"([^\"]+)\"").find(xml)?.groupValues?.get(1)
+        // Single quotes are as legal as double ones here, and a generator that emits
+        // them used to make the whole book unreadable for want of one character.
+        val full = Regex("<rootfile\\b[^>]*>").findAll(xml)
+            .mapNotNull { attr(it.value, "full-path") }
+            .firstOrNull()
         return full?.takeIf { it.isNotBlank() }?.replace('\\', '/')
+    }
+
+    /**
+     * Decodes an XML file using the charset its declaration names.
+     *
+     * An OPF or XHTML part is not necessarily UTF-8 — books from older converters are
+     * windows-1252 or UTF-16, and their declaration says so. Reading those as UTF-8
+     * mangles every accented character before the extractor ever sees it.
+     */
+    private fun decodeXml(bytes: ByteArray): String {
+        val head = String(bytes, 0, minOf(bytes.size, 200), Charsets.ISO_8859_1)
+        if (head.startsWith("\uFEFF")) return String(bytes, Charsets.UTF_8)
+        val declared = Regex("encoding\\s*=\\s*[\"']([A-Za-z0-9._-]+)[\"']")
+            .find(head)?.groupValues?.get(1) ?: return String(bytes, Charsets.UTF_8)
+        val charset = runCatching { java.nio.charset.Charset.forName(declared) }.getOrNull()
+            ?: return String(bytes, Charsets.UTF_8)
+        return String(bytes, charset)
     }
 
     // ------------------------------------------------------------------ OPF
@@ -183,7 +230,7 @@ object EpubParser {
             ?.let { attr(it.value, "href") }
         if (navHref != null) {
             val path = resolve(base, navHref)
-            entries[path]?.toString(Charsets.UTF_8)?.let { html ->
+            entries[path]?.let { decodeXml(it) }?.let { html ->
                 val points = parseNavDoc(html, path)
                 if (points.isNotEmpty()) return points
             }
@@ -195,25 +242,40 @@ object EpubParser {
             ?: entries.keys.firstOrNull { it.endsWith(".ncx") }
         if (ncxHref != null) {
             val path = if (ncxHref.startsWith(base)) ncxHref else resolve(base, ncxHref)
-            entries[path]?.toString(Charsets.UTF_8)?.let { xml ->
+            entries[path]?.let { decodeXml(it) }?.let { xml ->
                 return parseNcx(xml, path)
             }
         }
         return emptyList()
     }
 
+    /**
+     * Every navPoint, including the ones nested inside another.
+     *
+     * A lazy `<navPoint>.*?</navPoint>` stops at the *first* closing tag, so for a
+     * book whose NCX nests parts and chapters it read only the outer entries: a
+     * "Part One" that contained "Chapter 1" and "Chapter 2" yielded the part and the
+     * second chapter, and the first chapter disappeared from the book. A stack of
+     * open tags gives every point, each with its own label.
+     */
     private fun parseNcx(xml: String, ncxPath: String): List<NavPoint> {
         val dir = ncxPath.substringBeforeLast('/', "")
         val out = mutableListOf<NavPoint>()
-        for (point in Regex("(?is)<navPoint\\b.*?</navPoint>").findAll(xml)) {
-            val body = point.value
-            val label = Regex("(?is)<navLabel\\b.*?</navLabel>").find(body)?.value
-                ?.let { elementText(it, "text") }
-                ?: continue
-            val src = Regex("(?is)<content\\b[^>]*>").find(body)
-                ?.let { attr(it.value, "src") }
-                ?: continue
-            out += toNavPoint(src, label, dir)
+        val open = ArrayDeque<Int>()
+        for (tag in Regex("(?is)</?navPoint\\b[^>]*>").findAll(xml)) {
+            if (tag.value.startsWith("</")) {
+                val start = open.removeLastOrNull() ?: continue
+                val body = xml.substring(start, tag.range.first)
+                val label = Regex("(?is)<navLabel\\b.*?</navLabel>").find(body)?.value
+                    ?.let { elementText(it, "text") }
+                    ?: continue
+                val src = Regex("(?is)<content\\b[^>]*>").find(body)
+                    ?.let { attr(it.value, "src") }
+                    ?: continue
+                out += toNavPoint(src, label, dir)
+            } else {
+                open.addLast(tag.range.last + 1)
+            }
         }
         return out
     }
@@ -347,8 +409,15 @@ object EpubParser {
             ?.let { attr(it.value, "content") }
         val candidates = buildList {
             metaId?.let { id -> manifest[id]?.href?.let { add(it) } }
+            // Either half may carry the name: one converter writes
+            // `<item id="cover-image" href="images/1.jpg">`, another
+            // `<item id="img7" href="images/cover.jpg">`. Testing only the id missed
+            // the second, and the book imported with no cover.
             manifest.entries
-                .firstOrNull { it.value.mediaType.startsWith("image") && it.key.contains("cover", true) }
+                .firstOrNull { entry ->
+                    entry.value.mediaType.startsWith("image") &&
+                        (entry.key.contains("cover", true) || entry.value.href.contains("cover", true))
+                }
                 ?.value?.href?.let { add(it) }
             Regex("(?is)<item\\b[^>]*>").findAll(opf)
                 .firstOrNull { attr(it.value, "properties")?.split(' ')?.contains("cover-image") == true }
@@ -383,11 +452,7 @@ object EpubParser {
      * plain `/`-separated names.
      */
     private fun resolve(base: String, href: String): String {
-        val decoded = try {
-            java.net.URLDecoder.decode(href, "UTF-8")
-        } catch (_: Exception) {
-            href
-        }
+        val decoded = percentDecode(href)
         val raw = if (base.isEmpty()) decoded else "$base/$decoded"
         val out = ArrayDeque<String>()
         for (part in raw.split('/')) {
@@ -400,13 +465,57 @@ object EpubParser {
         return out.joinToString("/")
     }
 
-    /** One attribute out of a tag's attribute text, quote-aware. */
+    /**
+     * Decodes `%XX` escapes without touching `+`.
+     *
+     * `URLDecoder` is form decoding, not path decoding: it turns `+` into a space,
+     * so a file genuinely named `chapter+1.xhtml` became `chapter 1.xhtml` and the
+     * lookup failed. In a URI path a `+` is just a plus.
+     */
+    internal fun percentDecode(value: String): String {
+        if ('%' !in value) return value
+        val bytes = java.io.ByteArrayOutputStream()
+        var i = 0
+        while (i < value.length) {
+            val c = value[i]
+            if (c == '%' && i + 2 < value.length) {
+                val code = value.substring(i + 1, i + 3).toIntOrNull(16)
+                if (code != null) {
+                    bytes.write(code)
+                    i += 3
+                    continue
+                }
+            }
+            // Everything that is not an escape is already text; re-encode it so the
+            // byte buffer holds one consistent stream.
+            bytes.write(c.toString().toByteArray(Charsets.UTF_8))
+            i++
+        }
+        return String(bytes.toByteArray(), Charsets.UTF_8)
+    }
+
+    /**
+     * One attribute out of a tag's attribute text, quote-aware.
+     *
+     * The lookbehind rules out a hyphen, colon or word character before the name: a
+     * plain `\b` is a boundary between `-` and `i`, so asking for `id` matched the
+     * `id` inside `data-id`, and asking for `href` matched the one in `xlink:href`.
+     */
     private fun attr(tag: String, name: String): String? =
-        Regex("(?is)\\b$name\\s*=\\s*(\"([^\"]*)\"|'([^']*)')").find(tag)?.let {
+        Regex("(?is)(?<![\\w:.-])$name\\s*=\\s*(\"([^\"]*)\"|'([^']*)')").find(tag)?.let {
             it.groupValues[2].ifEmpty { it.groupValues[3] }
         }?.takeIf { it.isNotBlank() }
 
     private val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "gif", "webp")
+
+    /**
+     * Cap on everything the archive expands to.
+     *
+     * A real book is a few megabytes. This is high enough that no genuine EPUB is
+     * refused and low enough that a zip bomb is reported as an unsupported file
+     * instead of exhausting the heap.
+     */
+    private const val MAX_UNPACKED_BYTES = 256 * 1024 * 1024
 
     /**
      * Fewest words a chapter needs to be worth listing.

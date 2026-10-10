@@ -3,7 +3,20 @@ package com.engreader.app.nlp
 /** Word-shape helpers shared by the dictionary, the grammar panel and the reader. */
 object Tokenizer {
 
-    private val WORD = Regex("[A-Za-z][A-Za-z'\\u2019-]*")
+    /**
+     * A word: a letter, then letters, apostrophes and hyphens.
+     *
+     * The letter class covers Latin-1 and Latin Extended, not just `A-Za-z`: the
+     * corpus is English but a name or a loanword carries accents — `café`, `Zürich`,
+     * `École`, `naïve` — and an ASCII-only class tokenised those as `caf` and `cole`,
+     * so tapping the accented character matched nothing and the word count came out
+     * short. Scripts outside Latin are deliberately still excluded, so a Chinese
+     * gloss in the text is not counted as an English word.
+     */
+    private val LETTER = "A-Za-z\\u00C0-\\u024F"
+
+    /** Shared with [Paragraphs] and [Sentences] so every layer splits words the same. */
+    internal val WORD = Regex("[$LETTER][$LETTER'\\u2019-]*")
 
     fun words(text: String): List<String> = WORD.findAll(text).map { it.value }.toList()
 

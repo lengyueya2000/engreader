@@ -207,4 +207,51 @@ class SourceRegressionTest {
         assertEquals(0L, RssParser.parseDate(""))
         assertEquals(0L, RssParser.parseDate("not a date"))
     }
+
+    @Test
+    fun `an attribute value containing a closing angle bracket does not end the tag`() {
+        // `[^>]*` stopped at the `>` inside the quoted value, so the tag was never
+        // matched and `3">alpha` leaked into the text.
+        assertEquals("alpha beta", Html.text("""<p title="5 > 3">alpha beta</p>"""))
+        assertEquals("gamma delta", Html.text("""<p data-x='a>b'>gamma delta</p>"""))
+    }
+
+    @Test
+    fun `a lone surrogate or an out-of-range code point is left as written`() {
+        // Neither can be encoded as UTF-8; decoding them produces a String that
+        // breaks the moment it is written back out.
+        assertEquals("&#xD800;", Html.decode("&#xD800;"))
+        assertEquals("&#x110000;", Html.decode("&#x110000;"))
+        assertEquals("&#0;", Html.decode("&#0;"))
+    }
+
+    @Test
+    fun `latin-1 named entities are decoded`() {
+        assertEquals("café ß ½", Html.decode("caf&eacute; &szlig; &frac12;"))
+        assertEquals("a b", Html.decode("a&ensp;b"))
+    }
+
+    @Test
+    fun `a namespaced element is matched by its local name`() {
+        // Namespaces are not processed, so the raw QName arrives with its prefix;
+        // matching that against bare names dropped every media:, dc: and content:
+        // element in the live feeds.
+        assertEquals("content", RssParser.localNameOf("media:content"))
+        assertEquals("date", RssParser.localNameOf("dc:date"))
+        assertEquals("title", RssParser.localNameOf("title"))
+    }
+
+    @Test
+    fun `a nested container is not cut short by its inner closing tag`() {
+        // The lazy `<(div|section|…)>.*?</\1>` ended at the first closing tag of any
+        // of the names, so `<div><div>a</div>b</div>` yielded `a` and dropped `b` —
+        // and on a page with no usable `<p>`, that is the body text.
+        val prose = "Officials said the decision was unprecedented and would be reviewed again. "
+        val html = """
+            <html><body><div><div>$prose</div>$prose$prose</div></body></html>
+        """.trimIndent()
+        val body = ArticleExtractor.extract(html).body
+        // Three copies of the sentence, not one.
+        assertEquals(3, Regex("unprecedented").findAll(body).count())
+    }
 }
