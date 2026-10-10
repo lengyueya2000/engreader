@@ -9,25 +9,31 @@ package com.engreader.app.tts
  * way a listener notices at once:
  *
  * - `1837` is spoken as the cardinal "one thousand eight hundred and thirty-seven".
- *   In a carrier sentence the year alone occupies 3.34 s of audio where the spoken form
- *   takes 1.50 s. Every four-digit year in a book is read out as a quantity, which is
+ *   In a carrier sentence the written form runs 6.85 s of audio against 5.22 s for the
+ *   spoken form. Every four-digit year in a book is read out as a quantity, which is
  *   the single clearest tell that a machine is talking.
  * - `CHAPTER VI.` comes back as "chapter vee eye". espeak treats a lone `V` as the
  *   letter, and where it does recognise a numeral it inserts the literal word "Roman" —
  *   `II` is spoken as "Roman two", which is worse than the letter.
  * - `8:35 P. M.` is spoken as "eight thirty-five p, M": the initial glues itself to the
  *   number and the second letter is read as a word.
- * - Markup is read out. `*did*` becomes "asterisk did asterisk" (2.87 s in a carrier
- *   against 1.47 s for the bare word), and a Project Gutenberg `[Illustration: ...]`
- *   note is read as a sentence of the book — 7.2 s of audio on its own.
+ * - Markup is read out. `it was **very** important and _quite_ true` is 5.17 s of audio
+ *   against 2.69 s without the markers — the voice says "asterisk" for each one. A
+ *   Project Gutenberg `[Illustration: ...]` note is worse: inside a sentence it adds
+ *   6.28 s, and on a line of its own it is a 7.2 s sentence of the book.
  *
  * What is deliberately *not* here is the connected speech itself. Linking and weak forms
  * already come out right and rewriting them would be fixing something that is not
- * broken: in a matched carrier "to" is reduced to /tə/ rather than spoken as "two"
- * (1.158 s against 1.279 s), and a phrase carries no measurable pause at a word boundary
- * where there is no punctuation — ASR word timings over "It is a truth universally
- * acknowledged..." show no gap above 50 ms. Contractions, `Mr.`/`Mrs.`/`Dr.`/`St.`/`No.`
- * and `8:35` are likewise already correct and are left alone.
+ * broken: in a matched carrier `to` is reduced rather than spelled out (8 runs, 1.101 s
+ * against 1.260 s for `two`, standard deviation 0.03 either way), and a phrase carries no
+ * measurable pause at a word boundary where there is no punctuation — per-word timings
+ * over "It is a truth universally acknowledged, that a single man" show a 0.000 s gap
+ * between every pair of words inside a phrase and the only pause in the sentence at the
+ * comma. Contractions, `Mr.`/`Mrs.`/`Dr.`/`St.`/`No.` and `8:35` are likewise already
+ * correct and are left alone.
+ *
+ * Every number above, and every number below, comes from `tools/voice/say.py`, which
+ * synthesises with this same bundled voice and transcribes the audio back.
  *
  * The output of [of] goes to the voice only. The reader still shows the original text,
  * so nothing here can move a word out from under a tap.

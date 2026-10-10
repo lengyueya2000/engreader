@@ -107,15 +107,17 @@ python tools/voice/measure.py \
 
 | 原文 | 直接读出来 | 改写后 |
 | --- | --- | --- |
-| `1837` | one thousand eight hundred and thirty-seven（3.34 秒） | eighteen thirty-seven（1.50 秒） |
+| `1837`（句中出现） | one thousand eight hundred and thirty-seven（整句 6.85 秒） | eighteen thirty-seven（整句 5.22 秒） |
 | `CHAPTER VI.` | chapter vee eye | Chapter six |
 | `8:35 P. M.` | eight thirty-five p, M | eight thirty-five p m |
-| `[Illustration: …]` | 整条注释当作正文念出来（7.2 秒） | 不念 |
-| `*did*` | asterisk did asterisk（2.87 秒） | did（1.47 秒） |
+| `[Illustration: …]` | 整条注释当作正文念（句内多出 6.3 秒；单独成句时 7.2 秒） | 不念 |
+| `it was **very** important and _quite_ true` | 每个星号都念成 asterisk（5.17 秒） | it was very important and quite true（2.69 秒） |
 
 年份只在**时间语境**里改写：前面是 `in`、`since`、`by`、`copyright` 这类词，或者紧挨着另一个年份时才当作年份，`1234 people` 这种数量照旧读数字。`1837-1901` 这样的年份区间不改——语音本来就会把连字符读成 "to"，改了反而多一道错的机会。罗马数字也只在章节标题、君王名（`Henry VIII`）、卷次这些位置改写，而且要求它能严格往返转换（`X` 是 10，但 `IIII` 不是合法写法，就不动）；单独的 `I` 是代词，不碰。
 
-**故意不改的是连读本身。** 先量了再说：把 `to` 放进同样的上下文里对比，弱读的 /tə/ 比读成 "two" 短 0.12 秒，说明弱读已经对了；对 "It is a truth universally acknowledged…" 做逐词时间戳，词与词之间没有超过 50 毫秒的空隙，说明该连的地方已经在连。缩写（`Mr.`、`Mrs.`、`Dr.`）、`It's` 这类缩合、`8:35`、`5 p.m.` 同样已经正确，写规则去"修"它们只会多一个出错的途径。
+**故意不改的是连读本身。** 先量了再说：同一句话里把 `to` 换成拼写不同的 `two`，8 次合成的均值是 1.101 秒对 1.260 秒（标准差各 0.03，差距约 5 个标准差）——弱读已经在发生，改写它反而是错的。对 "It is a truth universally acknowledged, that a single man" 做逐词时间戳，短语内部的词间空隙全是 0.000 秒，整句唯一的一段停顿是逗号处的 0.700 秒：该连的地方已经在连。缩写（`Mr.`、`Mrs.`、`Dr.`）、`It's` 这类缩合、`8:35`、`5 p.m.` 同样已经正确，写规则去"修"它们只会多一个出错的途径。
+
+上面这些数字都可以用 `tools/voice/say.py` 重新量一遍（默认模式回听识别，`--duration` 比较改写前后的音频长度，`--words` 打印逐词时间戳）。
 
 改写只发生在交给语音引擎的那一份文本上，界面上的原文一个字都不动，所以高亮位置和点击划词都还指向原句。整条注释独占一句时（Gutenberg 版的 `[Illustration: …]` 就是单独一行），改写结果可以是空字符串，此时朗读队列直接跳到下一句——实测这条注释是 7.2 秒的音频，没有听众想要它。
 
