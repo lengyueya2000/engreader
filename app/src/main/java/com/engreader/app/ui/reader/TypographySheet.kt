@@ -168,13 +168,14 @@ fun TypographySheet(
 
             Spacer(Modifier.height(6.dp))
             ToggleRow(
-                label = "显示段落中文翻译",
-                detail = "每段英文下方附上中文译文",
+                label = "显示句子中文翻译",
+                detail = "每句英文下面用小字附上对应的中文，逐句对照",
                 checked = showTranslation,
                 onCheckedChange = onShowTranslation,
             )
             Text(
-                text = "首次打开某篇文章需要联网获取译文，之后保存在本机。",
+                text = "首次打开某篇文章需要联网获取译文，之后保存在本机。" +
+                    "译文按段落获取，切句只在中英文句数一致时才逐句显示，否则整段对照。",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(start = 0.dp, bottom = 4.dp),

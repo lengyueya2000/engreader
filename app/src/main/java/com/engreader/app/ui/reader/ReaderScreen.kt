@@ -66,7 +66,11 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.engreader.app.nlp.Paragraph
+import com.engreader.app.nlp.Paragraphs
 import com.engreader.app.nlp.Sentence
+import com.engreader.app.nlp.Tokenizer
+import com.engreader.app.nlp.WordSpan
+import com.engreader.app.translate.SentenceAlignment
 import com.engreader.app.tts.SpeechState
 import com.engreader.app.ui.components.EmptyState
 import com.engreader.app.ui.components.HairLine
@@ -287,10 +291,11 @@ fun ReaderScreen(
                             savedLemmas = state.savedLemmas,
                             highlightSaved = state.highlightSaved,
                             listening = state.listening,
-                            speakingText = state.flatSentences
+                            speakingSentenceIndex = state.flatSentences
                                 .getOrNull(state.speakingSentence)
                                 ?.takeIf { state.listening && it.paragraphIndex == index }
-                                ?.text,
+                                ?.sentenceIndex
+                                ?: -1,
                             translation = state.translation
                                 .getOrNull(index)
                                 ?.takeIf { state.showTranslation && it.isNotBlank() },
@@ -548,8 +553,12 @@ private fun TranslationNotice(
  * Tap → look up the word under the finger. Long-press → analyse the sentence under
  * the finger. While listening, a tap jumps playback to that sentence.
  *
- * The Chinese translation, when shown, sits directly under the paragraph it belongs
- * to so the two are read together rather than looked up in a separate panel.
+ * With translations on, the paragraph is broken into its sentences and each English
+ * sentence is followed by its own Chinese line in smaller type, so the two can be
+ * read together. The split only happens when the Chinese divides into exactly as many
+ * sentences as the English has ([SentenceAlignment.align]); otherwise the paragraph
+ * and its translation are shown whole, as before — a line of Chinese under the wrong
+ * sentence would be worse than no pairing.
  */
 @Composable
 private fun ParagraphBlock(
@@ -559,7 +568,13 @@ private fun ParagraphBlock(
     highlightSaved: Boolean,
     /** True while the article is being read aloud, so a tap jumps playback. */
     listening: Boolean,
-    speakingText: String?,
+    /**
+     * Sentence currently being spoken inside this paragraph, or -1.
+     *
+     * An index rather than the text: two sentences in a paragraph can read identically,
+     * and matching on the text would then highlight the wrong one.
+     */
+    speakingSentenceIndex: Int,
     translation: String?,
     translationLoading: Boolean,
     bodyColor: Color,
@@ -572,41 +587,65 @@ private fun ParagraphBlock(
     onSentenceLongPress: (String) -> Unit,
     onSentenceTapWhileListening: (Int) -> Unit,
 ) {
-    var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
-
-    val annotated = remember(paragraph, savedLemmas, speakingText, highlightSaved, bodyColor, highlightColor, savedColor) {
-        buildAnnotatedString {
-            append(paragraph.text)
-            if (speakingText != null) {
-                val at = paragraph.text.indexOf(speakingText)
-                if (at >= 0) {
-                    addStyle(
-                        SpanStyle(background = highlightColor),
-                        at,
-                        at + speakingText.length,
-                    )
-                }
-            }
-            if (highlightSaved) {
-                paragraph.tokens.forEach { token ->
-                    val lemma = com.engreader.app.nlp.Tokenizer.normalize(token.text)
-                    if (lemma.isNotEmpty() && savedLemmas.contains(lemma)) {
-                        addStyle(
-                            SpanStyle(
-                                color = savedColor,
-                                textDecoration = TextDecoration.Underline,
-                                fontWeight = FontWeight.Medium,
-                            ),
-                            token.start,
-                            token.end,
-                        )
-                    }
-                }
-            }
-        }
+    val english = remember(sentences) { sentences.map { it.text } }
+    val sentenceTranslations = remember(english, translation) {
+        translation?.takeIf { it.isNotBlank() }?.let { SentenceAlignment.align(english, it) }
     }
 
     Column(Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 9.dp)) {
+        if (sentenceTranslations != null) {
+            sentenceTranslations.forEachIndexed { index, chinese ->
+                if (index > 0) Spacer(Modifier.height(12.dp))
+                SentenceBlock(
+                    sentence = sentences[index],
+                    indexInParagraph = index,
+                    paragraph = paragraph,
+                    savedLemmas = savedLemmas,
+                    highlightSaved = highlightSaved,
+                    listening = listening,
+                    highlighted = index == speakingSentenceIndex,
+                    bodyColor = bodyColor,
+                    subtleColor = subtleColor,
+                    highlightColor = highlightColor,
+                    savedColor = savedColor,
+                    fontSize = fontSize,
+                    lineHeightMultiplier = lineHeightMultiplier,
+                    onWordTap = onWordTap,
+                    onSentenceLongPress = onSentenceLongPress,
+                    onSentenceTapWhileListening = onSentenceTapWhileListening,
+                )
+                Spacer(Modifier.height(3.dp))
+                Text(
+                    text = chinese,
+                    color = subtleColor,
+                    // Smaller than the body: the translation supports the English, and
+                    // matching its size invites reading the Chinese instead.
+                    fontSize = (fontSize - 3).coerceAtLeast(13).sp,
+                    lineHeight = ((fontSize - 3) * 1.5f).sp,
+                    fontFamily = FontFamily.SansSerif,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+            return@Column
+        }
+
+        var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
+        val spoken = sentences.getOrNull(speakingSentenceIndex)?.text
+        val annotated = remember(paragraph, savedLemmas, spoken, highlightSaved, highlightColor, savedColor) {
+            buildEnglish(
+                text = paragraph.text,
+                tokens = paragraph.tokens,
+                highlight = spoken
+                    ?.let { paragraph.text.indexOf(it) }
+                    ?.takeIf { it >= 0 }
+                    ?.let { it until it + spoken.length },
+                savedLemmas = savedLemmas,
+                highlightSaved = highlightSaved,
+                highlightColor = highlightColor,
+                savedColor = savedColor,
+            )
+        }
+
         Text(
             text = annotated,
             color = bodyColor,
@@ -631,7 +670,7 @@ private fun ParagraphBlock(
                                 // inside the one currently being spoken.
                                 if (sentenceIndex >= 0) onSentenceTapWhileListening(sentenceIndex)
                             } else {
-                                val word = com.engreader.app.nlp.Paragraphs.wordAt(paragraph, offset)
+                                val word = Paragraphs.wordAt(paragraph, offset)
                                 if (word != null) onWordTap(word, sentence?.text ?: paragraph.text)
                             }
                         },
@@ -667,6 +706,112 @@ private fun ParagraphBlock(
                 fontSize = (fontSize - 4).coerceAtLeast(12).sp,
                 fontFamily = FontFamily.SansSerif,
             )
+        }
+    }
+}
+
+/**
+ * One English sentence in a translated paragraph.
+ *
+ * A separate `Text` per sentence is what makes the Chinese line sit under the right
+ * sentence; the tap offsets stay exact because a sentence's own text is a contiguous
+ * slice of the paragraph, so an offset inside it is only [Sentence.start] away from
+ * the paragraph offset the word lookup expects.
+ */
+@Composable
+private fun SentenceBlock(
+    sentence: Sentence,
+    /** Index of this sentence inside its paragraph, which is what playback jumps to. */
+    indexInParagraph: Int,
+    paragraph: Paragraph,
+    savedLemmas: Set<String>,
+    highlightSaved: Boolean,
+    listening: Boolean,
+    highlighted: Boolean,
+    bodyColor: Color,
+    subtleColor: Color,
+    highlightColor: Color,
+    savedColor: Color,
+    fontSize: Int,
+    lineHeightMultiplier: Float,
+    onWordTap: (String, String) -> Unit,
+    onSentenceLongPress: (String) -> Unit,
+    onSentenceTapWhileListening: (Int) -> Unit,
+) {
+    var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
+    val tokens = remember(paragraph, sentence) {
+        paragraph.tokens
+            .filter { it.start >= sentence.start && it.start < sentence.end }
+            .map { WordSpan(it.start - sentence.start, it.end.coerceAtMost(sentence.end) - sentence.start, it.text) }
+    }
+    val annotated = remember(sentence, tokens, savedLemmas, highlighted, highlightSaved, highlightColor, savedColor) {
+        buildEnglish(
+            text = sentence.text,
+            tokens = tokens,
+            highlight = if (highlighted) sentence.text.indices else null,
+            savedLemmas = savedLemmas,
+            highlightSaved = highlightSaved,
+            highlightColor = highlightColor,
+            savedColor = savedColor,
+        )
+    }
+
+    Text(
+        text = annotated,
+        color = bodyColor,
+        fontSize = fontSize.sp,
+        lineHeight = (fontSize * lineHeightMultiplier).sp,
+        fontFamily = FontFamily.Serif,
+        modifier = Modifier
+            .fillMaxWidth()
+            .pointerInput(sentence, listening) {
+                detectTapGestures(
+                    onTap = { position ->
+                        if (listening) {
+                            onSentenceTapWhileListening(indexInParagraph)
+                            return@detectTapGestures
+                        }
+                        val textLayout = layout ?: return@detectTapGestures
+                        val offset = textLayout.getOffsetForPosition(position)
+                        val word = Paragraphs.wordAt(paragraph, sentence.start + offset)
+                        if (word != null) onWordTap(word, sentence.text)
+                    },
+                    onLongPress = { onSentenceLongPress(sentence.text) },
+                )
+            },
+        onTextLayout = { layout = it },
+    )
+}
+
+/**
+ * The English run styled for the reader: the spoken sentence highlighted, and every
+ * word already in the wordbook underlined. [tokens] are offsets into [text].
+ */
+private fun buildEnglish(
+    text: String,
+    tokens: List<WordSpan>,
+    highlight: IntRange?,
+    savedLemmas: Set<String>,
+    highlightSaved: Boolean,
+    highlightColor: Color,
+    savedColor: Color,
+) = buildAnnotatedString {
+    append(text)
+    highlight?.let { addStyle(SpanStyle(background = highlightColor), it.first, it.last + 1) }
+    if (highlightSaved) {
+        tokens.forEach { token ->
+            val lemma = Tokenizer.normalize(token.text)
+            if (lemma.isNotEmpty() && savedLemmas.contains(lemma)) {
+                addStyle(
+                    SpanStyle(
+                        color = savedColor,
+                        textDecoration = TextDecoration.Underline,
+                        fontWeight = FontWeight.Medium,
+                    ),
+                    token.start,
+                    token.end,
+                )
+            }
         }
     }
 }
