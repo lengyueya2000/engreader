@@ -2,6 +2,7 @@ package com.engreader.app.ui.reader
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -43,15 +44,25 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInWindow
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.buildAnnotatedString
@@ -77,6 +88,73 @@ import com.engreader.app.ui.components.HairLine
 import com.engreader.app.ui.containerScopedViewModel
 import com.engreader.app.ui.theme.Palette
 import kotlinx.coroutines.launch
+
+/** Extra space left between the spoken sentence and the nearest screen edge. */
+private val SCROLL_MARGIN = 28.dp
+
+/** How many frames to wait for a scrolled-to paragraph to report its sentence bounds. */
+private const val COMPOSE_FRAMES = 8
+
+/** Height of the bar over the text, plus the header space under it. */
+private val CONTENT_TOP_INSET = 64.dp
+
+/** Room left under the text so the last lines are not hidden by the playback bar. */
+private val CONTENT_BOTTOM_INSET = 120.dp
+
+/**
+ * Where each sentence currently sits on screen, in window coordinates.
+ *
+ * A paragraph cannot answer this for itself: a long paragraph scrolls in and out of
+ * composition as a whole, and the sentence being read is frequently in a paragraph the
+ * list has not composed at all. The reader therefore registers one rectangle per
+ * sentence here, and removes it when that sentence leaves composition — what remains
+ * is exactly the sentences the auto-scroll can compare against the screen.
+ *
+ * A rectangle rather than the sentence's composable, because the scroll runs in a
+ * `LaunchedEffect` that outlives any one paragraph.
+ */
+private class SpokenBounds {
+    private val boxes = mutableMapOf<Int, Rect>()
+
+    /**
+     * Records where sentence [index] is, or forgets it when it has left composition.
+     *
+     * A rectangle with no area is not a position: a node reports one before it has been
+     * placed, and treating it as the top of the screen sends the scroll chasing a
+     * sentence that is not there.
+     */
+    fun putOrRemove(index: Int, box: Rect?) {
+        if (index < 0) return
+        if (box == null || box.width <= 0f || box.height <= 0f) {
+            boxes.remove(index)
+        } else {
+            boxes[index] = box
+        }
+    }
+
+    fun of(index: Int): Rect? = boxes[index]
+
+    fun clear() = boxes.clear()
+}
+
+/**
+ * Where a layout is on screen, unclipped.
+ *
+ * [boundsInWindow] is not usable here: it is clipped to the window, so a sentence that
+ * has scrolled just past the bottom edge reports an empty rectangle, which is
+ * indistinguishable from a sentence that has not been composed. The scroll would then
+ * never learn that the sentence it is following is off-screen, which is the one thing
+ * it exists to find out.
+ */
+private fun unclippedBounds(coordinates: LayoutCoordinates): Rect {
+    val topLeft = coordinates.positionInWindow()
+    return Rect(
+        left = topLeft.x,
+        top = topLeft.y,
+        right = topLeft.x + coordinates.size.width,
+        bottom = topLeft.y + coordinates.size.height,
+    )
+}
 
 /**
  * The reading surface.
@@ -107,6 +185,14 @@ fun ReaderScreen(
     val scope = rememberCoroutineScope()
     val state = viewModel.state
     val listState = rememberLazyListState()
+    /**
+     * Where each sentence currently is on screen, for the listening auto-scroll.
+     *
+     * Held here rather than in a paragraph so it survives paragraphs scrolling out of
+     * composition: the sentence being spoken is often in a paragraph the list has not
+     * composed yet, and the scroll needs to know that before it can bring it in.
+     */
+    val spokenBounds = remember { SpokenBounds() }
     var showTypography by remember { mutableStateOf(false) }
     var showQuiz by remember { mutableStateOf(false) }
     val liveSpeechState by viewModel.speechState.collectAsStateWithLifecycle()
@@ -116,7 +202,10 @@ fun ReaderScreen(
     LaunchedEffect(articleId) { viewModel.load() }
 
     DisposableEffect(articleId) {
-        onDispose { viewModel.flushProgress() }
+        onDispose {
+            viewModel.flushProgress()
+            spokenBounds.clear()
+        }
     }
 
     // Reading time and playback follow the app's own foreground state, not just this
@@ -136,17 +225,72 @@ fun ReaderScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    // Keep the sentence being read on screen during listening mode. The list is the
-    // article header, an optional translation-failure notice, then one item per
-    // paragraph, so the paragraph's own index is offset by however many of those lead
-    // it — without the notice this used to scroll one item past the spoken sentence.
-    LaunchedEffect(state.speakingSentence) {
-        val index = state.speakingSentence
-        if (index >= 0 && state.listening) {
-            val paragraphIndex = state.flatSentences.getOrNull(index)?.paragraphIndex ?: return@LaunchedEffect
-            val leading = 1 + if (state.showTranslation && state.translationStatus == TranslationStatus.Failed) 1 else 0
-            runCatching { listState.animateScrollToItem(leading + paragraphIndex) }
+    // Keep the sentence being read on screen during listening mode.
+    //
+    // Following the paragraph is not enough: a paragraph of a novel is easily taller
+    // than the screen, so scrolling its first line to the top leaves the sentence
+    // actually being spoken below the fold — the reading then walks off the bottom of
+    // the page with nothing bringing it back. Each sentence therefore reports its own
+    // bounds, and the list is nudged only when the spoken sentence leaves a comfortable
+    // band: scrolling on every sentence would drag the page under the reader's eyes.
+    val density = LocalDensity.current
+    // The list's own bounds, in window coordinates — the same space the sentence
+    // rectangles are measured in, so the two can be compared directly.
+    var surfaceTop by remember { mutableFloatStateOf(0f) }
+    var surfaceHeight by remember { mutableIntStateOf(0) }
+    val topReserve = with(density) {
+        WindowInsets.statusBars.asPaddingValues().calculateTopPadding().toPx() + CONTENT_TOP_INSET.toPx()
+    }
+    val bottomReserve = with(density) {
+        WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding().toPx() +
+            CONTENT_BOTTOM_INSET.toPx()
+    }
+    val margin = with(density) { SCROLL_MARGIN.toPx() }
+    // The flat index of each paragraph's first sentence. The flat list is built
+    // paragraph by paragraph, so this is normally just a running sum; it is computed
+    // rather than assumed because a paragraph whose text holds no sentences at all
+    // would make the arithmetic wrong for every paragraph after it.
+    val flatStart = remember(state.flatSentences) {
+        val out = HashMap<Int, Int>()
+        state.flatSentences.forEachIndexed { flat, sentence ->
+            out.putIfAbsent(sentence.paragraphIndex, flat)
         }
+        out
+    }
+
+    LaunchedEffect(state.speakingSentence, state.listening) {
+        val flat = state.speakingSentence
+        if (!state.listening || flat < 0) return@LaunchedEffect
+        // A sentence inside a paragraph the list has not composed has no bounds to read,
+        // so its paragraph is brought on screen first; the nudge below then places it.
+        // Jumped rather than animated: the frame wait that follows cannot tell a settled
+        // list from one still travelling, and the nudge would cancel the animation
+        // half-way and leave the paragraph where it stood.
+        var known = spokenBounds.of(flat)
+        if (known == null) {
+            val paragraphIndex = state.flatSentences.getOrNull(flat)?.paragraphIndex ?: return@LaunchedEffect
+            val leading = 1 + if (state.showTranslation && state.translationStatus == TranslationStatus.Failed) 1 else 0
+            runCatching { listState.scrollToItem(leading + paragraphIndex) }
+            repeat(COMPOSE_FRAMES) {
+                if (known == null) {
+                    withFrameNanos { }
+                    known = spokenBounds.of(flat)
+                }
+            }
+        }
+        val box = known ?: return@LaunchedEffect
+        if (surfaceHeight <= 0) return@LaunchedEffect
+        val top = surfaceTop + topReserve + margin
+        val bottom = (surfaceTop + surfaceHeight - bottomReserve - margin).coerceAtLeast(top + 1f)
+        // A sentence taller than the band cannot fit in it; aligning its top is the
+        // only thing that keeps its beginning readable.
+        val delta = when {
+            box.height > bottom - top -> box.top - top
+            box.top < top -> box.top - top
+            box.bottom > bottom -> box.bottom - bottom
+            else -> 0f
+        }
+        if (delta != 0f) runCatching { listState.animateScrollBy(delta) }
     }
 
     val theme = state.theme
@@ -171,10 +315,16 @@ fun ReaderScreen(
                 val article = state.article ?: return@Box
                 LazyColumn(
                     state = listState,
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .onGloballyPositioned { coordinates ->
+                            val box = coordinates.boundsInWindow()
+                            surfaceTop = box.top
+                            surfaceHeight = box.height.toInt()
+                        },
                     contentPadding = PaddingValues(
-                        top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 64.dp,
-                        bottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding() + 120.dp,
+                        top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + CONTENT_TOP_INSET,
+                        bottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding() + CONTENT_BOTTOM_INSET,
                     ),
                 ) {
                     item {
@@ -296,6 +446,9 @@ fun ReaderScreen(
                                 ?.takeIf { state.listening && it.paragraphIndex == index }
                                 ?.sentenceIndex
                                 ?: -1,
+                            /** Flat index of this paragraph's first sentence. */
+                            firstFlatIndex = flatStart[index] ?: -1,
+                            onSentenceBounds = spokenBounds::putOrRemove,
                             translation = state.translation
                                 .getOrNull(index)
                                 ?.takeIf { state.showTranslation && it.isNotBlank() },
@@ -575,6 +728,16 @@ private fun ParagraphBlock(
      * and matching on the text would then highlight the wrong one.
      */
     speakingSentenceIndex: Int,
+    /**
+     * Flat index of this paragraph's first sentence, or -1 when the paragraph has none.
+     *
+     * Sentences report their bounds under `firstFlatIndex + indexInParagraph`, which is
+     * the same index the reader's playback state uses, so the auto-scroll can look up
+     * where the spoken sentence is without knowing anything about paragraphs.
+     */
+    firstFlatIndex: Int,
+    /** Reports where a sentence is, or null when it has left composition. */
+    onSentenceBounds: (Int, Rect?) -> Unit,
     translation: String?,
     translationLoading: Boolean,
     bodyColor: Color,
@@ -604,6 +767,8 @@ private fun ParagraphBlock(
                     highlightSaved = highlightSaved,
                     listening = listening,
                     highlighted = index == speakingSentenceIndex,
+                    flatIndex = if (firstFlatIndex >= 0) firstFlatIndex + index else -1,
+                    onBounds = onSentenceBounds,
                     bodyColor = bodyColor,
                     subtleColor = subtleColor,
                     highlightColor = highlightColor,
@@ -646,6 +811,45 @@ private fun ParagraphBlock(
             )
         }
 
+        // Without a per-sentence split the paragraph is one `Text`, so the auto-scroll
+        // is told where the spoken sentence's own lines sit inside it. The rectangle is
+        // rebuilt whenever the layout or the text's position changes, which is what
+        // keeps it correct as the list scrolls under it.
+        val spokenRange = remember(paragraph, spoken) {
+            val sentence = sentences.getOrNull(speakingSentenceIndex)
+            if (sentence == null) null else sentence.start until sentence.end
+        }
+        var origin by remember { mutableStateOf<Offset?>(null) }
+        val flatIndex = if (firstFlatIndex >= 0 && speakingSentenceIndex >= 0) {
+            firstFlatIndex + speakingSentenceIndex
+        } else {
+            -1
+        }
+        LaunchedEffect(flatIndex, spokenRange, layout, origin) {
+            val measured = layout
+            val at = origin
+            if (flatIndex < 0 || spokenRange == null || measured == null || at == null) {
+                onSentenceBounds(flatIndex, null)
+                return@LaunchedEffect
+            }
+            val lastOffset = (spokenRange.last - 1).coerceAtLeast(spokenRange.first)
+            if (lastOffset >= measured.layoutInput.text.length) return@LaunchedEffect
+            val firstLine = measured.getLineForOffset(spokenRange.first)
+            val lastLine = measured.getLineForOffset(lastOffset)
+            onSentenceBounds(
+                flatIndex,
+                Rect(
+                    left = at.x,
+                    top = at.y + measured.getLineTop(firstLine),
+                    right = at.x + measured.size.width,
+                    bottom = at.y + measured.getLineBottom(lastLine),
+                ),
+            )
+        }
+        DisposableEffect(flatIndex) {
+            onDispose { onSentenceBounds(flatIndex, null) }
+        }
+
         Text(
             text = annotated,
             color = bodyColor,
@@ -654,6 +858,7 @@ private fun ParagraphBlock(
             fontFamily = FontFamily.Serif,
             modifier = Modifier
                 .fillMaxWidth()
+                .onGloballyPositioned { origin = unclippedBounds(it).topLeft }
                 .pointerInput(paragraph, sentences, listening) {
                     detectTapGestures(
                         onTap = { position ->
@@ -728,6 +933,10 @@ private fun SentenceBlock(
     highlightSaved: Boolean,
     listening: Boolean,
     highlighted: Boolean,
+    /** Flat index of this sentence, which is what the auto-scroll looks up. */
+    flatIndex: Int,
+    /** Reports where this sentence is on screen, or null when it leaves composition. */
+    onBounds: (Int, Rect?) -> Unit,
     bodyColor: Color,
     subtleColor: Color,
     highlightColor: Color,
@@ -756,6 +965,14 @@ private fun SentenceBlock(
         )
     }
 
+    // Where this sentence sits, for the listening auto-scroll. Reported on every
+    // position change rather than only when it becomes the spoken one: the scroll
+    // reads it as the list moves, and a rectangle recorded once would be stale the
+    // moment anything above it changed height.
+    DisposableEffect(flatIndex) {
+        onDispose { onBounds(flatIndex, null) }
+    }
+
     Text(
         text = annotated,
         color = bodyColor,
@@ -764,6 +981,7 @@ private fun SentenceBlock(
         fontFamily = FontFamily.Serif,
         modifier = Modifier
             .fillMaxWidth()
+            .onGloballyPositioned { onBounds(flatIndex, unclippedBounds(it)) }
             .pointerInput(sentence, listening) {
                 detectTapGestures(
                     onTap = { position ->
