@@ -101,6 +101,26 @@ python tools/voice/measure.py \
   --sheet speaker-info.txt --english-only
 ```
 
+### 朗读前把书面语改写成人话
+
+内置语音是拿 espeak-ng 做音素化的，它读数字和符号用的是通用朗读规则，不是"有人在念小说"的规则。实测（用同一套内置语音合成、再用 faster-whisper 回听识别）发现四处一听就知道是机器在念的地方，朗读前统一改写：
+
+| 原文 | 直接读出来 | 改写后 |
+| --- | --- | --- |
+| `1837` | one thousand eight hundred and thirty-seven（3.34 秒） | eighteen thirty-seven（1.50 秒） |
+| `CHAPTER VI.` | chapter vee eye | Chapter six |
+| `8:35 P. M.` | eight thirty-five p, M | eight thirty-five p m |
+| `[Illustration: …]` | 整条注释当作正文念出来（7.2 秒） | 不念 |
+| `*did*` | asterisk did asterisk（2.87 秒） | did（1.47 秒） |
+
+年份只在**时间语境**里改写：前面是 `in`、`since`、`by`、`copyright` 这类词，或者紧挨着另一个年份时才当作年份，`1234 people` 这种数量照旧读数字。`1837-1901` 这样的年份区间不改——语音本来就会把连字符读成 "to"，改了反而多一道错的机会。罗马数字也只在章节标题、君王名（`Henry VIII`）、卷次这些位置改写，而且要求它能严格往返转换（`X` 是 10，但 `IIII` 不是合法写法，就不动）；单独的 `I` 是代词，不碰。
+
+**故意不改的是连读本身。** 先量了再说：把 `to` 放进同样的上下文里对比，弱读的 /tə/ 比读成 "two" 短 0.12 秒，说明弱读已经对了；对 "It is a truth universally acknowledged…" 做逐词时间戳，词与词之间没有超过 50 毫秒的空隙，说明该连的地方已经在连。缩写（`Mr.`、`Mrs.`、`Dr.`）、`It's` 这类缩合、`8:35`、`5 p.m.` 同样已经正确，写规则去"修"它们只会多一个出错的途径。
+
+改写只发生在交给语音引擎的那一份文本上，界面上的原文一个字都不动，所以高亮位置和点击划词都还指向原句。整条注释独占一句时（Gutenberg 版的 `[Illustration: …]` 就是单独一行），改写结果可以是空字符串，此时朗读队列直接跳到下一句——实测这条注释是 7.2 秒的音频，没有听众想要它。
+
+规则都写在 `app/src/main/java/com/engreader/app/tts/SpokenText.kt`，每条边界都有对应的测试（`SpokenTextTest`），另有一份把应用自带的 58 段正文冻结成语料的回归测试（`SpokenCorpusTest`），保证改写既不会丢词，也不会突然开始改写本来不需要动的段落。
+
 ## 构建
 
 环境要求：JDK 17+、Android SDK（platform 35、build-tools 35）、Gradle 8.9。

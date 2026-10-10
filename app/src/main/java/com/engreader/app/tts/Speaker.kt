@@ -177,7 +177,7 @@ class Speaker(private val context: Context) {
     fun prefetch(text: String) {
         if (_state.value != SpeechState.Ready || oneShot) return
         if (_backend.value != SpeechBackend.Bundled) return
-        neural.prefetch(text, rate)
+        neural.prefetch(SpokenText.of(text), rate)
     }
 
     /**
@@ -185,14 +185,30 @@ class Speaker(private val context: Context) {
      *
      * [utteranceId] comes back on the matching [SpeechEvent], which is how the reader
      * learns which sentence finished and highlights the next one.
+     *
+     * The text handed to the voice is [SpokenText.of] the sentence, not the sentence
+     * itself: years, roman numerals and markup are written for the eye, and the bundled
+     * voice reads them literally. The reader's own copy is untouched, so the highlight
+     * and the tap targets still refer to the original.
+     *
+     * That rewrite can leave nothing behind, when the sentence is only an apparatus note
+     * such as `[Illustration: ...]`. The queue is advanced here rather than by handing
+     * empty text to the engine: the bundled voice does report completion for blank text,
+     * but the platform engine's callback for it is not something to rely on, and a
+     * missing completion would strand the reader on the note forever.
      */
     fun speak(text: String, utteranceId: String, flush: Boolean = true) {
         if (_state.value != SpeechState.Ready) return
         oneShot = false
         _speaking.value = true
+        val spoken = SpokenText.of(text)
+        if (spoken.isBlank()) {
+            emit(SpeechEvent.Finished(utteranceId))
+            return
+        }
         if (_backend.value == SpeechBackend.Bundled) {
             neural.speak(
-                text = text,
+                text = spoken,
                 rate = rate,
                 onStart = { scope.launch { _speaking.value = true } },
                 onDone = { emit(SpeechEvent.Finished(utteranceId)) },
@@ -200,7 +216,7 @@ class Speaker(private val context: Context) {
             )
         } else {
             val tts = engine ?: run { emit(SpeechEvent.Failed(utteranceId)); return }
-            tts.speak(text, if (flush) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD, null, utteranceId)
+            tts.speak(spoken, if (flush) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD, null, utteranceId)
         }
     }
 
