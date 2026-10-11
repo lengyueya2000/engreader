@@ -361,7 +361,7 @@ class WordbookRepository(
         note = getString(getColumnIndexOrThrow("note")),
     )
 
-    private companion object {
+    internal companion object {
         const val SELECT =
             "SELECT lemma, display, translation, phonetic, firstSeenAt, seenCount, mastered, " +
                 "box, dueAt, correct, wrong, note FROM word"
@@ -371,9 +371,15 @@ class WordbookRepository(
         /** Longest sentence stored per look-up; a paragraph pasted in as one line is truncated. */
         const val MAX_SENTENCE = 400
 
-        /** Leitner intervals: 10 min, 1 day, 3 days, 7 days, 21 days. */
+        /**
+         * Leitner intervals, one per box: 10 min, 1 day, 3 days, 7 days, 21 days.
+         *
+         * Indexed by `box - 1` — the `CASE` above branches on `WHEN index + 1` because
+         * a box is 1-based. A duplicated leading entry here shifted every interval by
+         * one box, so the second review came 10 minutes later instead of a day and a
+         * word graduated after 7 days instead of 21.
+         */
         val INTERVALS_MS = longArrayOf(
-            10 * 60_000L,
             10 * 60_000L,
             24 * 3_600_000L,
             3 * 24 * 3_600_000L,

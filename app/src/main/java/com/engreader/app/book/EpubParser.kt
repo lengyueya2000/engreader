@@ -33,7 +33,11 @@ object EpubParser {
     )
 
     data class Chapter(val title: String, val text: String) {
-        val wordCount: Int get() = BookText.wordCount(text)
+        /**
+         * Tokenised once and remembered: the import path filters on it and then
+         * reports it, and recounting re-tokenised every chapter of the book.
+         */
+        val wordCount: Int by lazy { BookText.wordCount(text) }
     }
 
     /** One spine item, before it is split into chapters. */
@@ -174,7 +178,7 @@ object EpubParser {
 
     private fun parseManifest(opf: String): Map<String, Item> {
         val out = HashMap<String, Item>()
-        val manifest = Regex("(?is)<manifest\\b.*?</manifest>").find(opf)?.value ?: return out
+        val manifest = elementBody(opf, "manifest") ?: return out
         for (tag in Regex("(?is)<item\\b[^>]*>").findAll(manifest)) {
             val attrs = tag.value
             val id = attr(attrs, "id") ?: continue
@@ -185,7 +189,7 @@ object EpubParser {
     }
 
     private fun parseSpine(opf: String): List<String> {
-        val spine = Regex("(?is)<spine\\b.*?</spine>").find(opf)?.value ?: return emptyList()
+        val spine = elementBody(opf, "spine") ?: return emptyList()
         return Regex("(?is)<itemref\\b[^>]*>").findAll(spine)
             .mapNotNull { attr(it.value, "idref") }
             .toList()
@@ -194,7 +198,7 @@ object EpubParser {
     private data class Metadata(val title: String, val author: String, val language: String)
 
     private fun parseMetadata(opf: String): Metadata {
-        val block = Regex("(?is)<metadata\\b.*?</metadata>").find(opf)?.value ?: opf
+        val block = elementBody(opf, "metadata") ?: opf
         return Metadata(
             title = elementText(block, "dc:title"),
             author = elementText(block, "dc:creator"),
@@ -203,10 +207,22 @@ object EpubParser {
     }
 
     private fun elementText(xml: String, name: String): String =
-        Regex("(?is)<$name\\b[^>]*>(.*?)</$name\\s*>").find(xml)
-            ?.groupValues?.get(1)
+        elementBody(xml, name)
             ?.let { com.engreader.app.source.Html.decode(it).trim() }
             .orEmpty()
+
+    /**
+     * The content of the first `<name>` element, or null when it never closes.
+     *
+     * Written as two scans rather than `(?s)<name\b.*?</name>`: a lazy dot makes the
+     * engine search to the end of the document from every opening tag when the element
+     * is unclosed, which a crafted OPF can arrange thousands of times.
+     */
+    private fun elementBody(xml: String, name: String): String? {
+        val open = Regex("(?is)<$name\\b[^>]*>").find(xml) ?: return null
+        val close = Regex("(?is)</$name\\s*>").find(xml, open.range.last + 1) ?: return null
+        return xml.substring(open.range.last + 1, close.range.first)
+    }
 
     // ----------------------------------------------------------- navigation
 
@@ -283,10 +299,11 @@ object EpubParser {
     private fun parseNavDoc(html: String, navPath: String): List<NavPoint> {
         val dir = navPath.substringBeforeLast('/', "")
         // The toc nav specifically: a nav document may also hold a landmarks list.
-        val nav = Regex("(?is)<nav\\b[^>]*>").findAll(html)
-            .firstOrNull { attr(it.value, "epub:type") == "toc" || attr(it.value, "type") == "toc" }
-            ?.value
-            ?: html
+        // The *body* of the element is what is wanted — the links are between the
+        // opening and closing tags. Matching only the opening tag and then searching
+        // it for `<a>` found nothing, so every EPUB 3 nav document parsed as empty and
+        // the book fell through to NCX or to heading detection.
+        val nav = tocNavBody(html) ?: html
         return Regex("(?is)<a\\b[^>]*>").findAll(nav).mapNotNull { tag ->
             val href = attr(tag.value, "href") ?: return@mapNotNull null
             val end = nav.indexOf("</a>", tag.range.last)
@@ -295,6 +312,26 @@ object EpubParser {
                 .replace("\n", " ").trim()
             if (label.isEmpty()) null else toNavPoint(href, label, dir)
         }.toList()
+    }
+
+    /**
+     * The inside of the `epub:type="toc"` nav element, or null when the document has
+     * no such nav.
+     *
+     * Scanned rather than matched with a lazy `.*?</nav>`: an unclosed `<nav` makes
+     * that pattern rescan to the end of the document once per opening. Nav elements
+     * cannot nest, so the first closing tag after an opening one belongs to it.
+     */
+    private fun tocNavBody(html: String): String? {
+        var at = 0
+        while (true) {
+            val open = Regex("(?is)<nav\\b[^>]*>").find(html, at) ?: return null
+            val close = html.indexOf("</nav", open.range.last + 1)
+            if (close < 0) return null
+            val type = attr(open.value, "epub:type") ?: attr(open.value, "type")
+            if (type == "toc") return html.substring(open.range.last + 1, close)
+            at = open.range.last + 1
+        }
     }
 
     private fun toNavPoint(src: String, label: String, dir: String): NavPoint {
@@ -380,10 +417,11 @@ object EpubParser {
         overrideTitle: String? = null,
     ): Chapter {
         val slice = section.html.substring(start.coerceIn(0, section.html.length), end.coerceIn(start, section.html.length))
+        val text = BookText.fromHtml(slice)
         val title = overrideTitle?.takeIf { it.isNotBlank() }
-            ?: BookText.chapterHeading(slice)
+            ?: BookText.chapterHeading(slice, text)
             ?: ""
-        return Chapter(title = title, text = BookText.fromHtml(slice))
+        return Chapter(title = title, text = text)
     }
 
     /** Drops chapters that carry no prose, and titles the ones left untitled. */
@@ -502,9 +540,21 @@ object EpubParser {
      * `id` inside `data-id`, and asking for `href` matched the one in `xlink:href`.
      */
     private fun attr(tag: String, name: String): String? =
-        Regex("(?is)(?<![\\w:.-])$name\\s*=\\s*(\"([^\"]*)\"|'([^']*)')").find(tag)?.let {
+        attrPattern(name).find(tag)?.let {
             it.groupValues[2].ifEmpty { it.groupValues[3] }
         }?.takeIf { it.isNotBlank() }
+
+    private val ATTR_PATTERNS = java.util.concurrent.ConcurrentHashMap<String, Regex>()
+
+    /**
+     * The pattern for one attribute name, built once per name.
+     *
+     * [attr] is called for every tag of every chapter and the names asked for are a
+     * small fixed set, so recompiling per call was pure repeated work.
+     */
+    private fun attrPattern(name: String): Regex = ATTR_PATTERNS.computeIfAbsent(name) {
+        Regex("(?is)(?<![\\w:.-])$name\\s*=\\s*(\"([^\"]*)\"|'([^']*)')")
+    }
 
     private val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "gif", "webp")
 

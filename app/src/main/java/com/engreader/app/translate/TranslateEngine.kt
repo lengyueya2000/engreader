@@ -71,7 +71,29 @@ internal object TranslateHttp {
         }
     }
 
-    private fun InputStream.readAll(): String = use { it.readBytes().toString(Charsets.UTF_8) }
+    /**
+     * Reads the body, refusing to buffer without a ceiling.
+     *
+     * `readBytes()` takes whatever the server sends: a wrong host answering with a
+     * stream, or a hostile one, would be buffered into memory until the process died.
+     * A whole article's translation is a few kilobytes.
+     */
+    private fun InputStream.readAll(): String = use { input ->
+        val out = java.io.ByteArrayOutputStream()
+        val buffer = ByteArray(8 * 1024)
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            if (out.size() + read > MAX_RESPONSE_BYTES) {
+                throw TranslationException("翻译服务返回的内容过大")
+            }
+            out.write(buffer, 0, read)
+        }
+        out.toByteArray().toString(Charsets.UTF_8)
+    }
+
+    /** Upper bound on a response body, in bytes. */
+    private const val MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
     /**
      * `q=a&q=b` with each value percent-encoded.

@@ -51,6 +51,17 @@ class Dictionary(private val context: Context) : Lexicon, FamilyLexicon {
     @Volatile
     private var db: SQLiteDatabase? = null
 
+    /**
+     * Recent successful look-ups, keyed by the string as tapped, oldest evicted first.
+     *
+     * Only hits are kept: a miss costs one more query, whereas tracking them would
+     * need a sentinel entry to tell "not in the dictionary" from "not cached yet".
+     */
+    private val cache = object : LinkedHashMap<String, WordEntry>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, WordEntry>?): Boolean =
+            size > CACHE_LIMIT
+    }
+
     private val file: File get() = File(context.filesDir, DB_NAME)
 
     private fun open(): SQLiteDatabase {
@@ -108,13 +119,33 @@ class Dictionary(private val context: Context) : Lexicon, FamilyLexicon {
      * [WordEntry.alsoForm] so the sheet can offer it.
      */
     override fun lookup(raw: String): WordEntry? {
-        val query = raw.trim().trimEnd('.', ',', ';', ':', '!', '?', '"', '\'', ')', ']')
-        if (query.isEmpty()) return null
-        val lower = query.lowercase()
+        // The same handful of words is resolved over and over — every paragraph
+        // recomposition, every grammar analysis, every quiz option list — and each
+        // miss is two or three SQLite queries. Entries are immutable, so a recent-hit
+        // cache is safe to share across the background dispatchers.
+        cacheGet(raw)?.let { return it }
+        // The token as tapped, minus surrounding punctuation, is what the sheet shows;
+        // only the key the query runs on is normalised further.
+        val keys = lookupKeys(raw)
+        if (keys.isEmpty()) return null
+        for (key in keys) resolve(key, keys.first())?.let { return cachePut(raw, it) }
+        return null
+    }
 
-        val own = entryFor(lower, query)
+    private fun cacheGet(key: String): WordEntry? = synchronized(cache) { cache[key] }
+
+    private fun cachePut(key: String, entry: WordEntry): WordEntry {
+        synchronized(cache) { cache[key] = entry }
+        return entry
+    }
+
+    /** Headword resolution: the exact spelling, then the lemma the `form` table names. */
+    private fun resolve(key: String, display: String): WordEntry? {
+        val lower = key.lowercase()
+
+        val own = entryFor(lower, display)
         val lemma = lemmaFor(lower)?.takeIf { !it.equals(lower, ignoreCase = true) }
-        val fromLemma = lemma?.let { entryFor(it, query) }
+        val fromLemma = lemma?.let { entryFor(it, display) }
 
         return when {
             own == null -> fromLemma
@@ -382,6 +413,9 @@ class Dictionary(private val context: Context) : Lexicon, FamilyLexicon {
     companion object {
         private const val DB_NAME = "dict.db"
 
+        /** Entries kept in the look-up cache. A few hundred taps' worth, a few tens of KB. */
+        private const val CACHE_LIMIT = 512
+
         /**
          * Escapes the `LIKE` wildcards so a typed prefix is matched literally.
          *
@@ -391,5 +425,35 @@ class Dictionary(private val context: Context) : Lexicon, FamilyLexicon {
          */
         internal fun escapeLikePrefix(value: String): String =
             value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+        /**
+         * The headword keys to try for a tapped token, best first, or an empty list
+         * when the token holds nothing to look up.
+         *
+         * Surrounding punctuation goes first. A possessive ending is then offered as a
+         * *second* key rather than replacing the token: the dictionary stores neither
+         * `minister's` nor `ministers'`, so a tap on either used to report "not found",
+         * but it does have entries for `it's` and `don't`, and those glosses are the
+         * ones the reader wants. The plural possessive is already gone with the
+         * punctuation — a trailing apostrophe is one of the stripped characters.
+         */
+        internal fun lookupKeys(raw: String): List<String> {
+            val query = raw.trim().trim(*SURROUNDING)
+            if (query.isEmpty()) return emptyList()
+            val base = query.removeSuffix("'s").removeSuffix("\u2019s")
+            return if (base.isNotEmpty() && base != query) listOf(query, base) else listOf(query)
+        }
+
+        /**
+         * Characters a tapped token can be wrapped in.
+         *
+         * Both ends, not just the trailing one: the reader's own tokens never carry
+         * punctuation, but the same key function is reachable from a pasted word, and
+         * an asymmetric strip leaves a leading quote glued to the headword.
+         */
+        private val SURROUNDING = charArrayOf(
+            '.', ',', ';', ':', '!', '?', '"', '\'', '\u2018', '\u2019', '\u201C', '\u201D',
+            '(', ')', '[', ']',
+        )
     }
 }

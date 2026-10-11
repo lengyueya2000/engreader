@@ -152,6 +152,56 @@ class WordFamilyTest {
     }
 
     @Test
+    fun `a stem is never a different word with the ending cut off it`() {
+        // `number` minus `er` is `numb`, so a prefix search for `number` returned the
+        // family of `numb`: numbed, numbly, numbness. The same held for `corner`
+        // (corn), `bother` (both) and `matter` (matt).
+        assertEquals("number", WordFamily.stemOf("number"))
+        assertEquals("corner", WordFamily.stemOf("corner"))
+        assertEquals("bother", WordFamily.stemOf("bother"))
+        assertEquals("matter", WordFamily.stemOf("matter"))
+        // A stem search still finds a word genuinely built on the stem: `govern` is its
+        // own stem, and `governor` matches on `or` from the accept list.
+        assertEquals("govern", WordFamily.stemOf("govern"))
+    }
+
+    @Test
+    fun `a relative built on the stem is still found`() {
+        val lexicon = FakeLexicon(
+            entries = mapOf(
+                "govern" to (PartOfSpeech.Verb to "统治"),
+                "governor" to (PartOfSpeech.Noun to "总督"),
+                "governance" to (PartOfSpeech.Noun to "治理"),
+            ),
+            family = mapOf("govern" to listOf("govern", "governor", "governance")),
+        )
+        val words = WordFamily.related(lexicon, lexicon.lookup("govern")!!).map { it.word }
+        assertTrue(words.contains("governor"))
+        assertTrue(words.contains("governance"))
+    }
+
+    @Test
+    fun `relatives never include a multi-word entry`() {
+        val lexicon = FakeLexicon(
+            entries = mapOf(
+                "number" to (PartOfSpeech.Noun to "数字"),
+                "numbered" to (PartOfSpeech.Verb to "编号"),
+                "numbering" to (PartOfSpeech.Verb to "编号"),
+                "number one" to (PartOfSpeech.Noun to "第一"),
+                "number plate" to (PartOfSpeech.Noun to "车牌"),
+            ),
+            family = mapOf(
+                "number" to listOf("number", "numbered", "numbering", "number one", "number plate"),
+            ),
+        )
+        val entry = lexicon.lookup("number")!!
+        val words = WordFamily.related(lexicon, entry).map { it.word }
+        assertFalse(words.contains("number one"))
+        assertFalse(words.contains("number plate"))
+        assertTrue(words.contains("numbered"))
+    }
+
+    @Test
     fun `related combines inflections with stem matches`() {
         val lexicon = FakeLexicon(
             entries = mapOf(

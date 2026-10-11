@@ -111,9 +111,14 @@ class QuizBuilder(private val dictionary: Lexicon) {
         }
 
         val out = mutableListOf<QuizQuestion>()
+        // Distractors are drawn from the article's own words of the same part of
+        // speech. Grouping them costs one dictionary lookup per distinct word;
+        // doing it inside the option builder meant re-querying the dictionary for
+        // every word of the article, once per question.
+        val poolByPos = articlePoolByPos(articleWords)
         for (candidate in candidates) {
             if (out.size >= limit) break
-            val options = clozeOptions(candidate.surface, candidate.pos, articleWords) ?: continue
+            val options = clozeOptions(candidate.surface, candidate.pos, poolByPos) ?: continue
             val answer = options.indexOfFirst { it.equals(candidate.surface, ignoreCase = true) }
             if (answer < 0) continue
             val blanked = blankOut(candidate.sentence.text, candidate.start, candidate.end)
@@ -141,6 +146,22 @@ class QuizBuilder(private val dictionary: Lexicon) {
     }
 
     /**
+     * The article's own words, grouped by part of speech and sorted.
+     *
+     * The same candidate pool serves every question, so it is built once from a
+     * single pass over the article's distinct words instead of a dictionary query
+     * per word per question.
+     */
+    private fun articlePoolByPos(articleWords: Map<String, Int>): Map<PartOfSpeech, List<String>> {
+        val grouped = HashMap<PartOfSpeech, MutableList<String>>()
+        for (word in articleWords.keys) {
+            if (word.length < 5 || word in STOP) continue
+            grouped.getOrPut(posOfWord(word)) { mutableListOf() } += word
+        }
+        return grouped.mapValues { (_, words) -> words.sorted() }
+    }
+
+    /**
      * Four English options: the word the article used plus three same-part-of-speech
      * words drawn from the article itself where possible, so the wrong answers are
      * plausible in register rather than obviously foreign.
@@ -148,12 +169,10 @@ class QuizBuilder(private val dictionary: Lexicon) {
     private fun clozeOptions(
         answer: String,
         pos: PartOfSpeech,
-        articleWords: Map<String, Int>,
+        poolByPos: Map<PartOfSpeech, List<String>>,
     ): List<String>? {
-        val fromArticle = articleWords.keys
-            .filter { it != answer.lowercase() && it.length >= 5 && it !in STOP }
-            .filter { word -> posOfWord(word) == pos }
-            .sorted()
+        val fromArticle = (poolByPos[pos] ?: emptyList())
+            .filter { it != answer.lowercase() }
             .take(12)
 
         val pool = fromArticle.toMutableList()
@@ -177,11 +196,22 @@ class QuizBuilder(private val dictionary: Lexicon) {
         }
         if (picked.size < 3) return null
 
-        val options = (picked + answer).toMutableList()
+        // The answer keeps the article's spelling, so a sentence-initial target used to
+        // be the only capitalised option in the list and gave itself away. Every option
+        // is shown in the answer's own leading case so the list is uniform.
+        val options = (picked + answer).map { matchCase(it, answer) }.toMutableList()
         val shift = Math.floorMod(seed, 4)
         repeat(shift) { options.add(options.removeAt(0)) }
         return options
     }
+
+    /** [word] in the leading case of [answer], so casing never marks the answer out. */
+    private fun matchCase(word: String, answer: String): String =
+        if (answer.firstOrNull()?.isUpperCase() == true) {
+            word.replaceFirstChar { it.uppercaseChar() }
+        } else {
+            word.lowercase()
+        }
 
     /**
      * Replaces the answer with a blank, keeping any trailing punctuation and the
@@ -196,11 +226,24 @@ class QuizBuilder(private val dictionary: Lexicon) {
         Cloze.blankAt(sentence, start, end)
 
     /** True when the answer is still readable somewhere else in the blanked sentence. */
-    private fun stillVisible(blanked: String, answer: String): Boolean =
-        Regex(
-            "(?<![A-Za-z'\\u2019-])" + Regex.escape(answer) + "(?![A-Za-z'\\u2019-])",
-            RegexOption.IGNORE_CASE,
-        ).containsMatchIn(blanked)
+    private fun stillVisible(blanked: String, answer: String): Boolean {
+        // Scanned rather than matched with a lookaround pattern built per candidate:
+        // the pattern text depends on the answer, so a regex here compiles once per
+        // question for a check that is one linear pass.
+        var at = blanked.indexOf(answer, startIndex = 0, ignoreCase = true)
+        while (at >= 0) {
+            val left = at - 1
+            val right = at + answer.length
+            val wholeLeft = left < 0 || !isWordChar(blanked[left])
+            val wholeRight = right >= blanked.length || !isWordChar(blanked[right])
+            if (wholeLeft && wholeRight) return true
+            at = blanked.indexOf(answer, startIndex = at + 1, ignoreCase = true)
+        }
+        return false
+    }
+
+    /** The characters that make a match part of a longer word rather than the word. */
+    private fun isWordChar(c: Char) = c.isLetter() || c == '\'' || c == '\u2019' || c == '-'
 
     // -------------------------------------------------------------- reference
 

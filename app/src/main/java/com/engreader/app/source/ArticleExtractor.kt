@@ -53,11 +53,21 @@ object ArticleExtractor {
      * `Britain`.
      */
     private fun attr(attrs: String, name: String): String? {
-        val match = Regex(
-            "(?is)(?:^|\\s)$name\\s*=\\s*(\"([^\"]*)\"|'([^']*)'|([^\\s\"'>]+))",
-        ).find(attrs) ?: return null
+        val match = attrPattern(name).find(attrs) ?: return null
         val groups = match.groupValues
         return groups[2].ifEmpty { groups[3].ifEmpty { groups[4] } }.takeIf { it.isNotBlank() }
+    }
+
+    private val ATTR_PATTERNS = java.util.concurrent.ConcurrentHashMap<String, Regex>()
+
+    /**
+     * The pattern for one attribute name, built once per name.
+     *
+     * [attr] runs on every tag of a document and the name set is tiny and fixed, so
+     * compiling the pattern on each call was pure repeated work.
+     */
+    private fun attrPattern(name: String): Regex = ATTR_PATTERNS.computeIfAbsent(name) {
+        Regex("(?is)(?:^|\\s)$name\\s*=\\s*(\"([^\"]*)\"|'([^']*)'|([^\\s\"'>]+))")
     }
 
     /**

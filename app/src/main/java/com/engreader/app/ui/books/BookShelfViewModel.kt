@@ -74,7 +74,10 @@ class BookShelfViewModel(private val container: AppContainer) : ViewModel() {
             // The coroutine was cancelled, not the import: swallowing this would leave
             // the shelf showing a spinner that never resolves.
             throw e
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
+            // `Throwable` rather than `Exception`: a malformed book can exhaust the heap
+            // while it is decompressed, and that arrives as an `Error`. Reporting it
+            // keeps the app alive with a message instead of a crash dialog.
             state = state.copy(
                 importing = null,
                 error = e.message ?: "导入失败",

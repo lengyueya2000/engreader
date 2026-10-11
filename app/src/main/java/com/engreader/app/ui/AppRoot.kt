@@ -36,7 +36,11 @@ import com.engreader.app.ui.wordbook.WordbookScreen
 
 /** Where the app is, outside the tab bar: an open article, or a full-screen tool. */
 sealed interface Overlay {
-    data class Reading(val articleId: Long) : Overlay
+    /**
+     * The reader, at [paragraph] when it is a search hit and at the chapter's own stored
+     * position when it is zero.
+     */
+    data class Reading(val articleId: Long, val paragraph: Int = 0) : Overlay
     data object Settings : Overlay
     data object Review : Overlay
     data object BookShelf : Overlay
@@ -93,11 +97,11 @@ fun AppRoot(container: AppContainer) {
         // chapter one to chapter twelve should still leave the reader one back-press
         // from the shelf, not twelve. The reader is keyed by article id, so the swap
         // builds a fresh ViewModel for the new chapter.
-        val openChapter: (Long) -> Unit = { id ->
+        val openChapter: (Long, Int) -> Unit = { id, paragraph ->
             if (overlays.lastOrNull() is Overlay.Reading) {
-                overlays[overlays.lastIndex] = Overlay.Reading(id)
+                overlays[overlays.lastIndex] = Overlay.Reading(id, paragraph)
             } else {
-                overlays.add(Overlay.Reading(id))
+                overlays.add(Overlay.Reading(id, paragraph))
             }
             refreshKey++
         }
@@ -150,6 +154,7 @@ fun AppRoot(container: AppContainer) {
                             onBack = pop,
                             onSavedChanged = { refreshKey++ },
                             onOpenChapter = openChapter,
+                            initialParagraph = overlay.paragraph,
                         )
                     }
                     Overlay.Review -> com.engreader.app.ui.wordbook.ReviewScreen(onBack = pop)

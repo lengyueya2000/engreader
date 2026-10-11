@@ -58,6 +58,23 @@ class BookParserTest {
     // ----------------------------------------------------------------- EPUB
 
     @Test
+    fun `an epub3 nav document names the chapters`() {
+        // The nav is this book's only navigation — there is no NCX — and its body has
+        // no headings. The parser matched just the opening `<nav>` tag and then
+        // searched *it* for links, which found nothing, so the nav parsed as empty and
+        // the book fell back to heading detection: one unnamed chapter instead of
+        // three named ones. The landmarks list comes first, so the toc has to be
+        // picked by its `epub:type` rather than by position.
+        val book = EpubParser.parse(resource("nav-only.epub"))
+        assertEquals("Nav Only Book", book.title)
+        assertEquals("Fixture Author", book.author)
+        assertEquals(
+            listOf("Preface", "Chapter One", "Chapter Two"),
+            book.chapters.map { it.title },
+        )
+    }
+
+    @Test
     fun `an epub is split by its navigation document`() {
         val book = EpubParser.parse(resource("two-chapters.epub"))
         assertEquals("Two Chapters & a Preface", book.title)
@@ -370,6 +387,147 @@ class BookParserTest {
         val book = EpubParser.parse(epub)
         assertTrue("the spine item must still resolve", book.chapters.isNotEmpty())
     }
+
+    // ------------------------------------------- plain text, FB2 and HTML
+
+    @Test
+    fun `a plain text book is split on its chapter headings`() {
+        val text = buildString {
+            append("Title: A Short Book\n\nAuthor: Test Author\n\n")
+            append("*** START OF THE PROJECT GUTENBERG EBOOK A SHORT BOOK ***\n\n")
+            append("CHAPTER I.\n\n")
+            append(paragraph("The first chapter begins here."))
+            append("\n\nCHAPTER II.\n\n")
+            append(paragraph("The second chapter follows on."))
+            append("\n\n*** END OF THE PROJECT GUTENBERG EBOOK A SHORT BOOK ***\n")
+        }
+        val book = TextParser.parsePlain(text.toByteArray(Charsets.UTF_8))
+        assertEquals("A Short Book", book.title)
+        assertEquals("Test Author", book.author)
+        assertEquals(listOf("CHAPTER I", "CHAPTER II"), book.chapters.map { it.title })
+        assertTrue(book.chapters.all { it.wordCount >= 40 })
+    }
+
+    @Test
+    fun `the gutenberg licence text is not part of the book`() {
+        val text = "*** START OF THE PROJECT GUTENBERG EBOOK X ***\n\n" +
+            paragraph("Real prose begins here.") + "\n\n" +
+            "*** END OF THE PROJECT GUTENBERG EBOOK X ***\n" +
+            "Most people start at our website which has the main PG search facility."
+        val book = TextParser.parsePlain(text.toByteArray(Charsets.UTF_8))
+        val body = book.chapters.joinToString(" ") { it.text }
+        assertTrue(body.contains("Real prose begins here."))
+        assertFalse(body.contains("PG search facility"))
+    }
+
+    @Test
+    fun `text with no headings is cut into readable chapters`() {
+        // One enormous chapter would have the reader split the whole book into
+        // sentences before it could show the first line.
+        val text = (1..2000).joinToString("\n\n") {
+            paragraph("Paragraph number $it says the same thing again.")
+        }
+        val book = TextParser.parsePlain(text.toByteArray(Charsets.UTF_8))
+        assertTrue("expected more than one chapter, got ${book.chapters.size}", book.chapters.size > 1)
+        assertTrue(book.chapters.all { it.wordCount <= 6_000 })
+        assertEquals("第 1 节", book.chapters.first().title)
+    }
+
+    @Test
+    fun `a chapter number written in words still starts a chapter`() {
+        // The shared marker rule wants a numeral, so a plain-text edition that spells it
+        // out imported as one enormous chapter with no table of contents.
+        val text = buildString {
+            append("Chapter One: The Beginning\n\n")
+            append(paragraph("The morning was cold and the streets were empty."))
+            append("\n\nChapter Two: The Journey\n\n")
+            append(paragraph("The journey took eleven hours by train."))
+        }
+        val book = TextParser.parsePlain(text.toByteArray(Charsets.UTF_8))
+        assertEquals(
+            listOf("Chapter One: The Beginning", "Chapter Two: The Journey"),
+            book.chapters.map { it.title },
+        )
+    }
+
+    @Test
+    fun `a sentence that mentions a chapter is not a heading`() {
+        // Only a line that *starts* with the marker counts; otherwise ordinary prose
+        // about a chapter would cut the text in half.
+        val text = paragraph("Chapter one of the story was written last year.") + "\n\n" +
+            paragraph("The rest of the book continues from here.")
+        val book = TextParser.parsePlain(text.toByteArray(Charsets.UTF_8))
+        assertEquals(1, book.chapters.size)
+        assertTrue(book.chapters.first().text.contains("was written last year"))
+    }
+
+    @Test
+    fun `a legacy chinese encoding is not turned into replacement characters`() {
+        val text = "第一章\n\n" + "这是正文的第一段内容。".repeat(10)
+        val bytes = text.toByteArray(java.nio.charset.Charset.forName("GB18030"))
+        val book = TextParser.parsePlain(bytes)
+        val body = book.chapters.joinToString(" ") { it.text }
+        assertFalse(body, body.contains('\uFFFD'))
+        assertTrue(body, body.contains("这是正文的第一段内容"))
+    }
+
+    @Test
+    fun `an fb2 book takes its metadata and chapters from its sections`() {
+        val fb2 = """
+            <?xml version="1.0" encoding="utf-8"?>
+            <FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0">
+              <description><title-info>
+                <book-title>The Test Novel</book-title>
+                <author><first-name>Jane</first-name><last-name>Austen</last-name></author>
+                <lang>en</lang>
+              </title-info></description>
+              <body>
+                <section><title><p>Chapter One</p></title>
+                  <p>${paragraph("The opening section of the book.")}</p></section>
+                <section><title><p>Chapter Two</p></title>
+                  <p>${paragraph("The closing section of the book.")}</p></section>
+              </body>
+              <body name="notes"><section><title><p>Notes</p></title>
+                <p>${paragraph("A footnote that is not part of the story.")}</p></section></body>
+            </FictionBook>
+        """.trimIndent()
+        val book = TextParser.parseFb2(fb2.toByteArray(Charsets.UTF_8))
+        assertEquals("The Test Novel", book.title)
+        assertEquals("Jane Austen", book.author)
+        assertEquals("en", book.language)
+        assertEquals(listOf("Chapter One", "Chapter Two"), book.chapters.map { it.title })
+    }
+
+    @Test
+    fun `an html file is split on its headings`() {
+        val html = """
+            <html><head><title>A Saved Page</title></head><body>
+            <h1>First Part</h1><p>${paragraph("Text of the first part.")}</p>
+            <h1>Second Part</h1><p>${paragraph("Text of the second part.")}</p>
+            </body></html>
+        """.trimIndent()
+        val book = TextParser.parseHtml(html.toByteArray(Charsets.UTF_8))
+        assertEquals("A Saved Page", book.title)
+        assertEquals(listOf("First Part", "Second Part"), book.chapters.map { it.title })
+    }
+
+    @Test
+    fun `the new formats are detected from their bytes`() {
+        val fb2 = "<?xml version=\"1.0\"?><FictionBook><body/></FictionBook>"
+        assertEquals(BookFormat.Fb2, BookFormat.detect(fb2.toByteArray()))
+        val html = "<!DOCTYPE html><html><body><p>hi</p></body></html>"
+        assertEquals(BookFormat.Html, BookFormat.detect(html.toByteArray()))
+        assertEquals(BookFormat.Txt, BookFormat.detect("Just some prose, no markup.".toByteArray()))
+        // A UTF-16 text file is full of NULs but is still text.
+        val utf16 = "\uFEFFChapter One\n\nSome prose here.".toByteArray(Charsets.UTF_16LE)
+        assertEquals(BookFormat.Txt, BookFormat.detect(utf16))
+        // A binary format with no NUL in its opening is not text.
+        val binary = ByteArray(600) { if (it % 3 == 0) 0x01 else 0x41 }
+        assertNull(BookFormat.detect(binary))
+    }
+
+    /** A paragraph long enough that a chapter holding it clears the minimum. */
+    private fun paragraph(sentence: String): String = sentence.repeat(12).trim()
 
     /** A minimal EPUB whose manifest carries [itemTag] and whose content is one file. */
     private fun singleChapterEpub(itemTag: String): ByteArray {

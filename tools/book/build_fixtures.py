@@ -126,6 +126,86 @@ def huff_cdic_records():
     cdic = b'CDIC' + struct.pack('>LL', 16, 256) + struct.pack('>L', 8) + bytes(table) + bytes(data)
     return huff, cdic
 
+def build_epub_nav_only(path):
+    """A minimal EPUB 3 whose only navigation is the nav document — there is no NCX.
+
+    The nav holds a landmarks list *before* the toc list, so the parser has to pick
+    the `epub:type="toc"` nav rather than the first one it sees. The body carries no
+    `<h1>`/`<h2>` headings and every section is over the 40-word chapter floor, so a
+    book that fails to read the nav falls back to heading detection and yields one
+    unnamed chapter instead of three named ones.
+    """
+    import zipfile
+    container = ('<?xml version="1.0" encoding="utf-8"?>'
+                 '<container version="1.0" '
+                 'xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+                 '<rootfiles><rootfile full-path="OEBPS/content.opf" '
+                 'media-type="application/oebps-package+xml"/></rootfiles></container>')
+    opf = ('<?xml version="1.0" encoding="utf-8"?>'
+           '<package xmlns="http://www.idpf.org/2007/opf" version="3.0" '
+           'unique-identifier="bookid">'
+           '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
+           '<dc:identifier id="bookid">urn:uuid:nav-only-fixture</dc:identifier>'
+           '<dc:title>Nav Only Book</dc:title>'
+           '<dc:creator>Fixture Author</dc:creator>'
+           '<dc:language>en</dc:language></metadata>'
+           '<manifest>'
+           '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>'
+           '<item id="text" href="text.xhtml" media-type="application/xhtml+xml"/>'
+           '</manifest>'
+           '<spine><itemref idref="text"/></spine></package>')
+    nav = ('<?xml version="1.0" encoding="utf-8"?>'
+           '<html xmlns="http://www.w3.org/1999/xhtml" '
+           'xmlns:epub="http://www.idpf.org/2007/ops"><head><title>Contents</title></head>'
+           '<body>'
+           '<nav epub:type="landmarks"><ol>'
+           '<li><a epub:type="bodymatter" href="text.xhtml">Start Reading</a></li>'
+           '</ol></nav>'
+           '<nav epub:type="toc"><ol>'
+           '<li><a href="text.xhtml#preface">Preface</a></li>'
+           '<li><a href="text.xhtml#one">Chapter One</a></li>'
+           '<li><a href="text.xhtml#two">Chapter Two</a></li>'
+           '</ol></nav>'
+           '</body></html>')
+
+    def section(sid, sentences):
+        body = ''.join('<p>%s</p>' % s for s in sentences)
+        return '<div id="%s">%s</div>' % (sid, body)
+
+    text = ('<?xml version="1.0" encoding="utf-8"?>'
+            '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Nav Only Book</title></head>'
+            '<body>'
+            + section('preface', [
+                'This preface exists so that the front matter is long enough to survive the '
+                'word-count floor that drops empty chapters, which would otherwise remove it.',
+                'It says nothing in particular, and it is followed by two chapters that are '
+                'named only by the navigation document, since no heading appears in the text.',
+            ])
+            + section('one', [
+                'The first chapter begins here, in the middle of the file, with no heading of '
+                'any kind to mark it, so the only record of where it starts is the anchor that '
+                'the navigation document points at.',
+                'Everything a reader sees for this chapter is plain prose in a plain paragraph, '
+                'and the chapter boundary is a position in the markup rather than an element.',
+            ])
+            + section('two', [
+                'The second chapter follows the first in the same file, again without a heading, '
+                'and again the navigation document is the only thing that knows it is a chapter.',
+                'A reader that ignores the navigation would see one long chapter here instead of '
+                'three, which is exactly what this fixture is built to detect.',
+            ])
+            + '</body></html>')
+
+    with zipfile.ZipFile(path, 'w') as z:
+        # `mimetype` first and uncompressed: the detector looks for the literal string.
+        z.writestr(zipfile.ZipInfo('mimetype'), 'application/epub+zip',
+                   compress_type=zipfile.ZIP_STORED)
+        z.writestr('META-INF/container.xml', container, compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr('OEBPS/content.opf', opf, compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr('OEBPS/nav.xhtml', nav, compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr('OEBPS/text.xhtml', text, compress_type=zipfile.ZIP_DEFLATED)
+
+
 def main(out_dir):
     os.makedirs(out_dir, exist_ok=True)
     chapters = [
@@ -192,6 +272,10 @@ def main(out_dir):
           os.path.join(out_dir, 'palmdoc-only.mobi'))
     open(os.path.join(out_dir, 'palmdoc-only.txt'), 'wb').write(body)
     open(os.path.join(out_dir, 'plain.txt'), 'wb').write(text)
+
+    # 8. An EPUB 3 whose navigation is the nav document only (no NCX).
+    build_epub_nav_only(os.path.join(out_dir, 'nav-only.epub'))
+
     for f in sorted(os.listdir(out_dir)):
         print(f, os.path.getsize(os.path.join(out_dir, f)))
 

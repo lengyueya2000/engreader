@@ -48,41 +48,24 @@ object BookText {
     private val COMMENT = Regex("(?s)<!--.*?-->")
     private val SENTENCE_END = Regex("[.!?][\"'\\u201D\\u2019)]*\\s*$")
 
-    /**
-     * Removes each [DROPPED] element with its content, in one pass per element name.
-     *
-     * The obvious regex, `<(script|…)\b[^>]*>.*?</\1\s*>`, is quadratic on markup that
-     * opens the element repeatedly without closing it: every one of the n openings
-     * makes the engine scan to the end of the document before giving up. A book with a
-     * thousand stray `<script>` tags — a corrupt conversion, or a file crafted to
-     * stall the importer — would take minutes. Scanning with `indexOf` instead keeps
-     * each pass linear, and an element with no closing tag at all is skipped up front
-     * rather than searched for once per opening.
-     */
-    private fun dropElements(html: String): String {
-        var out = html
-        for (name in DROPPED) {
-            if (!out.contains("</$name", ignoreCase = true)) continue
-            out = dropElement(out, name)
-        }
-        return out
-    }
+    /** Runs of any whitespace, including the non-breaking spaces conversions leave behind. */
+    private val ALL_SPACE = Regex("[\\s\\u00A0\\u2007\\u202F]+")
 
-    private fun dropElement(html: String, name: String): String {
-        val open = Regex("(?is)<$name\\b${Html.ATTRS}>")
-        val close = Regex("(?is)</$name\\s*>")
-        val out = StringBuilder(html.length)
-        var at = 0
-        while (true) {
-            val start = open.find(html, at) ?: break
-            val end = close.find(html, start.range.last + 1) ?: break
-            out.append(html, at, start.range.first).append(' ')
-            // Past the closing tag, so the next search cannot re-find this element.
-            at = end.range.last + 1
-        }
-        out.append(html, at, html.length)
-        return out.toString()
-    }
+    /** The same, but stopping at a line break, which is a paragraph boundary. */
+    private val LINE_SPACE = Regex("[ \\t\\u00A0\\u2007\\u202F]+")
+
+    /** Plain whitespace, for flattening an already line-broken label. */
+    private val WHITESPACE = Regex("\\s+")
+
+    /**
+     * Removes each [DROPPED] element with its content.
+     *
+     * Shared with the feed path, which needs the same protection: the obvious regex,
+     * `<(script|…)\b[^>]*>.*?</\1\s*>`, is quadratic on markup that opens the element
+     * repeatedly without closing it. A book with a thousand stray `<script>` tags — a
+     * corrupt conversion, or a file crafted to stall the importer — would take minutes.
+     */
+    private fun dropElements(html: String): String = Html.dropElements(html, DROPPED)
 
     /**
      * Paragraph break sentinel.
@@ -114,7 +97,7 @@ object BookText {
         s = BLOCK_OPEN.replace(s, BREAK)
         s = BLOCK_CLOSE.replace(s, BREAK)
         s = ANY_TAG.replace(s, "")
-        s = s.replace(Regex("[\\s\\u00A0\\u2007\\u202F]+"), " ")
+        s = s.replace(ALL_SPACE, " ")
         s = s.replace(BREAK, "\n")
         return fromPlain(s)
     }
@@ -134,7 +117,7 @@ object BookText {
         // feeds double-encode; doing that here would rewrite the author's text.
         val decoded = com.engreader.app.source.Html.decodeOnce(text)
         val lines = decoded.split('\n', '\r')
-            .map { line -> line.replace(Regex("[ \\t\\u00A0\\u2007\\u202F]+"), " ").trim() }
+            .map { line -> line.replace(LINE_SPACE, " ").trim() }
             .filter { it.isNotEmpty() }
         return lines.joinToString("\n\n")
     }
@@ -169,23 +152,32 @@ object BookText {
      * *heading to* or *tailpiece to* are skipped: those are captions on an
      * illustration plate, and they name the chapter the plate belongs to rather than
      * the one being read.
+     *
+     * [text] is the chapter's already-extracted text when the caller has it; the
+     * import path extracts it anyway to store the chapter, and converting the same
+     * markup a second time here was a full extra pass per chapter.
      */
-    fun chapterHeading(html: String): String? {
+    fun chapterHeading(html: String, text: String? = null): String? {
         firstHeading(html)?.let { return it }
-        val head = fromHtml(html).take(HEADING_SCAN_CHARS)
+        val head = (text ?: fromHtml(html)).take(HEADING_SCAN_CHARS)
         // Every marker in the opening, not just the first: an illustration plate is
         // captioned before the chapter it precedes, so the first match is often the
         // rejected one and the real title sits a line further down.
         for (match in CHAPTER_MARKER.findAll(head)) {
             if (PLATE_CAPTION.containsMatchIn(head.substring(0, match.range.first))) continue
-            return normaliseMarker(match.value)
+            return normaliseHeading(match.value)
         }
         return null
     }
 
-    /** `Chapter: I.` reads as `Chapter I`. */
-    private fun normaliseMarker(raw: String): String {
-        val trimmed = raw.trim().trimEnd('.', ',', ':', ';').replace(Regex("\\s+"), " ")
+    /**
+     * `Chapter: I.` reads as `Chapter I`.
+     *
+     * Shared with the plain-text parser, which has its own reasons for spotting a
+     * heading and must still produce the same title for a marker the shared rule missed.
+     */
+    internal fun normaliseHeading(raw: String): String {
+        val trimmed = raw.trim().trimEnd('.', ',', ':', ';').replace(WHITESPACE, " ")
         val parts = MARKER_PARTS.matchEntire(trimmed) ?: return trimmed
         return "${parts.groupValues[1]} ${parts.groupValues[2]}"
     }
@@ -201,10 +193,10 @@ object BookText {
      * marker is left alone: `Preface` and `List of Illustrations` are real titles.
      */
     fun cleanContentsLabel(label: String): String {
-        val flat = label.replace(Regex("\\s+"), " ").trim()
+        val flat = label.replace(WHITESPACE, " ").trim()
         val match = CHAPTER_MARKER.find(flat) ?: return flat.take(MAX_LABEL_CHARS)
         if (PLATE_CAPTION.containsMatchIn(flat.substring(0, match.range.first))) return flat.take(MAX_LABEL_CHARS)
-        return normaliseMarker(match.value)
+        return normaliseHeading(match.value)
     }
 
     /** A label long enough to be a paragraph is truncated rather than shown whole. */

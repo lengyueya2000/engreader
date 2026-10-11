@@ -6,6 +6,8 @@ import android.database.sqlite.SQLiteDatabase
 import com.engreader.app.model.Article
 import com.engreader.app.model.FeedItem
 import com.engreader.app.model.QuizQuestion
+import com.engreader.app.model.SearchHit
+import com.engreader.app.nlp.Paragraphs
 import com.engreader.app.nlp.Tokenizer
 import com.engreader.app.nlp.VocabularyGrader
 import com.engreader.app.nlp.VocabularyProfile
@@ -87,6 +89,9 @@ class ArticleRepository(
     ): Article = withContext(Dispatchers.IO) {
         val difficulty = ArticleExtractor.estimateDifficulty(extracted.body, grader.grade(extracted.body).grade)
         val now = System.currentTimeMillis()
+        // The feed summary is often repeated verbatim as the article's opening
+        // paragraph; keeping both shows the reader the same sentence twice.
+        val body = stripDuplicateLead(extracted.body, extracted.summary.ifBlank { item.summary })
         val values = ContentValues().apply {
             put("sourceId", item.sourceId)
             put("title", extracted.title.ifBlank { item.title })
@@ -95,9 +100,6 @@ class ArticleRepository(
             put("author", extracted.author)
             put("publishedAt", extracted.publishedAt.takeIf { it > 0 } ?: item.publishedAt)
             put("difficulty", difficulty)
-            // The feed summary is often repeated verbatim as the article's opening
-            // paragraph; keeping both shows the reader the same sentence twice.
-            val body = stripDuplicateLead(extracted.body, extracted.summary.ifBlank { item.summary })
             put("body", body)
             put("wordCount", Tokenizer.countWords(body))
             // The body may have changed under a re-fetch, so the cached lemma list no
@@ -107,6 +109,13 @@ class ArticleRepository(
             put("fetchedAt", now)
         }
         val id = if (existingId != null) {
+            // The translation is keyed by paragraph *position*, and the reader only
+            // checks that the count still lines up. A re-fetch returning the same
+            // number of paragraphs of different text therefore showed the old Chinese
+            // under the new English. It is dropped only when the text really changed:
+            // rebuilding costs a network round-trip, and a re-fetch that returned the
+            // same body leaves it valid.
+            if (!bodyUnchanged(existingId, body)) values.put("translation", "")
             db.writableDatabase.update("article", values, "id = ?", arrayOf(existingId.toString()))
             existingId
         } else {
@@ -122,6 +131,20 @@ class ArticleRepository(
         require(id > 0) { "Could not store article ${item.url}" }
         requireNotNull(get(id))
     }
+
+    /**
+     * True when the body already stored for [id] is the same text as [body].
+     *
+     * Compared inside SQLite rather than by reading the stored body back: the point
+     * is to decide whether anything derived from the old body is still valid, and
+     * pulling a full article into the heap to compare two strings would be the most
+     * expensive part of the re-fetch.
+     */
+    private fun bodyUnchanged(id: Long, body: String): Boolean =
+        db.readableDatabase.rawQuery(
+            "SELECT body = ? FROM article WHERE id = ?",
+            arrayOf(body, id.toString()),
+        ).use { it.moveToFirst() && it.getInt(0) == 1 }
 
     suspend fun get(id: Long): Article? = withContext(Dispatchers.IO) {
         db.readableDatabase.rawQuery("$SELECT WHERE id = ?", arrayOf(id.toString()))
@@ -146,6 +169,17 @@ class ArticleRepository(
         db.readableDatabase.rawQuery(
             "$SELECT WHERE saved = 1 AND bookId = 0 ORDER BY fetchedAt DESC", null,
         ).use { it.toArticles() }
+    }
+
+    /**
+     * Whether any article is stored at all, without loading one.
+     *
+     * The first-launch seed check only needs a yes/no, and reading every row to
+     * answer it meant tokenising the whole library before the home list could show.
+     */
+    suspend fun hasAny(): Boolean = withContext(Dispatchers.IO) {
+        db.readableDatabase.rawQuery("SELECT 1 FROM article LIMIT 1", null)
+            .use { it.moveToFirst() }
     }
 
     /**
@@ -242,6 +276,74 @@ class ArticleRepository(
         Unit
     }
 
+    /**
+     * Records how far down the text the reader had got.
+     *
+     * Written as a paragraph number rather than a pixel offset: the offset depends on
+     * the font size, the line height and the window width, all of which change, while
+     * the paragraph the reader stopped at is the same paragraph afterwards.
+     */
+    suspend fun setReadParagraph(id: Long, paragraph: Int) = withContext(Dispatchers.IO) {
+        if (id <= 0 || paragraph < 0) return@withContext
+        db.writableDatabase.execSQL(
+            "UPDATE article SET readParagraph = ? WHERE id = ?",
+            arrayOf(paragraph, id),
+        )
+        Unit
+    }
+
+    /**
+     * Finds the paragraphs containing [query].
+     *
+     * Scoped to the chapter when the reader is in one, and to the whole book when the
+     * row is a chapter: a novel is searched as a novel, and a single article as itself.
+     * The scan is done in memory rather than with SQL `LIKE`, because a paragraph is the
+     * unit of a result and the paragraph boundaries are the reader's, not the database's
+     * — `LIKE` would have to be re-derived from the same text afterwards anyway.
+     */
+    suspend fun search(
+        bookId: Long,
+        articleId: Long,
+        query: String,
+        limit: Int = SEARCH_LIMIT,
+    ): List<SearchHit> = withContext(Dispatchers.IO) {
+        val needle = query.trim()
+        if (needle.length < 2) return@withContext emptyList()
+        val sql = if (bookId > 0) {
+            "SELECT id, chapterIndex, title, body FROM article WHERE bookId = ? " +
+                "ORDER BY chapterIndex ASC"
+        } else {
+            "SELECT id, chapterIndex, title, body FROM article WHERE id = ?"
+        }
+        val arg = (if (bookId > 0) bookId else articleId).toString()
+        val hits = mutableListOf<SearchHit>()
+        db.readableDatabase.rawQuery(sql, arrayOf(arg)).use { c ->
+            val idIndex = c.getColumnIndexOrThrow("id")
+            val chapterIndex = c.getColumnIndexOrThrow("chapterIndex")
+            val title = c.getColumnIndexOrThrow("title")
+            val body = c.getColumnIndexOrThrow("body")
+            while (c.moveToNext() && hits.size < limit) {
+                val rowId = c.getLong(idIndex)
+                val chapter = c.getInt(chapterIndex)
+                val chapterTitle = c.getString(title).orEmpty()
+                val text = c.getString(body).orEmpty()
+                Paragraphs.split(text).forEachIndexed { index, paragraph ->
+                    if (hits.size >= limit) return@forEachIndexed
+                    if (paragraph.text.contains(needle, ignoreCase = true)) {
+                        hits += SearchHit(
+                            articleId = rowId,
+                            chapterIndex = chapter,
+                            chapterTitle = chapterTitle,
+                            paragraphIndex = index,
+                            text = paragraph.text,
+                        )
+                    }
+                }
+            }
+        }
+        hits
+    }
+
     private fun Cursor.toArticles(): List<Article> = buildList {
         while (moveToNext()) add(toArticle())
     }
@@ -312,6 +414,8 @@ class ArticleRepository(
             vocabProfile = getString(getColumnIndexOrThrow("vocabProfile")),
             bookId = getLong(getColumnIndexOrThrow("bookId")),
             chapterIndex = getInt(getColumnIndexOrThrow("chapterIndex")),
+            storedWordCount = getInt(getColumnIndexOrThrow("wordCount")),
+            readParagraph = getInt(getColumnIndexOrThrow("readParagraph")),
         )
     }
 
@@ -341,10 +445,13 @@ class ArticleRepository(
     }
 
     private companion object {
+        /** Most results one search returns; a common word in a novel would otherwise list thousands. */
+        const val SEARCH_LIMIT = 120
+
         const val SELECT =
             "SELECT id, sourceId, title, subtitle, url, author, publishedAt, difficulty, body, " +
                 "saved, fetchedAt, lastReadAt, readSeconds, quizJson, translation, vocabProfile, " +
-                "bookId, chapterIndex " +
+                "bookId, chapterIndex, wordCount, readParagraph " +
                 "FROM article"
     }
 }

@@ -56,6 +56,8 @@ class AppContainer(context: Context) {
 
     val wordbook = WordbookRepository(userDb, dictionary)
 
+    val backup = BackupRepository(userDb)
+
     val progress = ProgressRepository(userDb, dictionary)
 
     val settings = SettingsRepository(appContext)

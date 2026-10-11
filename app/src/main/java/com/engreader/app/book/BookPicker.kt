@@ -29,6 +29,9 @@ object BookPicker {
         "application/epub+zip",
         "application/x-mobipocket-ebook",
         "application/vnd.amazon.ebook",
+        "application/x-fictionbook+xml",
+        "text/plain",
+        "text/html",
         "application/octet-stream",
         "*/*",
     )
@@ -36,7 +39,10 @@ object BookPicker {
     /** True for a name the app is willing to try, used only to warn early. */
     fun looksSupported(name: String): Boolean {
         val extension = name.substringAfterLast('.', "").lowercase()
-        return extension in setOf("epub", "mobi", "azw", "azw3", "prc")
+        return extension in setOf(
+            "epub", "mobi", "azw", "azw3", "prc",
+            "fb2", "txt", "text", "html", "htm", "xhtml", "md",
+        )
     }
 
     fun describe(context: Context, uri: Uri): PickedFile {

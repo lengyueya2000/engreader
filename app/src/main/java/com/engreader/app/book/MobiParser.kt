@@ -123,10 +123,15 @@ object MobiParser {
         val initial = textLength.coerceIn(0, MAX_TEXT_LENGTH).coerceAtMost(1 shl 20)
         val text = ByteArrayOutputStream(initial)
         for (i in textStart until textStart + recordCount) {
+            // Every record's expansion is bounded by what is left of the ceiling, so a
+            // file whose records each claim to expand enormously is refused rather than
+            // accumulated until the process dies.
+            val remaining = MAX_TEXT_LENGTH - text.size()
+            if (remaining <= 0) throw BookFormat.Companion.Unsupported("MOBI 的正文过大")
             val raw = records.getOrNull(i) ?: break
             val trimmed = trimTrailingEntries(raw, extraFlags)
             val expanded = when {
-                huffman != null -> huffman.decode(trimmed)
+                huffman != null -> huffman.decode(trimmed, remaining)
                 compression == COMPRESSION_PALMDOC -> palmDoc(trimmed)
                 compression == COMPRESSION_NONE -> trimmed
                 else -> throw BookFormat.Companion.Unsupported("不支持的压缩方式（$compression）")
@@ -354,6 +359,9 @@ object MobiParser {
         /** Phrase bytes, paired with whether they are already plain text. */
         private val phrases = ArrayList<Pair<ByteArray, Boolean>>()
 
+        /** Total bytes held in [phrases], so a crafted table cannot exhaust the heap. */
+        private var phraseBytes = 0
+
         init {
             val huff = records.getOrNull(huffRecord)
                 ?: throw BookFormat.Companion.Unsupported("MOBI 的 HUFF 表缺失")
@@ -395,7 +403,15 @@ object MobiParser {
             val total = readInt(cdic, 8)
             val bits = readInt(cdic, 12)
             if (bits <= 0 || bits > 16) throw BookFormat.Companion.Unsupported("MOBI 的 CDIC 码长不对")
-            val wanted = minOf(1 shl bits, total - phrases.size)
+            // The format's own ceiling is one entry per code, so 2^16 phrases is the most
+            // a genuine table can hold. The byte ceiling is what actually matters: every
+            // entry carries its own offset into the same record, so a crafted table can
+            // point a hundred thousand entries at the same 32 KB phrase and multiply the
+            // heap by the entry count. A real CDIC table is a few hundred kilobytes.
+            if (total > MAX_PHRASES || phrases.size >= MAX_PHRASES) {
+                throw BookFormat.Companion.Unsupported("MOBI 的压缩词表过大")
+            }
+            val wanted = minOf(1 shl bits, total - phrases.size, MAX_PHRASES - phrases.size)
             for (k in 0 until wanted) {
                 val entryAt = 16 + k * 2
                 if (entryAt + 2 > cdic.size) break
@@ -407,20 +423,24 @@ object MobiParser {
                 val plain = word and 0x8000 != 0
                 val from = lengthAt + 2
                 val to = (from + length).coerceAtMost(cdic.size)
+                phraseBytes += to - from
+                if (phraseBytes > MAX_PHRASE_BYTES) {
+                    throw BookFormat.Companion.Unsupported("MOBI 的压缩词表过大")
+                }
                 phrases += cdic.copyOfRange(from, to) to plain
             }
         }
 
-        fun decode(data: ByteArray): ByteArray = decode(data, depth = 0)
+        fun decode(data: ByteArray, budget: Int = MAX_TEXT_LENGTH): ByteArray = decode(data, 0, budget)
 
-        private fun decode(data: ByteArray, depth: Int): ByteArray {
+        private fun decode(data: ByteArray, depth: Int, budget: Int): ByteArray {
             // A phrase is allowed to be compressed, but a table that refers to itself —
             // corrupt, or crafted — would recurse until the stack runs out. A
             // `StackOverflowError` is an `Error`, so it escapes the import path's
             // `catch (Exception)` and kills the app; the reference implementation stops
             // at a depth of 20, and no real book nests anywhere near that.
             if (depth > MAX_PHRASE_DEPTH) return ByteArray(0)
-            val out = ByteArrayOutputStream(data.size * 4)
+            val out = ByteArrayOutputStream(minOf(data.size * 4, budget))
             // Eight zero bytes so the 64-bit window can be read four bytes past the end.
             val padded = data.copyOf(data.size + 8)
             var bitsLeft = data.size * 8
@@ -448,6 +468,12 @@ object MobiParser {
                 val index = (max - code) ushr (32 - length)
                 if (index < 0 || index >= phrases.size) break
                 val (bytes, plain) = phrases[index]
+                // Every code costs at least one bit and may write a 32 KB phrase, so a
+                // crafted record can claim gigabytes out of a few kilobytes of input.
+                // The ceiling is the same one the decoded text is held to.
+                if (out.size() + bytes.size > budget) {
+                    throw BookFormat.Companion.Unsupported("MOBI 的正文解压后过大")
+                }
                 if (plain) {
                     out.write(bytes)
                 } else if (depth >= MAX_PHRASE_DEPTH) {
@@ -456,7 +482,7 @@ object MobiParser {
                     // uncached so a shallower occurrence can still expand it.
                     break
                 } else {
-                    val expanded = decode(bytes, depth + 1)
+                    val expanded = decode(bytes, depth + 1, budget - out.size())
                     phrases[index] = expanded to true
                     out.write(expanded)
                 }
@@ -545,19 +571,26 @@ object MobiParser {
      */
     private fun splitChapters(markup: String): List<EpubParser.Chapter> {
         val byBreak = Regex("(?i)<\\s*/?\\s*mbp:pagebreak[^>]*>").split(markup)
-        val pieces = if (byBreak.count { BookText.wordCount(BookText.fromHtml(it)) >= MIN_CHAPTER_WORDS } >= 2) {
-            byBreak
+        // Each piece is extracted once and the decision is made on the result.
+        // Counting the words first and extracting again for real converted every
+        // chapter of the book twice, which is the expensive half of an import.
+        // A single piece cannot hold two chapters, so that case skips the work.
+        val broken = if (byBreak.size < 2) emptyList() else byBreak.map { extractChapter(it) }
+        val pieces = if (broken.count { it.wordCount >= MIN_CHAPTER_WORDS } >= 2) {
+            broken
         } else {
-            splitOnHeadings(markup)
+            splitOnHeadings(markup).map { extractChapter(it) }
         }
-        val chapters = pieces.map { piece ->
-            val text = BookText.fromHtml(piece)
-            EpubParser.Chapter(BookText.chapterHeading(piece) ?: "", text)
-        }.filter { it.wordCount >= MIN_CHAPTER_WORDS }
 
+        val chapters = pieces.filter { it.wordCount >= MIN_CHAPTER_WORDS }
         return chapters.mapIndexed { index, chapter ->
             if (chapter.title.isBlank()) chapter.copy(title = "第 ${index + 1} 节") else chapter
         }
+    }
+
+    private fun extractChapter(markup: String): EpubParser.Chapter {
+        val text = BookText.fromHtml(markup)
+        return EpubParser.Chapter(BookText.chapterHeading(markup, text) ?: "", text)
     }
 
     private fun splitOnHeadings(markup: String): List<String> {
@@ -653,6 +686,12 @@ object MobiParser {
 
     /** How deep a compressed phrase may nest before the table is treated as broken. */
     private const val MAX_PHRASE_DEPTH = 20
+
+    /** One phrase per code is the format's own ceiling, so 2^16 is the most a real table holds. */
+    private const val MAX_PHRASES = 1 shl 16
+
+    /** Total bytes of compressed phrases. A genuine CDIC table is a few hundred kilobytes. */
+    private const val MAX_PHRASE_BYTES = 8 * 1024 * 1024
 
     /** Upper bound on the declared text length, so a bad header cannot allocate GBs. */
     private const val MAX_TEXT_LENGTH = 64 * 1024 * 1024

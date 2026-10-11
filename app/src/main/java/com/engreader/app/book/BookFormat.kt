@@ -12,6 +12,9 @@ enum class BookFormat(val label: String) {
     Epub("EPUB"),
     Mobi("MOBI"),
     Azw3("AZW3"),
+    Fb2("FB2"),
+    Html("HTML"),
+    Txt("TXT"),
     ;
 
     companion object {
@@ -27,6 +30,10 @@ enum class BookFormat(val label: String) {
          *
          * Only the first few hundred bytes are needed, so callers should pass a
          * prefix rather than a whole multi-megabyte file.
+         *
+         * The order matters: an EPUB is a zip, a Palm database may be a MOBI or may be
+         * something else entirely, and plain text matches anything — so it is tried
+         * last, once every structured format has been ruled out.
          */
         fun detect(bytes: ByteArray): BookFormat? = when {
             isZip(bytes) -> if (looksLikeEpub(bytes)) Epub else null
@@ -35,12 +42,63 @@ enum class BookFormat(val label: String) {
             } else {
                 null
             }
+            contains(bytes, "<FictionBook") -> Fb2
+            looksLikeHtml(bytes) -> Html
+            isPlainText(bytes) -> Txt
             else -> null
         }
 
         private fun isZip(b: ByteArray): Boolean =
             b.size >= 4 && b[0] == 0x50.toByte() && b[1] == 0x4B.toByte() &&
                 b[2] == 0x03.toByte() && b[3] == 0x04.toByte()
+
+        /**
+         * Whether the opening of the file contains [needle], ignoring case.
+         *
+         * Only the opening is searched: the whole point of sniffing is to decide before
+         * reading a file that may be tens of megabytes.
+         */
+        private fun contains(b: ByteArray, needle: String): Boolean {
+            val head = String(b, 0, minOf(b.size, SNIFF_BYTES), Charsets.ISO_8859_1)
+            return head.contains(needle, ignoreCase = true)
+        }
+
+        private fun looksLikeHtml(b: ByteArray): Boolean {
+            val head = String(b, 0, minOf(b.size, SNIFF_BYTES), Charsets.ISO_8859_1)
+            return head.contains("<html", ignoreCase = true) ||
+                head.contains("<!doctype html", ignoreCase = true) ||
+                head.contains("<body", ignoreCase = true)
+        }
+
+        /**
+         * A file whose opening is text and not bytes is treated as plain text.
+         *
+         * NUL is what separates a novel from a binary format none of the readers above
+         * recognised — a PDF, a DOCX, a JAR all carry them within the first few
+         * kilobytes — and the control-character share catches the binary formats that
+         * happen not to. A UTF-16 file is full of NULs but is still text, which is why
+         * its byte-order mark counts as a text signature on its own.
+         */
+        private fun isPlainText(b: ByteArray): Boolean {
+            if (hasUtf16Mark(b)) return true
+            val head = b.size.coerceAtMost(SNIFF_BYTES)
+            if (head == 0) return false
+            var control = 0
+            for (i in 0 until head) {
+                val c = b[i].toInt() and 0xFF
+                if (c == 0) return false
+                // Tab, newline and carriage return are the only control bytes text has.
+                if (c < 0x09 || c in 0x0E..0x1F || c == 0x7F) control++
+            }
+            return control * 100 <= head
+        }
+
+        private fun hasUtf16Mark(b: ByteArray): Boolean =
+            b.size >= 2 && (b[0] == 0xFF.toByte() && b[1] == 0xFE.toByte() ||
+                b[0] == 0xFE.toByte() && b[1] == 0xFF.toByte())
+
+        /** How much of the file the sniffing rules look at. */
+        private const val SNIFF_BYTES = 4096
 
         /**
          * A zip is an EPUB when it carries the `mimetype` entry the OCF spec requires

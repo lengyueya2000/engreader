@@ -145,7 +145,7 @@ fun BookShelfScreen(
 
             item {
                 Text(
-                    text = "导入 EPUB / MOBI / AZW3，按章阅读，同样可以划词和朗读",
+                    text = "导入 EPUB / MOBI / AZW3 / FB2 / HTML / TXT，按章阅读，同样可以划词和朗读",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 22.dp),
@@ -161,7 +161,7 @@ fun BookShelfScreen(
                 item {
                     EmptyState(
                         title = "还没有导入的书",
-                        detail = "点右上角的加号，从手机里选一个 EPUB、MOBI 或 AZW3 文件。" +
+                        detail = "点右上角的加号，从手机里选一个 EPUB、MOBI、AZW3、FB2、HTML 或 TXT 文件。" +
                             "整本书会被拆成章节存进本机，之后不需要网络也能读。",
                         icon = Icons.Outlined.AutoStories,
                         actionLabel = "选择文件",

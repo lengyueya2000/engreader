@@ -33,6 +33,10 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -70,6 +74,12 @@ fun TypographySheet(
     onDismiss: () -> Unit,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    // Each slider holds its own value while the finger is down and commits on
+    // release. Persisting on every step wrote the settings file once per frame of
+    // the drag and recomposed the whole article behind the sheet for each of them.
+    var previewSize by remember(fontSize) { mutableStateOf(fontSize.toFloat()) }
+    var previewLineHeight by remember(lineHeight) { mutableStateOf(lineHeight) }
+    var previewRate by remember(speechRate) { mutableStateOf(speechRate) }
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
@@ -92,19 +102,21 @@ fun TypographySheet(
             )
             Spacer(Modifier.height(18.dp))
 
-            SettingRow(Icons.Outlined.FormatSize, "字号", "${fontSize}sp")
+            SettingRow(Icons.Outlined.FormatSize, "字号", "${previewSize.toInt()}sp")
             Slider(
-                value = fontSize.toFloat(),
-                onValueChange = { onFontSize(it.toInt()) },
+                value = previewSize,
+                onValueChange = { previewSize = it },
+                onValueChangeFinished = { onFontSize(previewSize.toInt()) },
                 valueRange = 15f..30f,
                 steps = 14,
             )
 
             Spacer(Modifier.height(6.dp))
-            SettingRow(Icons.AutoMirrored.Outlined.Subject, "行距", "%.2f×".format(lineHeight))
+            SettingRow(Icons.AutoMirrored.Outlined.Subject, "行距", "%.2f×".format(previewLineHeight))
             Slider(
-                value = lineHeight,
-                onValueChange = onLineHeight,
+                value = previewLineHeight,
+                onValueChange = { previewLineHeight = it },
+                onValueChangeFinished = { onLineHeight(previewLineHeight) },
                 valueRange = 1.35f..2.3f,
                 steps = 18,
             )
@@ -184,10 +196,11 @@ fun TypographySheet(
             Spacer(Modifier.height(6.dp))
             HairLine()
             Spacer(Modifier.height(14.dp))
-            SettingRow(Icons.Outlined.Headphones, "朗读语速", "%.2f×".format(speechRate))
+            SettingRow(Icons.Outlined.Headphones, "朗读语速", "%.2f×".format(previewRate))
             Slider(
-                value = speechRate,
-                onValueChange = onSpeechRate,
+                value = previewRate,
+                onValueChange = { previewRate = it },
+                onValueChangeFinished = { onSpeechRate(previewRate) },
                 valueRange = 0.5f..1.4f,
                 steps = 8,
             )

@@ -8,6 +8,7 @@ import com.engreader.app.book.BookFormat
 import com.engreader.app.book.BookText
 import com.engreader.app.book.EpubParser
 import com.engreader.app.book.MobiParser
+import com.engreader.app.book.TextParser
 import com.engreader.app.model.Article
 import com.engreader.app.model.Book
 import com.engreader.app.model.ChapterRef
@@ -56,7 +57,7 @@ class BookRepository(
 
         val format = BookFormat.detect(bytes)
             ?: throw BookFormat.Companion.Unsupported(
-                "认不出这个格式。目前支持 EPUB、MOBI 和 AZW3。"
+                "认不出这个格式。目前支持 EPUB、MOBI、AZW3、FB2、HTML 和纯文本。"
             )
 
         val parsed = when (format) {
@@ -65,6 +66,15 @@ class BookRepository(
             }
             BookFormat.Mobi, BookFormat.Azw3 -> MobiParser.parse(bytes).let {
                 Parsed(it.title, it.author, it.chapters, it.cover, it.coverExtension)
+            }
+            BookFormat.Fb2 -> TextParser.parseFb2(bytes).let {
+                Parsed(it.title, it.author, it.chapters, null, "")
+            }
+            BookFormat.Html -> TextParser.parseHtml(bytes).let {
+                Parsed(it.title, it.author, it.chapters, null, "")
+            }
+            BookFormat.Txt -> TextParser.parsePlain(bytes).let {
+                Parsed(it.title, it.author, it.chapters, null, "")
             }
         }
 
@@ -132,8 +142,11 @@ class BookRepository(
                     endTransaction()
                 }
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             // The row was rolled back, so the image written above belongs to nothing.
+            // `Throwable` rather than `Exception`: a malformed file can exhaust the heap
+            // or the stack, and those are `Error`s — the cover would otherwise be left
+            // behind for a book that does not exist.
             if (coverFile.isNotEmpty()) File(coversDir(), coverFile).delete()
             throw e
         }
@@ -314,23 +327,9 @@ class BookRepository(
             lastReadAt = getLong(getColumnIndexOrThrow("lastReadAt")),
             readSeconds = getInt(getColumnIndexOrThrow("readSeconds")),
             lastChapter = getInt(getColumnIndexOrThrow("lastChapter")),
-            wordCount = wordCountOf(id),
+            wordCount = getInt(getColumnIndexOrThrow("bookWords")),
         )
     }
-
-    /**
-     * Word count of the whole book, summed from its chapters.
-     *
-     * Read from the stored column rather than computed: a book's chapters are written
-     * once and never change, so this is a cheap `SUM` over an indexed column, and the
-     * space-counting expression it replaced disagreed with [Article.wordCount] — which
-     * the reader and the article list both show.
-     */
-    private fun wordCountOf(bookId: Long): Int =
-        db.readableDatabase.rawQuery(
-            "SELECT SUM(wordCount) FROM article WHERE bookId = ?",
-            arrayOf(bookId.toString()),
-        ).use { if (it.moveToFirst() && !it.isNull(0)) it.getInt(0) else 0 }
 
     /** What a parser produced, normalised so EPUB and MOBI share one import path. */
     private data class Parsed(
@@ -347,7 +346,12 @@ class BookRepository(
 
         const val SELECT =
             "SELECT id, title, author, format, fileName, coverFile, chapterCount, addedAt, " +
-                "lastReadAt, readSeconds, lastChapter FROM book"
+                "lastReadAt, readSeconds, lastChapter, " +
+                // Summed in the same statement rather than one query per book: the
+                // shelf asked for a separate SUM for every row it displayed.
+                "(SELECT IFNULL(SUM(a.wordCount), 0) FROM article a WHERE a.bookId = book.id) " +
+                "AS bookWords " +
+                "FROM book"
 
         /**
          * A chapter's URL.

@@ -1,5 +1,7 @@
 package com.engreader.app.ui.settings
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -14,6 +16,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
@@ -21,6 +24,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.outlined.FileDownload
+import androidx.compose.material.icons.outlined.FileUpload
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -32,16 +37,22 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import com.engreader.app.data.BackupRepository
 import com.engreader.app.tts.VoiceCatalog
 import com.engreader.app.ui.LocalContainer
 import com.engreader.app.ui.components.HairLine
 import com.engreader.app.ui.theme.ReadingTheme
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Settings that are not reading-specific.
@@ -62,6 +73,50 @@ fun SettingsScreen(onBack: () -> Unit) {
     var speechVoice by remember { mutableStateOf(settings.speechVoice) }
     var theme by remember { mutableStateOf(settings.readingTheme) }
     var showTranslation by remember { mutableStateOf(settings.showTranslation) }
+    var backupMessage by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+
+    /**
+     * Writes the backup to the file the reader picked.
+     *
+     * The file is chosen through the system picker rather than written to a folder of
+     * the app's choosing, so the export lands somewhere the reader can find it and the
+     * app needs no storage permission.
+     */
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json"),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            backupMessage = runCatching {
+                val json = container.backup.export()
+                withContext(Dispatchers.IO) {
+                    context.contentResolver.openOutputStream(uri)?.use {
+                        it.write(json.toByteArray())
+                    } ?: throw IllegalStateException("打不开所选文件")
+                }
+                "已导出。"
+            }.getOrElse { "导出失败：${it.message ?: "未知错误"}" }
+        }
+    }
+
+    val importLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            backupMessage = runCatching {
+                val text = withContext(Dispatchers.IO) {
+                    context.contentResolver.openInputStream(uri)?.use { it.readBytes().decodeToString() }
+                        ?: throw IllegalStateException("打不开所选文件")
+                }
+                val result = container.backup.restore(text)
+                "已导入：新增生词 ${result.wordsAdded} 个，更新 ${result.wordsUpdated} 个，" +
+                    "阅读记录 ${result.sessionsAdded} 条。"
+            }.getOrElse { "导入失败：${it.message ?: "未知错误"}" }
+        }
+    }
 
     LaunchedEffect(Unit) {
         container.speaker.prepare(
@@ -298,6 +353,39 @@ fun SettingsScreen(onBack: () -> Unit) {
             HairLine()
             Spacer(Modifier.height(18.dp))
 
+            Group("备份与恢复")
+            Text(
+                text = "生词本里的复习进度、笔记和阅读记录只存在这台设备上，" +
+                    "导出成文件后可以在换手机或重装后导回来。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                BackupButton(
+                    icon = Icons.Outlined.FileUpload,
+                    label = "导出备份",
+                    modifier = Modifier.weight(1f),
+                ) { exportLauncher.launch(BackupRepository.FILE_NAME) }
+                BackupButton(
+                    icon = Icons.Outlined.FileDownload,
+                    label = "导入备份",
+                    modifier = Modifier.weight(1f),
+                ) { importLauncher.launch(arrayOf("application/json", "text/plain", "*/*")) }
+            }
+            backupMessage?.let { message ->
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+
+            Spacer(Modifier.height(22.dp))
+            HairLine()
+            Spacer(Modifier.height(18.dp))
+
             Group("关于内容来源")
             Text(
                 text = "词库来自开源项目 ECDICT（约 5.9 万条常用词，含音标、词频与考试标签），" +
@@ -318,6 +406,37 @@ fun SettingsScreen(onBack: () -> Unit) {
 
             Spacer(Modifier.height(WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding() + 40.dp))
         }
+    }
+}
+
+/** One of the two backup actions: an icon over a label, sized to share a row. */
+@Composable
+private fun BackupButton(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    Column(
+        modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainer)
+            .clickable(onClick = onClick)
+            .padding(vertical = 12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Icon(
+            icon,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(20.dp),
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
     }
 }
 

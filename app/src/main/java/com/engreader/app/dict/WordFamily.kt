@@ -69,6 +69,24 @@ object WordFamily {
     )
 
     /**
+     * The endings [stemOf] is allowed to strip — a strict subset of
+     * [DERIVATIONAL_SUFFIXES].
+     *
+     * Stripping is only safe when the remainder is a fragment rather than a word.
+     * `er`, `or`, `y` and `al` are the four that break that: `number` minus `er` is
+     * `numb`, so a prefix search for `number` returned `numbed`, `numbly` and
+     * `numbness`; `final` minus `al` is `fin`, which listed `fined`. Nothing is lost
+     * by leaving them out, because a word genuinely built on a short stem is still
+     * found — `teach` is its own stem, and `teacher` matches on `er` from the accept
+     * list above.
+     */
+    private val STRIPPABLE = listOf(
+        "ation", "ition", "ative", "able", "ible", "ance", "ence", "ment", "ness",
+        "ion", "ive", "ing", "ity", "ous", "ful", "ate", "acy", "ism", "ist",
+        "ed", "ly",
+    )
+
+    /**
      * Splits an `exchange` blob into `(form, code)` pairs, in [CODES] order.
      *
      * A spelling stored under two codes (ECDICT files `derived` as both the past
@@ -109,7 +127,7 @@ object WordFamily {
         // the longer ones in the stem (`governm` for `government`). The guard keeps a
         // short word from being stripped to nothing: `derive` ends in `ive`, but
         // cutting there would leave three letters and match half the dictionary.
-        val suffix = DERIVATIONAL_SUFFIXES.firstOrNull { w.length - it.length >= 4 && w.endsWith(it) }
+        val suffix = STRIPPABLE.firstOrNull { w.length - it.length >= 4 && w.endsWith(it) }
         val cut = when {
             suffix != null -> w.length - suffix.length
             // A silent `e` is what the derivational suffixes attach to (`derive` →
@@ -140,6 +158,9 @@ object WordFamily {
         val stem = stemOf(entry.lemma)
         if (stem != null) {
             lexicon.wordsStartingWith(stem, limit = 40)
+                // The dictionary holds multi-word entries (`number one`, `a bit`), and
+                // they are never a form of the word being read.
+                .filter { it.word.all { c -> c.isLetter() } }
                 .filter { it.word.length > stem.length }
                 .filter { it.word.length <= entry.lemma.length + 8 }
                 .filter { !it.word.equals(entry.lemma, ignoreCase = true) }

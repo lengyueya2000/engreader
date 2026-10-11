@@ -84,12 +84,19 @@ class WordbookViewModel(private val container: AppContainer) : ViewModel() {
 
     suspend fun remove(lemma: String) {
         container.wordbook.remove(lemma)
-        load()
+        // One deleted row, so the list is updated in place. Reloading rebuilt the
+        // difficulty band of every remaining word and put the whole list behind a
+        // spinner for a tap that changed a single row.
+        state = state.copy(words = state.words.filterNot { it.lemma == lemma })
+        refreshCounts()
     }
 
     suspend fun setMastered(lemma: String, mastered: Boolean) {
         container.wordbook.setMastered(lemma, mastered)
-        load()
+        state = state.copy(
+            words = state.words.map { if (it.lemma == lemma) it.copy(mastered = mastered) else it },
+        )
+        refreshCounts()
     }
 
     suspend fun lookup(lemma: String): WordEntry? = withContext(Dispatchers.IO) {
@@ -114,7 +121,23 @@ class WordbookViewModel(private val container: AppContainer) : ViewModel() {
     /** Saves the reader's own note against a word. */
     suspend fun setNote(lemma: String, note: String) {
         container.wordbook.setNote(lemma, note)
-        load()
+        state = state.copy(
+            words = state.words.map { if (it.lemma == lemma) it.copy(note = note) else it },
+        )
+        applyFilter()
+    }
+
+    /** Re-reads the header counts, which a single-row edit can change. */
+    private suspend fun refreshCounts() {
+        val counts = withContext(Dispatchers.IO) {
+            Triple(
+                container.wordbook.dueCount(),
+                container.wordbook.totalCount(),
+                container.wordbook.masteredCount(),
+            )
+        }
+        state = state.copy(dueCount = counts.first, total = counts.second, mastered = counts.third)
+        applyFilter()
     }
 
     /** Related forms of a saved word, shown under its gloss. */

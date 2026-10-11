@@ -90,7 +90,8 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
     }
 
     /** Installs the bundled passages on first launch so there is always something to read. */
-    suspend fun installSeedIfEmpty() {        val hasAny = withContext(Dispatchers.IO) { container.articles.all().isNotEmpty() }
+    suspend fun installSeedIfEmpty() {
+        val hasAny = withContext(Dispatchers.IO) { container.articles.hasAny() }
         if (hasAny) return
         val seeds = container.seedLibrary.load()
         seeds.forEach { seed ->

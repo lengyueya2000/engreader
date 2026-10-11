@@ -44,11 +44,17 @@ class DiscoverViewModel(private val container: AppContainer) : ViewModel() {
             }
         }
         try {
-            val items = container.fetcher.feed(topic.feedUrl, topic.id, topic.name)
-                .sortedByDescending { it.publishedAt }
-                .distinctBy { it.url }
-            cache[topic.id] = items
-            state = state.copy(loading = false, items = items, error = null)
+            val fetched = container.fetcher.feed(topic.feedUrl, topic.id, topic.name)
+            if (fetched == null) {
+                // 304: the feed has not changed, so whatever is already on screen
+                // stands. Treated as a success rather than an error, because that is
+                // what it is.
+                state = state.copy(loading = false, items = cache[topic.id] ?: state.items, error = null)
+            } else {
+                val items = fetched.sortedByDescending { it.publishedAt }.distinctBy { it.url }
+                cache[topic.id] = items
+                state = state.copy(loading = false, items = items, error = null)
+            }
         } catch (e: CancellationException) {
             // Switching tabs cancels this scope. That is not a load failure, and
             // reporting it as one would replace a good list with an error screen.
@@ -71,11 +77,14 @@ class DiscoverViewModel(private val container: AppContainer) : ViewModel() {
             }
         }
         try {
-            val items = container.fetcher.feed(source)
-                .sortedByDescending { it.publishedAt }
-                .distinctBy { it.url }
-            cache[source.id] = items
-            state = state.copy(loading = false, items = items)
+            val fetched = container.fetcher.feed(source)
+            if (fetched == null) {
+                state = state.copy(loading = false, items = cache[source.id] ?: state.items, error = null)
+            } else {
+                val items = fetched.sortedByDescending { it.publishedAt }.distinctBy { it.url }
+                cache[source.id] = items
+                state = state.copy(loading = false, items = items)
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {

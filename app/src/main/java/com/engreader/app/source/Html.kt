@@ -51,18 +51,23 @@ object Html {
     private val SPACE_BEFORE = Regex("\\s+([,.;:!?%\u201D\u2019\\]\\)\\}])")
     private val SPACE_AFTER = Regex("([\u201C\u2018\\[\\(\\{])\\s+")
 
-    private val SCRIPT = Regex("(?is)<(script|style|noscript|svg|form|nav|aside)\\b.*?</\\1>")
     private val COMMENT = Regex("(?s)<!--.*?-->")
 
+    /** Elements dropped whole by [stripNoise], before anything else is rewritten. */
+    private val SCRIPT_ELEMENTS = setOf("script", "style", "noscript", "svg", "form", "nav", "aside")
+
     /**
-     * Containers whose text is never the article body.
+     * Elements dropped whole by [stripNoise], after hidden text has gone.
      *
      * A `<figcaption>` is a caption and a `<footer>` is page chrome, but both are
      * written with ordinary `<p>` elements, so the extractor kept them: the BBC's
      * footer paragraph arrived as a final "Copyright © 2026 BBC…" paragraph and its
      * image captions arrived as stray sentences in the middle of the prose.
      */
-    private val CHROME = Regex("(?is)<(figure|figcaption|footer|template)\\b$ATTRS>.*?</\\1\\s*>")
+    private val CHROME_ELEMENTS = setOf("figure", "figcaption", "footer", "template")
+
+    /** Any run of whitespace, for collapsing markup-produced gaps. */
+    private val WHITESPACE = Regex("\\s+")
 
     /**
      * An element whose class marks its text as visible only to a screen reader.
@@ -177,7 +182,7 @@ object Html {
         // after it stay together.
         val separated = BLOCK.replace(html, " ")
         val bare = TAGS.replace(separated, "")
-        val flat = decode(bare).replace(Regex("\\s+"), " ").trim()
+        val flat = decode(bare).replace(WHITESPACE, " ").trim()
         return SPACE_AFTER.replace(SPACE_BEFORE.replace(flat, "$1"), "$1")
     }
 
@@ -193,8 +198,45 @@ object Html {
     }
 
     fun stripNoise(html: String): String {
-        val noScripts = SCRIPT.replace(COMMENT.replace(html, " "), " ")
+        val noComments = COMMENT.replace(html, " ")
+        val noScripts = dropElements(noComments, SCRIPT_ELEMENTS)
         val noHidden = HIDDEN.replace(noScripts, " ")
-        return CHROME.replace(noHidden, " ")
+        return dropElements(noHidden, CHROME_ELEMENTS)
+    }
+
+    /**
+     * Removes each named element together with its content, one linear pass per name.
+     *
+     * The obvious regex, `<(a|b)\b[^>]*>.*?</\1>`, is quadratic when an element opens
+     * repeatedly without ever closing: every opening makes the engine scan to the end
+     * of the document before giving up. A page with a thousand stray `<script>` tags —
+     * a broken template, or one crafted to stall the extractor — would take minutes.
+     * Scanning with `indexOf`-backed regexes instead keeps each pass linear, and an
+     * element that never closes is given up on once rather than searched for per
+     * opening.
+     */
+    internal fun dropElements(html: String, names: Collection<String>): String {
+        var out = html
+        for (name in names) {
+            if (!out.contains("</$name", ignoreCase = true)) continue
+            out = dropElement(out, name)
+        }
+        return out
+    }
+
+    internal fun dropElement(html: String, name: String): String {
+        val open = Regex("(?is)<$name\\b$ATTRS>")
+        val close = Regex("(?is)</$name\\s*>")
+        val out = StringBuilder(html.length)
+        var at = 0
+        while (true) {
+            val start = open.find(html, at) ?: break
+            val end = close.find(html, start.range.last + 1) ?: break
+            out.append(html, at, start.range.first).append(' ')
+            // Past the closing tag, so the next search cannot re-find this element.
+            at = end.range.last + 1
+        }
+        out.append(html, at, html.length)
+        return out.toString()
     }
 }

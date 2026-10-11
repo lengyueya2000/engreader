@@ -50,7 +50,11 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
                 -- leaves both at zero, which is what keeps the two kinds apart in
                 -- every query that lists one or the other.
                 bookId       INTEGER NOT NULL DEFAULT 0,
-                chapterIndex INTEGER NOT NULL DEFAULT 0
+                chapterIndex INTEGER NOT NULL DEFAULT 0,
+                -- The paragraph the reader had scrolled to, so reopening a long piece
+                -- resumes where it was left instead of at the top. Zero means the top,
+                -- which is also what every article imported before this column has.
+                readParagraph INTEGER NOT NULL DEFAULT 0
             )
             """.trimIndent()
         )
@@ -193,6 +197,12 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
             db.execSQL("CREATE INDEX IF NOT EXISTS idx_session_article ON session(articleId)")
             db.execSQL("CREATE INDEX IF NOT EXISTS idx_quiz_article ON quiz(articleId)")
         }
+        if (oldVersion < 5) {
+            // Where the reader stopped, as a paragraph number. Nothing is backfilled:
+            // every existing row starts at 0, which is the top of the text, and that is
+            // the honest answer for an article whose position was never recorded.
+            addColumn(db, "article", "readParagraph", "INTEGER NOT NULL DEFAULT 0")
+        }
     }
 
     /**
@@ -233,6 +243,6 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
 
     companion object {
         const val NAME = "engreader.db"
-        const val VERSION = 4
+        const val VERSION = 5
     }
 }

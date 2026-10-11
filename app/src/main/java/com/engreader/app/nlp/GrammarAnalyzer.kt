@@ -67,7 +67,18 @@ data class SentenceAnalysis(
  */
 class GrammarAnalyzer(private val dictionary: Lexicon) {
 
-    private val posCache = HashMap<String, PartOfSpeech>(4096)
+    private val posCache = java.util.concurrent.ConcurrentHashMap<String, PartOfSpeech>()
+
+    /**
+     * How many part-of-speech answers are kept.
+     *
+     * [analyze] runs on `Dispatchers.Default`, so two sentences can be parsed at once
+     * and the cache must tolerate concurrent writes — an unsynchronised `HashMap` can
+     * lose entries or corrupt itself while resizing. It is bounded by hand rather than
+     * by a real LRU: once full it simply stops growing, which costs a recomputation
+     * instead of holding every word the process has ever seen.
+     */
+    private val POS_CACHE_LIMIT = 8192
 
     private val SUBORDINATORS = setOf(
         "because", "although", "though", "even", "if", "unless", "until", "till",
@@ -223,6 +234,10 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
         offsets: List<Int>,
     ): List<Marker> {
         val out = mutableListOf<Marker>()
+        // Lowercased once for the whole scan: rebuilding it inside the loop made this
+        // quadratic in the token count, which shows up on a sentence the splitter
+        // failed to break up and handed over as one long string.
+        val lower = tokens.map { it.lowercase() }
         for (tokenIndex in 1 until tokens.size) {
             val at = offsets[tokenIndex]
             var i = at - 1
@@ -231,7 +246,6 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
             // Only when the punctuation is immediately followed by a clause of its
             // own, i.e. a finite verb appears within the next few words.
             val window = tokenIndex..minOf(tokenIndex + 5, tokens.lastIndex)
-            val lower = tokens.map { it.lowercase() }
             if (window.any { isFiniteVerb(lower, it) }) {
                 out += Marker(at, at + tokens[tokenIndex].length, sentence[i].toString(), ClauseKind.Coordinated, true)
             }
@@ -898,7 +912,7 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
                 PartOfSpeechParser.guess(key)
             }
         }
-        posCache[key] = pos
+        if (posCache.size < POS_CACHE_LIMIT) posCache[key] = pos
         return pos
     }
 

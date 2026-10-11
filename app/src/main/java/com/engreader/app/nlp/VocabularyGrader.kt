@@ -20,9 +20,16 @@ class VocabularyGrader(private val dictionary: Lexicon) {
         var advanced = 0
         var graded = 0
         val seen = HashSet<String>(words.size)
+        val lemmas = HashSet<String>(words.size)
         for (word in words) {
             if (!seen.add(word)) continue
             val entry = dictionary.lookup(word) ?: continue
+            // Counted by lemma, not by surface form. `study`, `studies` and `studied`
+            // are one word to a learner, and counting them separately inflated the
+            // denominator and under-reported the difficulty. [VocabularyProfile]
+            // already counts lemmas, so this keeps the two readings of one text
+            // consistent.
+            if (!lemmas.add(entry.lemma.lowercase())) continue
             graded++
             // `Unknown` is the last enum constant, so a bare `>= B2` comparison would
             // count an ungraded word as the hardest kind. It means "no frequency data",

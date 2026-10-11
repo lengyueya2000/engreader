@@ -38,16 +38,22 @@ object RssParser {
 
     private class Result(val items: List<FeedItem>, val aborted: Boolean)
 
-    fun parse(stream: InputStream, sourceId: String, sourceName: String): List<FeedItem> {
+    fun parse(
+        stream: InputStream,
+        sourceId: String,
+        sourceName: String,
+        /** Address the feed was fetched from, for resolving relative links. */
+        baseUrl: String = "",
+    ): List<FeedItem> {
         val raw = readAll(stream)
-        val strict = attempt(raw, sourceId, sourceName, decodeText = false)
+        val strict = attempt(raw, sourceId, sourceName, decodeText = false, baseUrl = baseUrl)
         if (!strict.aborted) return strict.items
 
         // A bare `&` in a headline, or an HTML-only entity such as `&nbsp;`, is not
         // well-formed XML and stops the parser where it stands, losing every item
         // after it. Re-reading the same bytes with those references escaped recovers
         // them; whichever pass read more items is the one returned.
-        val lenient = attempt(raw, sourceId, sourceName, decodeText = true)
+        val lenient = attempt(raw, sourceId, sourceName, decodeText = true, baseUrl = baseUrl)
         return if (lenient.items.size > strict.items.size) lenient.items else strict.items
     }
 
@@ -56,6 +62,7 @@ object RssParser {
         sourceId: String,
         sourceName: String,
         decodeText: Boolean,
+        baseUrl: String,
     ): Result {
         val parser = Xml.newPullParser()
         parser.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, false)
@@ -65,10 +72,15 @@ object RssParser {
             // A null encoding lets the parser honour the XML declaration or the BOM.
             parser.setInput(ByteArrayInputStream(raw), null)
         }
-        return collect(parser, sourceId, sourceName)
+        return collect(parser, sourceId, sourceName, baseUrl)
     }
 
-    private fun collect(parser: XmlPullParser, sourceId: String, sourceName: String): Result {
+    private fun collect(
+        parser: XmlPullParser,
+        sourceId: String,
+        sourceName: String,
+        baseUrl: String,
+    ): Result {
         val items = mutableListOf<FeedItem>()
         var inItem = false
         var title = ""
@@ -110,7 +122,7 @@ object RssParser {
                     XmlPullParser.END_TAG -> {
                         if (localName(parser) in setOf("item", "entry") && inItem) {
                             inItem = false
-                            val cleanLink = link.trim()
+                            val cleanLink = resolveLink(link.trim(), baseUrl)
                             val cleanTitle = Html.text(title)
                             if (cleanTitle.isNotEmpty() && cleanLink.isNotEmpty()) {
                                 items += FeedItem(
@@ -123,7 +135,7 @@ object RssParser {
                                     summary = Html.summary(description),
                                     url = cleanLink,
                                     publishedAt = parseDate(pubDate),
-                                    imageUrl = image,
+                                    imageUrl = resolveLink(image.trim(), baseUrl),
                                 )
                             }
                         }
@@ -153,6 +165,22 @@ object RssParser {
     /** The prefix-stripping half of [localName], split out so it can be tested. */
     internal fun localNameOf(qname: String): String =
         qname.substringAfterLast(':').lowercase()
+
+    /**
+     * Makes a feed link absolute against the address the feed came from.
+     *
+     * Plenty of feeds write `<link>/news/story</link>` or `<link href="story.html"/>`,
+     * which only means anything relative to the feed's own address. Left as written,
+     * the URL failed to open and every article in that feed quietly fell back to its
+     * summary. A protocol-relative `//host/path` resolves the same way.
+     */
+    internal fun resolveLink(link: String, baseUrl: String): String {
+        if (link.isEmpty() || baseUrl.isEmpty()) return link
+        if (link.startsWith("http://") || link.startsWith("https://")) return link
+        return runCatching {
+            java.net.URL(java.net.URL(baseUrl), link).toString()
+        }.getOrDefault(link)
+    }
 
     /**
      * Text content of the current element, or "" when it has none.

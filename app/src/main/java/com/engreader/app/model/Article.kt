@@ -39,12 +39,28 @@ data class Article(
     val bookId: Long = 0,
     /** Position of this chapter inside its book, from 0. Meaningless when [bookId] is 0. */
     val chapterIndex: Int = 0,
+    /**
+     * Words in [body], as stored in the `wordCount` column.
+     *
+     * Schema v4 added the column and backfilled it, so reading it back is free.
+     * Anything built in memory without the column falls back to counting once.
+     */
+    private val storedWordCount: Int = 0,
+    /**
+     * Paragraph the reader had scrolled to, from the `readParagraph` column.
+     *
+     * Zero for a piece that has never been scrolled, and for everything stored before
+     * schema v5 added the column, which is the same thing: the top of the text.
+     */
+    val readParagraph: Int = 0,
 ) {
     /** Cached content lemmas, or an empty list when the profile has not been built yet. */
     val contentLemmas: List<String>
         get() = com.engreader.app.nlp.VocabularyProfile.decode(vocabProfile)
 
-    val wordCount: Int by lazy { com.engreader.app.nlp.Tokenizer.countWords(body) }
+    val wordCount: Int get() = if (storedWordCount > 0) storedWordCount else countedWords
+    private val countedWords: Int by lazy { com.engreader.app.nlp.Tokenizer.countWords(body) }
+
     val estimatedMinutes: Int get() = (wordCount / 180).coerceAtLeast(1)
 
     /**

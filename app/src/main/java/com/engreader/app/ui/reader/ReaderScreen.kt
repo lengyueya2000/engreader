@@ -1,5 +1,11 @@
 package com.engreader.app.ui.reader
 
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.animateScrollBy
@@ -32,6 +38,7 @@ import androidx.compose.material.icons.filled.Headphones
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.outlined.BookmarkBorder
 import androidx.compose.material.icons.outlined.Checklist
+import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.TextFields
 import androidx.compose.material.icons.outlined.Translate
 import androidx.compose.material3.CircularProgressIndicator
@@ -42,6 +49,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -50,6 +58,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -62,6 +71,7 @@ import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInWindow
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLayoutResult
@@ -72,6 +82,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -157,6 +168,23 @@ private fun unclippedBounds(coordinates: LayoutCoordinates): Rect {
 }
 
 /**
+ * Asks for the notification permission the playback notification needs, once.
+ *
+ * Only from Android 13, and only when it has not already been granted: below that the
+ * permission does not exist, and a granted one would prompt for nothing. A refusal is
+ * not an error — the voice is unaffected, the reader just cannot stop it from the
+ * notification shade.
+ */
+private fun askForNotificationPermission(context: Context, launch: (String) -> Unit) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+    val granted = ContextCompat.checkSelfPermission(
+        context,
+        Manifest.permission.POST_NOTIFICATIONS,
+    ) == PackageManager.PERMISSION_GRANTED
+    if (!granted) launch(Manifest.permission.POST_NOTIFICATIONS)
+}
+
+/**
  * The reading surface.
  *
  * Each paragraph is a single `Text` whose annotated string carries the styling for
@@ -169,13 +197,25 @@ fun ReaderScreen(
     onBack: () -> Unit,
     onSavedChanged: () -> Unit,
     /**
-     * Opens another chapter in place of this one.
+     * Opens another chapter in place of this one, optionally at a paragraph.
      *
      * Replacing rather than stacking is deliberate: walking from chapter one to
      * chapter twelve should still leave the reader one back-press from the shelf, not
      * twelve. The caller owns the navigation, so this screen stays unaware of it.
+     *
+     * A paragraph of zero means the chapter's own stored position, which is what a
+     * chapter opened from the table of contents wants; a search hit names the paragraph
+     * it found.
      */
-    onOpenChapter: (Long) -> Unit = {},
+    onOpenChapter: (Long, Int) -> Unit = { _, _ -> },
+    /**
+     * A paragraph to land on in the piece being opened, or zero for its stored position.
+     *
+     * This is the second half of [onOpenChapter]: when a search hit lives in the chapter
+     * already on screen the ViewModel is reused rather than rebuilt, so the jump has to
+     * arrive as a parameter change rather than as a new destination.
+     */
+    initialParagraph: Int = 0,
 ) {
     // Scoped to this article rather than to the activity: the reader is opened once
     // per article, and an activity-scoped ViewModel would keep serving the first one.
@@ -186,6 +226,15 @@ fun ReaderScreen(
     val state = viewModel.state
     val listState = rememberLazyListState()
     /**
+     * How many list items come before the first paragraph.
+     *
+     * The header, plus the translation-failure notice when there is one. Every jump to a
+     * paragraph — the listening auto-scroll, the search results, restoring the reading
+     * position — has to add it, and having one number for it is what keeps them from
+     * disagreeing.
+     */
+    val leadingItems = 1 + if (state.showTranslation && state.translationStatus == TranslationStatus.Failed) 1 else 0
+    /**
      * Where each sentence currently is on screen, for the listening auto-scroll.
      *
      * Held here rather than in a paragraph so it survives paragraphs scrolling out of
@@ -195,11 +244,29 @@ fun ReaderScreen(
     val spokenBounds = remember { SpokenBounds() }
     var showTypography by remember { mutableStateOf(false) }
     var showQuiz by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    /**
+     * Asked for the first time the reader presses play, not at launch.
+     *
+     * The permission is only about the playback notification — the voice works without
+     * it — so it is asked for at the moment the notification would appear, which is the
+     * only point where the reason for it is on screen.
+     */
+    val notifications = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { }
     val liveSpeechState by viewModel.speechState.collectAsStateWithLifecycle()
     val liveVoice by viewModel.activeVoice.collectAsStateWithLifecycle()
     val liveBackend by viewModel.speechBackend.collectAsStateWithLifecycle()
 
     LaunchedEffect(articleId) { viewModel.load() }
+
+    // A jump requested from outside — a search hit in the chapter already open. Runs
+    // before load has finished when the chapter is new, in which case the ViewModel
+    // holds the request until there are paragraphs to scroll to.
+    LaunchedEffect(initialParagraph) {
+        if (initialParagraph > 0) viewModel.jumpToParagraph(initialParagraph)
+    }
 
     DisposableEffect(articleId) {
         onDispose {
@@ -246,6 +313,9 @@ fun ReaderScreen(
             CONTENT_BOTTOM_INSET.toPx()
     }
     val margin = with(density) { SCROLL_MARGIN.toPx() }
+    // One instance for the whole list, so an unchanged wordbook lets every paragraph
+    // skip recomposition instead of being redrawn on each state change.
+    val savedLemmas = remember(state.savedLemmas) { SavedLemmaSet(state.savedLemmas) }
     // The flat index of each paragraph's first sentence. The flat list is built
     // paragraph by paragraph, so this is normally just a running sum; it is computed
     // rather than assumed because a paragraph whose text holds no sentences at all
@@ -269,8 +339,7 @@ fun ReaderScreen(
         var known = spokenBounds.of(flat)
         if (known == null) {
             val paragraphIndex = state.flatSentences.getOrNull(flat)?.paragraphIndex ?: return@LaunchedEffect
-            val leading = 1 + if (state.showTranslation && state.translationStatus == TranslationStatus.Failed) 1 else 0
-            runCatching { listState.scrollToItem(leading + paragraphIndex) }
+            runCatching { listState.scrollToItem(leadingItems + paragraphIndex) }
             repeat(COMPOSE_FRAMES) {
                 if (known == null) {
                     withFrameNanos { }
@@ -291,6 +360,29 @@ fun ReaderScreen(
             else -> 0f
         }
         if (delta != 0f) runCatching { listState.animateScrollBy(delta) }
+    }
+
+    /**
+     * Puts the list back where the reader left it.
+     *
+     * Once per article, when the text has been laid out. A position of zero is the top
+     * of the text and is not restored: that is what everything stored before the
+     * position was recorded has, and scrolling to the top is what the list does anyway.
+     */
+    var restored by remember(articleId) { mutableStateOf(false) }
+    LaunchedEffect(articleId, state.loading, state.resumeParagraph) {
+        if (state.loading) return@LaunchedEffect
+        val target = state.resumeParagraph
+        if (target > 0) runCatching { listState.scrollToItem(leadingItems + target) }
+        restored = true
+    }
+
+    // Reports the top paragraph as the reader scrolls, so leaving the piece records
+    // where they were. Gated on [restored]: the first frame of a reopened article is at
+    // the top, and recording that would erase the position just restored.
+    LaunchedEffect(listState, leadingItems) {
+        snapshotFlow { listState.firstVisibleItemIndex }
+            .collect { index -> if (restored) viewModel.recordPosition(index - leadingItems) }
     }
 
     val theme = state.theme
@@ -438,7 +530,7 @@ fun ReaderScreen(
                         ParagraphBlock(
                             paragraph = rp.paragraph,
                             sentences = rp.sentences,
-                            savedLemmas = state.savedLemmas,
+                            savedLemmas = savedLemmas,
                             highlightSaved = state.highlightSaved,
                             listening = state.listening,
                             speakingSentenceIndex = state.flatSentences
@@ -468,10 +560,13 @@ fun ReaderScreen(
                                 scope.launch { viewModel.analyze(sentence) }
                             },
                             onSentenceTapWhileListening = { indexInParagraph ->
-                                val flat = state.flatSentences.indexOfFirst {
-                                    it.paragraphIndex == index && it.sentenceIndex == indexInParagraph
-                                }
-                                if (flat >= 0) viewModel.speakSentence(flat)
+                                // The flat list is built paragraph by paragraph, so a
+                                // sentence's flat index is its paragraph's first plus
+                                // its offset. Scanning the whole list per tap was
+                                // linear in the length of the article.
+                                val first = flatStart[index] ?: -1
+                                val flat = if (first < 0) -1 else first + indexInParagraph
+                                if (flat in state.flatSentences.indices) viewModel.speakSentence(flat)
                             },
                         )
                     }
@@ -530,7 +625,7 @@ fun ReaderScreen(
                                     val bookId = state.book?.id ?: return@ChapterNav
                                     scope.launch {
                                         viewModel.articleIdOfChapter(bookId, chapter.index)
-                                            ?.let { onOpenChapter(it) }
+                                            ?.let { onOpenChapter(it, 0) }
                                     }
                                 },
                             )
@@ -555,12 +650,18 @@ fun ReaderScreen(
                         onBack()
                     },
                     onOpenContents = { viewModel.setContentsVisible(true) },
+                    onOpenSearch = { viewModel.setSearchVisible(true) },
                     onToggleSave = {
                         val article = state.article ?: return@ReaderTopBar
                         viewModel.setSaved(!article.saved)
                         onSavedChanged()
                     },
-                    onToggleListen = { viewModel.toggleListening(scope) },
+                    onToggleListen = {
+                        if (!state.listening) {
+                            askForNotificationPermission(context) { notifications.launch(it) }
+                        }
+                        viewModel.toggleListening(scope)
+                    },
                 )
 
                 if (state.listening) {
@@ -569,7 +670,7 @@ fun ReaderScreen(
                         current = state.speakingSentence + 1,
                         total = state.flatSentences.size,
                         onPrevious = viewModel::previousSentence,
-                        onToggle = { viewModel.stopListening() },
+                        onToggle = viewModel::pauseListening,
                         onNext = viewModel::nextSentence,
                     )
                 }
@@ -623,13 +724,30 @@ fun ReaderScreen(
                     if (chapter.articleId != articleId) {
                         scope.launch {
                             viewModel.articleIdOfChapter(book.id, chapter.index)
-                                ?.let { onOpenChapter(it) }
+                                ?.let { onOpenChapter(it, 0) }
                         }
                     }
                 },
                 onDismiss = { viewModel.setContentsVisible(false) },
             )
         }
+    }
+
+    if (state.searchVisible) {
+        SearchSheet(
+            query = state.searchQuery,
+            results = state.searchResults,
+            running = state.searchRunning,
+            bookTitle = state.book?.title,
+            onQuery = viewModel::setSearchQuery,
+            onOpen = { hit ->
+                viewModel.jumpToHit(hit)
+                // A hit in another chapter is a navigation: the screen owns where the
+                // reader is, so the ViewModel only reports what was found.
+                if (hit.articleId != articleId) onOpenChapter(hit.articleId, hit.paragraphIndex)
+            },
+            onDismiss = { viewModel.setSearchVisible(false) },
+        )
     }
 
     if (showTypography) {
@@ -717,7 +835,7 @@ private fun TranslationNotice(
 private fun ParagraphBlock(
     paragraph: Paragraph,
     sentences: List<Sentence>,
-    savedLemmas: Set<String>,
+    savedLemmas: SavedLemmaSet,
     highlightSaved: Boolean,
     /** True while the article is being read aloud, so a tap jumps playback. */
     listening: Boolean,
@@ -795,16 +913,20 @@ private fun ParagraphBlock(
         }
 
         var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
-        val spoken = sentences.getOrNull(speakingSentenceIndex)?.text
-        val annotated = remember(paragraph, savedLemmas, spoken, highlightSaved, highlightColor, savedColor) {
+        // The spoken sentence's own offsets rather than `indexOf` of its text: a
+        // paragraph of dialogue can hold the same sentence twice, and the first
+        // occurrence is then the wrong one to underline. Keyed on the index, not on
+        // the text, so two consecutive sentences that read alike still move the range.
+        val spokenSentence = sentences.getOrNull(speakingSentenceIndex)
+        val spokenRange = remember(paragraph, speakingSentenceIndex) {
+            spokenSentence?.let { it.start until it.end }
+        }
+        val annotated = remember(paragraph, savedLemmas, spokenSentence, highlightSaved, highlightColor, savedColor) {
             buildEnglish(
                 text = paragraph.text,
                 tokens = paragraph.tokens,
-                highlight = spoken
-                    ?.let { paragraph.text.indexOf(it) }
-                    ?.takeIf { it >= 0 }
-                    ?.let { it until it + spoken.length },
-                savedLemmas = savedLemmas,
+                highlight = spokenRange,
+                savedLemmas = savedLemmas.values,
                 highlightSaved = highlightSaved,
                 highlightColor = highlightColor,
                 savedColor = savedColor,
@@ -815,10 +937,6 @@ private fun ParagraphBlock(
         // is told where the spoken sentence's own lines sit inside it. The rectangle is
         // rebuilt whenever the layout or the text's position changes, which is what
         // keeps it correct as the list scrolls under it.
-        val spokenRange = remember(paragraph, spoken) {
-            val sentence = sentences.getOrNull(speakingSentenceIndex)
-            if (sentence == null) null else sentence.start until sentence.end
-        }
         var origin by remember { mutableStateOf<Offset?>(null) }
         val flatIndex = if (firstFlatIndex >= 0 && speakingSentenceIndex >= 0) {
             firstFlatIndex + speakingSentenceIndex
@@ -929,7 +1047,7 @@ private fun SentenceBlock(
     /** Index of this sentence inside its paragraph, which is what playback jumps to. */
     indexInParagraph: Int,
     paragraph: Paragraph,
-    savedLemmas: Set<String>,
+    savedLemmas: SavedLemmaSet,
     highlightSaved: Boolean,
     listening: Boolean,
     highlighted: Boolean,
@@ -958,7 +1076,7 @@ private fun SentenceBlock(
             text = sentence.text,
             tokens = tokens,
             highlight = if (highlighted) sentence.text.indices else null,
-            savedLemmas = savedLemmas,
+            savedLemmas = savedLemmas.values,
             highlightSaved = highlightSaved,
             highlightColor = highlightColor,
             savedColor = savedColor,
@@ -999,6 +1117,22 @@ private fun SentenceBlock(
             },
         onTextLayout = { layout = it },
     )
+}
+
+/**
+ * The wordbook's lemmas in a form Compose can skip on.
+ *
+ * A `Set<String>` is an interface, so the compiler cannot prove it immutable and
+ * treats every paragraph as changed on each recomposition of the reader — which,
+ * while an article is being read aloud, happens every few seconds. This wrapper is
+ * declared immutable and compares by content, so an equal set skips. The backing set
+ * is replaced rather than mutated.
+ */
+@Immutable
+private class SavedLemmaSet(val values: Set<String>) {
+    operator fun contains(lemma: String): Boolean = lemma in values
+    override fun equals(other: Any?): Boolean = other is SavedLemmaSet && values == other.values
+    override fun hashCode(): Int = values.hashCode()
 }
 
 /**
@@ -1046,6 +1180,7 @@ private fun ReaderTopBar(
     theme: com.engreader.app.ui.theme.ReadingTheme,
     onBack: () -> Unit,
     onOpenContents: () -> Unit,
+    onOpenSearch: () -> Unit,
     onToggleSave: () -> Unit,
     onToggleListen: () -> Unit,
 ) {
@@ -1084,6 +1219,13 @@ private fun ReaderTopBar(
                     tint = onSurface,
                 )
             }
+        }
+        IconButton(onClick = onOpenSearch) {
+            Icon(
+                Icons.Outlined.Search,
+                contentDescription = "查找",
+                tint = onSurface,
+            )
         }
         if (speechAvailable) {
             IconButton(onClick = onToggleListen) {

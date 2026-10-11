@@ -254,4 +254,75 @@ class SourceRegressionTest {
         // Three copies of the sentence, not one.
         assertEquals(3, Regex("unprecedented").findAll(body).count())
     }
+
+    @Test
+    fun `a relative feed link is resolved against the feed address`() {
+        // Left as written, `/news/story` could not be opened at all, so every article
+        // in such a feed quietly fell back to its summary.
+        val base = "https://example.com/world/rss"
+        assertEquals("https://example.com/news/story", RssParser.resolveLink("/news/story", base))
+        assertEquals("https://example.com/world/story.html", RssParser.resolveLink("story.html", base))
+        assertEquals("https://cdn.example.org/a.jpg", RssParser.resolveLink("//cdn.example.org/a.jpg", base))
+    }
+
+    @Test
+    fun `an absolute feed link is left alone`() {
+        val base = "https://example.com/world/rss"
+        assertEquals("https://other.example/x", RssParser.resolveLink("https://other.example/x", base))
+        // Without a base there is nothing to resolve against, so the link survives.
+        assertEquals("/news/story", RssParser.resolveLink("/news/story", ""))
+        assertEquals("", RssParser.resolveLink("", base))
+    }
+
+    @Test
+    fun `script and chrome elements are removed even when never closed`() {
+        // The lazy `<(script|nav|…)>.*?</\1>` regex searched to the end of the document
+        // from every opening tag when the element was never closed, which is quadratic
+        // on a page full of stray openings. The scan-based replacement must still drop
+        // the closed ones.
+        val html = "<nav>menu</nav><p>Real prose here.</p><script>var x = 1;</script>" +
+            "<footer>Copyright 2026</footer>"
+        val text = Html.text(Html.stripNoise(html))
+        assertTrue(text.contains("Real prose here."))
+        assertFalse(text.contains("menu"))
+        assertFalse(text.contains("var x"))
+        assertFalse(text.contains("Copyright"))
+    }
+
+    @Test
+    fun `a page declaring its charset in a meta tag is decoded with it`() {
+        // The header is the only place the old code looked, so a page that declared
+        // ISO-8859-1 in its markup was decoded as UTF-8 and arrived as mojibake.
+        val html = "<html><head><meta charset=\"iso-8859-1\"></head><body>caf\u00e9</body></html>"
+        assertEquals(
+            "<html><head><meta charset=\"iso-8859-1\"></head><body>café</body></html>",
+            PageCharset.decode(html.toByteArray(Charsets.ISO_8859_1), null),
+        )
+    }
+
+    @Test
+    fun `a meta http-equiv declaration is honoured too`() {
+        val html = "<html><head>" +
+            "<meta http-equiv=\"Content-Type\" content=\"text/html; charset=iso-8859-1\">" +
+            "</head><body>caf\u00e9</body></html>"
+        val decoded = PageCharset.decode(html.toByteArray(Charsets.ISO_8859_1), null)
+        assertTrue(decoded, decoded.contains("café"))
+    }
+
+    @Test
+    fun `a byte-order mark wins and is not left in the text`() {
+        val bytes = byteArrayOf(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte()) +
+            "<p>café</p>".toByteArray(Charsets.UTF_8)
+        // A header naming something else must not override the mark.
+        val decoded = PageCharset.decode(bytes, Charsets.ISO_8859_1)
+        assertEquals("<p>café</p>", decoded)
+    }
+
+    @Test
+    fun `the header wins when the document declares nothing`() {
+        val bytes = "caf\u00e9".toByteArray(Charsets.ISO_8859_1)
+        assertEquals("café", PageCharset.decode(bytes, Charsets.ISO_8859_1))
+        // Nothing declared anywhere: UTF-8 is the assumption.
+        assertEquals("café", PageCharset.decode("café".toByteArray(Charsets.UTF_8), null))
+    }
 }

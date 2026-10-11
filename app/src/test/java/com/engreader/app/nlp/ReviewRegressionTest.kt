@@ -119,6 +119,41 @@ class VocabularyGraderRegressionTest {
         override fun definitions(headword: String) = emptyList<Pair<PartOfSpeech, String>>()
     }
 
+    /** Resolves a handful of forms to their lemma, the way the real dictionary does. */
+    private val lemmatising = object : Lexicon {
+        private val lemmas = mapOf(
+            "study" to "study", "studies" to "study", "studied" to "study",
+            "reform" to "reform", "reforms" to "reform",
+            "quixotic" to "quixotic",
+        )
+
+        override fun lookup(raw: String): WordEntry? {
+            val key = raw.lowercase()
+            val lemma = lemmas[key] ?: return null
+            return WordEntry(
+                lemma = lemma, queried = raw, translation = "n x", phonetic = "",
+                definition = "", collins = 0, oxford = false,
+                frq = if (lemma == "quixotic") 0 else 9000, bnc = 0, tag = "",
+            )
+        }
+
+        override fun suggest(prefix: String, limit: Int) = emptyList<Pair<String, String>>()
+        override fun glosses(translation: String) = emptyList<Pair<PartOfSpeech, String>>()
+        override fun distractors(entry: WordEntry, pos: PartOfSpeech, count: Int) = emptyList<String>()
+        override fun englishDistractors(entry: WordEntry, pos: PartOfSpeech, count: Int) = emptyList<String>()
+        override fun firstGloss(translation: String) = "x"
+        override fun definitions(headword: String) = emptyList<Pair<PartOfSpeech, String>>()
+    }
+
+    @Test
+    fun `inflected forms of one word are counted once`() {
+        // Counted by surface form, `study`, `studies` and `studied` were three words,
+        // which inflated the denominator and under-reported the difficulty.
+        val one = VocabularyGrader(lemmatising).grade("study")
+        val three = VocabularyGrader(lemmatising).grade("study studies studied")
+        assertEquals(one.gradedWords, three.gradedWords)
+    }
+
     @Test
     fun `words with no frequency data are not counted as advanced`() {
         // Unknown is the last enum constant, so `band >= B2` was true for it and a
@@ -138,5 +173,24 @@ class VocabularyGraderRegressionTest {
         // The guard is needed because of this ordering, not in spite of it.
         assertTrue(DifficultyBand.Unknown > DifficultyBand.B2)
         assertTrue(DifficultyBand.C2 > DifficultyBand.B1)
+    }
+}
+
+class ReviewScheduleRegressionTest {
+
+    @Test
+    fun `every box has its own, strictly longer interval`() {
+        // The table held a duplicated leading 10-minute entry for five boxes, and the
+        // generated CASE branches on `WHEN box`, so every interval was shifted one box
+        // down: box 2 waited 10 minutes instead of a day, and a word graduated to
+        // "mastered" after 7 days instead of 21.
+        val intervals = com.engreader.app.data.WordbookRepository.INTERVALS_MS
+        assertEquals(com.engreader.app.data.WordbookRepository.MAX_BOX, intervals.size)
+        for (i in 1 until intervals.size) {
+            assertTrue(
+                "interval ${i + 1} (${intervals[i]}) must be longer than ${intervals[i - 1]}",
+                intervals[i] > intervals[i - 1],
+            )
+        }
     }
 }

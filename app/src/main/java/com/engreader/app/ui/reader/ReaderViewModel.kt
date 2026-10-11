@@ -10,6 +10,7 @@ import com.engreader.app.model.Article
 import com.engreader.app.model.Book
 import com.engreader.app.model.ChapterRef
 import com.engreader.app.model.QuizQuestion
+import com.engreader.app.model.SearchHit
 import com.engreader.app.nlp.NewWord
 import com.engreader.app.nlp.Paragraph
 import com.engreader.app.nlp.Paragraphs
@@ -17,6 +18,7 @@ import com.engreader.app.nlp.Sentence
 import com.engreader.app.nlp.SentenceAnalysis
 import com.engreader.app.nlp.Sentences
 import com.engreader.app.nlp.VocabularyProfile
+import com.engreader.app.tts.PlaybackService
 import com.engreader.app.tts.SpeechBackend
 import com.engreader.app.tts.SpeechEvent
 import com.engreader.app.tts.SpeechState
@@ -26,6 +28,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -91,6 +94,19 @@ data class ReaderState(
     val book: Book? = null,
     val chapters: List<ChapterRef> = emptyList(),
     val contentsVisible: Boolean = false,
+    /**
+     * Paragraph to scroll to when the text first appears.
+     *
+     * Read once from the stored position and then left alone: the screen consumes it to
+     * place the list, and moving it as the reader scrolls would make the scroll effect
+     * that watches it fire again on every scroll.
+     */
+    val resumeParagraph: Int = 0,
+    val searchVisible: Boolean = false,
+    val searchQuery: String = "",
+    val searchResults: List<SearchHit> = emptyList(),
+    /** True while a query is being looked up, so the sheet can say it is working. */
+    val searchRunning: Boolean = false,
 )
 
 /** A sentence with its position in the flattened article, for TTS queueing. */
@@ -171,6 +187,42 @@ class ReaderViewModel(
     private var translationJob: Job? = null
     private var lastSpokenIndex = -1
 
+    /**
+     * Where playback stopped when it was paused rather than ended.
+     *
+     * Kept so the lock-screen play button and the reader's own listen toggle both pick
+     * the sentence back up instead of starting the article again. Reset by every path
+     * that ends the session outright.
+     */
+    private var pausedIndex = -1
+
+    /**
+     * Paragraph the list is scrolled to, as reported by the screen.
+     *
+     * Held here rather than read back from the list state at flush time: the flush runs
+     * from `onCleared` and from the app going to the background, both of which are after
+     * the composition that owns the list state has already gone.
+     */
+    private var readParagraph = 0
+
+    /** The position as last written, so a flush that changes nothing writes nothing. */
+    private var savedParagraph = 0
+
+    /** A paragraph to scroll to, asked for before the text was ready. */
+    private var pendingJump = -1
+
+    private var searchJob: Job? = null
+
+    /**
+     * Bumped by every look-up and every grammar analysis.
+     *
+     * Both await a dictionary or parse result and then write the card they belong to.
+     * A second tap while the first is still reading starts a second call, and without
+     * a generation the slower one lands last and shows the word the reader has already
+     * moved past.
+     */
+    private var cardGeneration = 0
+
     suspend fun load() {
         state = state.copy(loading = true)
         val article = container.articles.get(articleId)
@@ -216,7 +268,10 @@ class ReaderViewModel(
             speechRate = settings.speechRate,
             speechLocale = settings.speechLocale,
             speechVoice = settings.speechVoice,
+            resumeParagraph = article.readParagraph.coerceIn(0, (paragraphs.size - 1).coerceAtLeast(0)),
         )
+        readParagraph = state.resumeParagraph
+        savedParagraph = readParagraph
         container.articles.markOpened(articleId)
         sessionStart = System.currentTimeMillis()
         // A chapter of a book also advances the book: this is what makes "continue
@@ -237,6 +292,9 @@ class ReaderViewModel(
         // article read before translations existed, or one whose run failed).
         if (settings.showTranslation && article.translation.isEmpty()) requestTranslation()
         assessVocabulary(article)
+        // A jump asked for while the body was being split — a search hit in another
+        // chapter — lands now that there are paragraphs to scroll to.
+        applyPendingJump()
     }
 
     /**
@@ -288,6 +346,7 @@ class ReaderViewModel(
      * cancelled and a write launched there would never reach the database.
      */
     fun flushProgress() {
+        savePosition()
         if (sessionStart == 0L) return
         val now = System.currentTimeMillis()
         val seconds = ((now - sessionStart) / 1000).toInt()
@@ -306,6 +365,98 @@ class ReaderViewModel(
         }
     }
 
+    /**
+     * Records where the list is, for the next time the piece is opened.
+     *
+     * Called from a snapshot flow on every scroll position change, so it only assigns:
+     * the write happens in [savePosition] when the reader leaves or the app goes to the
+     * background. Writing on every scroll would put a database statement behind every
+     * fling.
+     */
+    fun recordPosition(paragraph: Int) {
+        if (paragraph < 0) return
+        readParagraph = paragraph
+    }
+
+    /** Writes the position, if it has moved since the last write. */
+    private fun savePosition() {
+        if (state.article == null) return
+        if (readParagraph == savedParagraph) return
+        val at = readParagraph
+        savedParagraph = at
+        container.appScope.launch { container.articles.setReadParagraph(articleId, at) }
+    }
+
+    // --------------------------------------------------------------- searching
+
+    fun setSearchVisible(visible: Boolean) {
+        state = state.copy(searchVisible = visible)
+        if (!visible) {
+            searchJob?.cancel()
+            searchJob = null
+            state = state.copy(searchRunning = false)
+        }
+    }
+
+    /**
+     * Searches the open piece, or the whole book when the open piece is a chapter.
+     *
+     * Debounced, and each new query cancels the one before it: a search reads the whole
+     * book off disk, and running one per keystroke would queue a scan per letter while
+     * the reader is still typing.
+     */
+    fun setSearchQuery(query: String) {
+        searchJob?.cancel()
+        val needle = query.trim()
+        state = state.copy(
+            searchQuery = query,
+            searchRunning = needle.length >= MIN_SEARCH_CHARS,
+            searchResults = if (needle.length < MIN_SEARCH_CHARS) emptyList() else state.searchResults,
+        )
+        if (needle.length < MIN_SEARCH_CHARS) return
+        val article = state.article ?: return
+        searchJob = container.appScope.launch {
+            delay(SEARCH_DEBOUNCE_MS)
+            val hits = container.articles.search(article.bookId, articleId, needle)
+            // Results for a query the reader has already typed past are dropped rather
+            // than shown: the debounce makes that unlikely, not impossible.
+            if (state.searchQuery.trim() == needle) {
+                state = state.copy(searchResults = hits, searchRunning = false)
+            }
+        }
+    }
+
+    /**
+     * Scrolls to a paragraph, or asks for the chapter holding it to be opened.
+     *
+     * Returns the id of the article the hit lives in, so the screen can tell whether it
+     * is a jump within the open piece or a chapter change.
+     */
+    fun jumpToHit(hit: SearchHit) {
+        state = state.copy(searchVisible = false)
+        if (hit.articleId == articleId) jumpToParagraph(hit.paragraphIndex)
+    }
+
+    /**
+     * Brings a paragraph into view, whether or not the text has loaded yet.
+     *
+     * A jump asked for before the body is split is remembered and applied at the end of
+     * [load]; one asked for afterwards takes effect immediately.
+     */
+    fun jumpToParagraph(index: Int) {
+        if (index < 0) return
+        pendingJump = index
+        applyPendingJump()
+    }
+
+    private fun applyPendingJump() {
+        if (pendingJump < 0 || state.loading || state.paragraphs.isEmpty()) return
+        val target = pendingJump.coerceIn(0, state.paragraphs.lastIndex)
+        pendingJump = -1
+        readParagraph = target
+        state = state.copy(resumeParagraph = target)
+    }
+
     // ------------------------------------------------------------ lifecycle
 
     /**
@@ -313,12 +464,15 @@ class ReaderViewModel(
      *
      * Reading time used to be the wall-clock gap between opening the article and
      * leaving it, so pocketing the phone for an hour added an hour of "reading". The
-     * clock is stopped here and restarted in [onEnterForeground]; playback is stopped
-     * too, because the neural engine keeps talking from the background.
+     * clock is stopped here and restarted in [onEnterForeground].
+     *
+     * Read-aloud is deliberately left running: it is the one thing meant to continue
+     * with the screen off, and [PlaybackService] is what keeps the process alive so it
+     * can. Anything else stops the voice, which is the reader pressing pause or the
+     * notification's stop button.
      */
     fun onEnterBackground() {
         flushProgress()
-        if (state.listening) stopListening()
     }
 
     /** Restarts the reading clock after [onEnterBackground] stopped it. */
@@ -358,6 +512,7 @@ class ReaderViewModel(
     suspend fun lookup(rawWord: String, sentence: String) {
         val query = rawWord.trim()
         if (query.isEmpty()) return
+        val generation = ++cardGeneration
         state = state.copy(
             lookup = LookupState(query = query, entry = null, saved = false, loading = true, inSentence = sentence),
         )
@@ -371,6 +526,9 @@ class ReaderViewModel(
                 found?.let { container.dictionary.family(it) } ?: emptyList(),
             )
         }
+        // A tap that arrived while this was reading has already shown its own card, and
+        // its answer is the one the reader is waiting for.
+        if (generation != cardGeneration) return
         val saved = entry?.let { container.wordbook.contains(it.lemma) } ?: false
         // Once a word has been answered correctly the Chinese gloss steps back and
         // the English definition leads, with the gloss still one tap away. Only when
@@ -462,7 +620,11 @@ class ReaderViewModel(
     suspend fun analyze(sentence: String) {
         // Parsing a sentence runs the tokeniser, the POS guesser and a dictionary
         // lookup per word — tens of milliseconds of work that used to block the tap.
+        val generation = ++cardGeneration
         val analysis = withContext(Dispatchers.Default) { container.grammar.analyze(sentence) }
+        // Tapping a second sentence before the first finished parsing must show the
+        // second one, whichever parse happens to return first.
+        if (generation != cardGeneration) return
         state = state.copy(analysis = analysis, analysisSentence = sentence)
     }
 
@@ -576,6 +738,60 @@ class ReaderViewModel(
         state = state.copy(listening = true, speakingSentence = lastSpokenIndex)
         speakAt(lastSpokenIndex)
         observeSpeech(scope)
+        openPlaybackService()
+    }
+
+    /**
+     * Brings up the foreground service that keeps the voice alive off-screen.
+     *
+     * The callbacks are the service's only way back in — it holds no reference to this
+     * ViewModel — so they are registered here and dropped in [stopListening]. They run
+     * on the app scope, which outlives any screen: the reader may well be off-screen
+     * when the lock-screen play button is pressed.
+     */
+    private fun openPlaybackService() {
+        val article = state.article ?: return
+        PlaybackService.Hooks.resume = { resumeListening() }
+        PlaybackService.Hooks.pause = { pauseListening() }
+        PlaybackService.Hooks.stop = { stopListening() }
+        PlaybackService.start(container.appContext, article.title, playbackSubtitle())
+    }
+
+    /** What the notification says under the title: the book's name, or the article's. */
+    private fun playbackSubtitle(): String {
+        val article = state.article ?: return ""
+        val book = state.book?.title.orEmpty()
+        return if (book.isNotBlank()) book else article.subtitle.ifBlank { article.originLabel }
+    }
+
+    /**
+     * Stops the voice but keeps the session, so the notification's play button works.
+     *
+     * Stopping the service here instead would take the notification with it, and there
+     * would be nothing left on the lock screen to press. Used by both the reader's own
+     * pause button and the lock-screen one, which is what keeps the two consistent:
+     * either one can be resumed from the other.
+     */
+    fun pauseListening() {
+        if (!state.listening) return
+        val at = lastSpokenIndex
+        container.speaker.stop()
+        speechJob?.cancel()
+        speechJob = null
+        state = state.copy(listening = false, speakingSentence = -1)
+        lastSpokenIndex = -1
+        pausedIndex = at
+        val article = state.article
+        PlaybackService.setPlaying(
+            container.appContext,
+            playing = false,
+            title = article?.title.orEmpty(),
+            subtitle = playbackSubtitle(),
+        )
+    }
+
+    private fun resumeListening() {
+        resumeFrom(container.appScope)
     }
 
     private fun speakAt(index: Int) {
@@ -618,14 +834,49 @@ class ReaderViewModel(
         }
     }
 
+    /**
+     * The reader's own listen button.
+     *
+     * Pauses rather than stops, so it matches the lock screen: the session stays up and
+     * pressing it again carries on from the same sentence instead of starting over.
+     */
     fun toggleListening(scope: CoroutineScope) {
-        if (state.listening) stopListening() else startListening(scope)
+        if (state.listening) pauseListening() else resumeFrom(scope)
     }
 
+    /**
+     * Continues from where playback was paused, or from what the reader is looking at.
+     *
+     * Starting from the top of the article is wrong once the reader has scrolled: a
+     * chapter of a novel is thousands of words long, and the position they left the text
+     * at is exactly the part they want read to them.
+     */
+    private fun resumeFrom(scope: CoroutineScope) {
+        val from = if (pausedIndex >= 0) pausedIndex else firstSentenceAtReadPosition()
+        pausedIndex = -1
+        startListening(scope, from)
+    }
+
+    /** Flat index of the first sentence of the paragraph at the top of the list. */
+    private fun firstSentenceAtReadPosition(): Int {
+        val index = state.flatSentences.indexOfFirst { it.paragraphIndex >= readParagraph }
+        return if (index < 0) 0 else index
+    }
+
+    /** Ends the session: the voice, the notification and the callbacks all go. */
     fun stopListening() {
         container.speaker.stop()
+        speechJob?.cancel()
+        speechJob = null
         state = state.copy(listening = false, speakingSentence = -1)
         lastSpokenIndex = -1
+        pausedIndex = -1
+        // Dropped before the service so a teardown cannot call back into a ViewModel
+        // that is being cleared.
+        PlaybackService.Hooks.resume = null
+        PlaybackService.Hooks.pause = null
+        PlaybackService.Hooks.stop = null
+        PlaybackService.stop(container.appContext)
     }
 
     /** Taps a sentence while listening to jump playback to it. */
@@ -688,9 +939,22 @@ class ReaderViewModel(
         super.onCleared()
         flushProgress()
         speechJob?.cancel()
+        searchJob?.cancel()
         // A translation already under way keeps running on the container's scope: it
         // writes straight to the article row, so leaving the reader mid-fetch should
         // still leave the article translated when the user comes back.
-        container.speaker.stop()
+        //
+        // Leaving the reader also ends the playback session: the queue and the
+        // highlight are this ViewModel's, so a service left running would have nothing
+        // left to advance it.
+        stopListening()
+    }
+
+    private companion object {
+        /** Shorter queries match nearly every paragraph and say nothing. */
+        const val MIN_SEARCH_CHARS = 2
+
+        /** Long enough to cover the gap between keystrokes, short enough to feel immediate. */
+        const val SEARCH_DEBOUNCE_MS = 220L
     }
 }
