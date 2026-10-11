@@ -107,6 +107,9 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
                 articleId  INTEGER NOT NULL,
                 day        TEXT    NOT NULL,
                 seconds    INTEGER NOT NULL DEFAULT 0,
+                -- How far into the article the reader had got, in words, at the moment
+                -- this row was written. One row per flush, so a single sitting writes it
+                -- several times; the statistics take the maximum per article.
                 wordsRead  INTEGER NOT NULL DEFAULT 0,
                 lookups    INTEGER NOT NULL DEFAULT 0,
                 finishedAt INTEGER NOT NULL

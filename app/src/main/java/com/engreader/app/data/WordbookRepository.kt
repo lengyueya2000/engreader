@@ -312,6 +312,15 @@ class WordbookRepository(
             out
         }
 
+    /**
+     * Writes one flush of reading: the time since the last one, and how far into the
+     * article the reader had got.
+     *
+     * [wordsRead] is coverage, not words gained, so it repeats across the flushes of one
+     * sitting and the statistics take the maximum per article. Storing the increment
+     * instead would need the position at the previous flush, which is not known once the
+     * reader has left and come back.
+     */
     suspend fun recordSession(articleId: Long, seconds: Int, wordsRead: Int, lookups: Int) =
         withContext(Dispatchers.IO) {
             if (seconds <= 0 && lookups <= 0) return@withContext

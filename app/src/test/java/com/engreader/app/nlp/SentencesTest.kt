@@ -132,6 +132,76 @@ class ParagraphsTest {
         assertTrue(Paragraphs.texts("").isEmpty())
         assertTrue(Paragraphs.texts("\n\n  \n\n").isEmpty())
     }
+
+    // ------------------------------------------------- reading coverage
+
+    /**
+     * What a flush reports as read.
+     *
+     * Both 累计词量 and 阅读速度 are summed from this, so an off-by-one here silently
+     * skews every number on the statistics screen.
+     */
+    private val prose = """
+        The train was late again.
+
+        We waited on the cold platform for an hour, watching the board.
+
+        Nobody spoke. Then the announcement came, and everyone moved at once.
+    """.trimIndent()
+
+    @Test
+    fun `coverage counts only the paragraphs reached`() {
+        val paragraphs = Paragraphs.split(prose)
+        assertEquals(3, paragraphs.size)
+        val first = paragraphs[0].tokens.size
+        val firstTwo = first + paragraphs[1].tokens.size
+
+        assertEquals(first, Paragraphs.wordsUpTo(paragraphs, 0))
+        assertEquals(firstTwo, Paragraphs.wordsUpTo(paragraphs, 1))
+    }
+
+    @Test
+    fun `reaching the last paragraph counts the body's word count`() {
+        // The invariant the statistics depend on: a piece read to the end contributes
+        // exactly the word count the article list shows, no more and no less.
+        val paragraphs = Paragraphs.split(prose)
+        assertEquals(
+            Tokenizer.countWords(prose),
+            Paragraphs.wordsUpTo(paragraphs, paragraphs.lastIndex),
+        )
+    }
+
+    @Test
+    fun `an index past the last paragraph counts them all`() {
+        val paragraphs = Paragraphs.split(prose)
+        assertEquals(
+            Paragraphs.wordsUpTo(paragraphs, paragraphs.lastIndex),
+            Paragraphs.wordsUpTo(paragraphs, paragraphs.lastIndex + 50),
+        )
+    }
+
+    @Test
+    fun `a negative index counts nothing`() {
+        // The header above the text is the only thing on screen: no paragraph has been
+        // reached, and reporting the piece's full length there is the old bug.
+        assertEquals(0, Paragraphs.wordsUpTo(Paragraphs.split(prose), -1))
+    }
+
+    @Test
+    fun `no paragraphs counts nothing`() {
+        assertEquals(0, Paragraphs.wordsUpTo(emptyList(), 0))
+    }
+
+    @Test
+    fun `coverage never falls as the reader moves on`() {
+        val paragraphs = Paragraphs.split(prose)
+        var previous = 0
+        for (index in paragraphs.indices) {
+            val words = Paragraphs.wordsUpTo(paragraphs, index)
+            assertTrue("coverage fell at paragraph $index", words >= previous)
+            previous = words
+        }
+    }
 }
 
 class TokenizerTest {

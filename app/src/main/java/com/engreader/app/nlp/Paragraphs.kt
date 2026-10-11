@@ -65,4 +65,22 @@ object Paragraphs {
      */
     fun wordAt(paragraph: Paragraph, offset: Int): String? =
         paragraph.tokens.firstOrNull { offset in it.start until it.end }?.text
+
+    /**
+     * Words in paragraphs `0..lastIndex` — how much of a piece has been got through.
+     *
+     * A paragraph's words are its token spans, which are the same matches
+     * [Tokenizer.countWords] makes, so reaching the last paragraph counts the body's
+     * full word count and stopping halfway counts only what was passed. That is what
+     * makes the reading statistics describe what was read rather than what was open.
+     *
+     * Clamped at both ends: a negative index (the header above the text is the only
+     * thing on screen) and an index past the last paragraph both count whole
+     * paragraphs rather than throwing or overrunning.
+     */
+    fun wordsUpTo(paragraphs: List<Paragraph>, lastIndex: Int): Int {
+        var words = 0
+        for (i in 0..minOf(lastIndex, paragraphs.lastIndex)) words += paragraphs[i].tokens.size
+        return words
+    }
 }

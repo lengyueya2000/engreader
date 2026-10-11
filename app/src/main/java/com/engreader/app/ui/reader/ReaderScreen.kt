@@ -377,12 +377,19 @@ fun ReaderScreen(
         restored = true
     }
 
-    // Reports the top paragraph as the reader scrolls, so leaving the piece records
-    // where they were. Gated on [restored]: the first frame of a reopened article is at
-    // the top, and recording that would erase the position just restored.
+    // Reports the visible paragraph range as the reader scrolls. The top of the range is
+    // where the piece is resumed from; the bottom of it is how far the piece has been
+    // read, which is what the reading statistics count. Gated on [restored]: the first
+    // frame of a reopened article is at the top, and recording that would erase the
+    // position just restored.
     LaunchedEffect(listState, leadingItems) {
-        snapshotFlow { listState.firstVisibleItemIndex }
-            .collect { index -> if (restored) viewModel.recordPosition(index - leadingItems) }
+        snapshotFlow {
+            listState.firstVisibleItemIndex to
+                (listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index
+                    ?: listState.firstVisibleItemIndex)
+        }.collect { (first, last) ->
+            if (restored) viewModel.recordPosition(first - leadingItems, last - leadingItems)
+        }
     }
 
     val theme = state.theme

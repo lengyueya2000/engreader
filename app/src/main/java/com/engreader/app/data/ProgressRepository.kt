@@ -12,10 +12,12 @@ data class ProgressSnapshot(
     val articlesStarted: Int,
     val articlesFinished: Int,
     /**
-     * Words in the distinct articles the reader has spent time on.
+     * Words in the distinct articles the reader has got through.
      *
-     * Distinct, not summed over sessions: the article's whole word count is written
-     * on every flush, so a piece read three times used to be counted three times.
+     * Per article, the furthest the reader reached, not the sum over sessions and not
+     * the article's total: a session row records how far into the piece the reader was,
+     * so a piece read in three sittings has that figure written three times and a piece
+     * abandoned after one paragraph must not count in full.
      */
     val wordsRead: Int,
     val lookups: Int,
@@ -34,12 +36,12 @@ data class ProgressSnapshot(
 /**
  * Reading speed, in words per minute.
  *
- * An estimate rather than a measurement: the session table stores the article's
- * whole word count against the time spent on it, so a piece left half-read reports
- * faster than it was. Sessions shorter than [ReadingSpeed.MIN_SESSION_SECONDS] are
- * excluded, because a few seconds on a long article would otherwise dominate the
- * average, and the figure is only produced once enough time has accumulated to be
- * worth reading at all.
+ * An estimate rather than a measurement: the session table stores how far into the
+ * article the reader was when the time was flushed, so a piece skimmed quickly reads
+ * fast and the last screenful before a flush is not counted at all. Sessions shorter
+ * than [ReadingSpeed.MIN_SESSION_SECONDS] are excluded, because a few seconds on a long
+ * article would otherwise dominate the average, and the figure is only produced once
+ * enough time has accumulated to be worth reading at all.
  */
 data class ReadingSpeed(
     /** Words per minute across the window. */
@@ -55,7 +57,7 @@ data class ReadingSpeed(
     val hasTrend: Boolean get() = previousWordsPerMinute > 0
 
     companion object {
-        /** Below this, a session is a glance rather than reading. */
+        /** Below this, the time spent on an article in the window is a glance, not reading. */
         const val MIN_SESSION_SECONDS = 30
     }
 }
@@ -121,9 +123,9 @@ class ProgressRepository(
     /**
      * Words in the distinct articles that have been read.
      *
-     * `MAX(wordsRead)` per article rather than `SUM`: every flush writes the
-     * article's whole word count, so summing counts a re-read as new words. The
-     * article's own count is constant across its rows, so the maximum is it.
+     * `MAX(wordsRead)` per article rather than `SUM`: a flush writes how far into the
+     * piece the reader had got, so summing counts every sitting over again. Reading on
+     * is monotonic within an article, so the largest figure is the furthest reached.
      */
     private fun distinctWordsRead(): Int =
         db.readableDatabase.rawQuery(
@@ -134,10 +136,10 @@ class ProgressRepository(
     /**
      * Reading speed over the last 14 days, against the 14 days before that.
      *
-     * Summed rather than averaged per session: a single 40-second session on a
-     * 600-word article would otherwise report 900 wpm and swamp a per-session mean.
-     * Summing words and time separately weights each session by how long it lasted,
-     * which is what "how fast do I read" means.
+     * Summed over articles rather than averaged per flush: a single 40-second flush on a
+     * 600-word article would otherwise report 900 wpm and swamp a per-flush mean.
+     * Summing words and time separately weights each article by how long it took, which
+     * is what "how fast do I read" means.
      */
     private fun readingSpeed(): ReadingSpeed? {
         val now = System.currentTimeMillis()
@@ -158,11 +160,24 @@ class ProgressRepository(
         )
     }
 
-    /** `(seconds, words)` read in `[from, to)`, ignoring glances. */
+    /**
+     * `(seconds, words)` read in `[from, to)`, ignoring glances.
+     *
+     * Collapsed to one row per article before summing. A row is a flush, not a sitting:
+     * a piece read with two trips to the background leaves three rows, each carrying how
+     * far into the piece the reader was, so summing them directly counted the words that
+     * many times over and reported a speed that many times too fast. The furthest
+     * coverage and the total time are what one article contributes.
+     *
+     * The glance filter is on the article's time in the window rather than a single
+     * flush's, since that is the unit being counted.
+     */
     private fun speedWindow(from: Long, to: Long): Pair<Int, Int> =
         db.readableDatabase.rawQuery(
-            "SELECT SUM(seconds), SUM(wordsRead) FROM session " +
-                "WHERE finishedAt >= ? AND finishedAt < ? AND seconds >= ?",
+            "SELECT SUM(seconds), SUM(words) FROM (" +
+                "SELECT SUM(seconds) seconds, MAX(wordsRead) words FROM session " +
+                "WHERE finishedAt >= ? AND finishedAt < ? GROUP BY articleId" +
+                ") WHERE seconds >= ?",
             arrayOf(from.toString(), to.toString(), ReadingSpeed.MIN_SESSION_SECONDS.toString()),
         ).use { c ->
             if (!c.moveToFirst() || c.isNull(0)) 0 to 0 else c.getInt(0) to c.getInt(1)

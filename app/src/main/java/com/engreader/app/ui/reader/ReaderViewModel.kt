@@ -227,6 +227,15 @@ class ReaderViewModel(
      */
     private var readParagraph = 0
 
+    /**
+     * The furthest paragraph the reader has had on screen this session.
+     *
+     * Tracked separately from [readParagraph], which follows the scroll and therefore
+     * moves back up when the reader scrolls back. This is a high-water mark, because
+     * what a flush reports as read must never shrink.
+     */
+    private var maxParagraph = 0
+
     /** The position as last written, so a flush that changes nothing writes nothing. */
     private var savedParagraph = 0
 
@@ -295,6 +304,10 @@ class ReaderViewModel(
         )
         readParagraph = state.resumeParagraph
         savedParagraph = readParagraph
+        // Reopening resumes partway in, and the part already behind the reader counts as
+        // read: starting the high-water mark at the top would report the coverage of a
+        // piece picked up at chapter's end as one paragraph.
+        maxParagraph = readParagraph
         // The article just replaced whatever the alignment was computed against, and a
         // paragraph index means something else in the new one.
         alignedParagraph = -1
@@ -378,6 +391,11 @@ class ReaderViewModel(
      * Runs on the container's scope rather than the caller's: the reader calls this
      * as it is being disposed, at which point the composition scope is already
      * cancelled and a write launched there would never reach the database.
+     *
+     * Called once per trip out of the foreground as well as on the way out, so one
+     * reading of a piece leaves several rows. The seconds are the increment since the
+     * last flush, and the words are the piece's coverage as of now, which is why the
+     * statistics aggregate the words per article rather than summing them.
      */
     fun flushProgress() {
         savePosition()
@@ -386,7 +404,7 @@ class ReaderViewModel(
         val seconds = ((now - sessionStart) / 1000).toInt()
         if (seconds <= 0) return
         sessionStart = now
-        val words = state.article?.wordCount ?: 0
+        val words = coveredWords()
         val bookId = state.article?.bookId ?: 0
         val count = lookups
         lookups = 0
@@ -400,16 +418,36 @@ class ReaderViewModel(
     }
 
     /**
+     * Words of the piece the reader has actually got through.
+     *
+     * Paragraphs up to the furthest one reached, not the article's total word count.
+     * Writing the total on every flush made a piece abandoned after one paragraph
+     * count in full towards 累计词量, and made 阅读速度 climb with every trip to the
+     * background, because the speed is words over time and the words were being
+     * counted again each time.
+     *
+     * Zero while the text is still loading: nothing has been read yet, and falling
+     * back to the article's total would put the old error back.
+     */
+    private fun coveredWords(): Int =
+        Paragraphs.wordsUpTo(state.paragraphs.map { it.paragraph }, maxParagraph)
+
+    /**
      * Records where the list is, for the next time the piece is opened.
      *
      * Called from a snapshot flow on every scroll position change, so it only assigns:
      * the write happens in [savePosition] when the reader leaves or the app goes to the
      * background. Writing on every scroll would put a database statement behind every
      * fling.
+     *
+     * [lastVisible] is the last paragraph on screen, which is how far the reader has
+     * actually got; the top one alone would report only the first screenful of a piece
+     * that fits on one screen, and nothing at all of the rest.
      */
-    fun recordPosition(paragraph: Int) {
+    fun recordPosition(paragraph: Int, lastVisible: Int = paragraph) {
         if (paragraph < 0) return
         readParagraph = paragraph
+        if (lastVisible > maxParagraph) maxParagraph = lastVisible
     }
 
     /** Writes the position, if it has moved since the last write. */

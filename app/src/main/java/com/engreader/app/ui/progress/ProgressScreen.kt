@@ -231,10 +231,10 @@ fun ProgressScreen(onOpenSettings: () -> Unit) {
 /**
  * Reading speed, with the change against the previous fortnight.
  *
- * Shown as a range rather than a precise number: the session table records the
- * article's full word count against the time spent, so a piece left half-read
- * reads fast, and presenting "247 wpm" would claim an accuracy the data does not
- * have. The trend is the point — that is what improves as vocabulary grows.
+ * The number is an estimate and the card says so: the words are counted from how far
+ * into each article the reader got, so the screenful they stopped on is not counted and
+ * skimming reads fast. The trend is the point — that is what improves as vocabulary
+ * grows — so the change against the previous fortnight leads and the caveat follows.
  */
 @Composable
 private fun SpeedCard(speed: com.engreader.app.data.ReadingSpeed) {
@@ -288,7 +288,7 @@ private fun SpeedCard(speed: com.engreader.app.data.ReadingSpeed) {
         )
         Spacer(Modifier.height(6.dp))
         Text(
-            text = "这是估算：文章读到一半也会按全文词数计入，所以偏快。看趋势比看绝对值有意义。",
+            text = "这是估算：词数按每篇读到的位置算，停下的那一屏不计入，跳读会让数字偏高。看趋势比看绝对值有意义。",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
         )
