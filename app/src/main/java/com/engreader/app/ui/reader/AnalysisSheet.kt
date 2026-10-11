@@ -1,6 +1,7 @@
 package com.engreader.app.ui.reader
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,6 +20,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.outlined.Lightbulb
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -27,9 +29,11 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -39,7 +43,11 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import com.engreader.app.nlp.ChunkRole
 import com.engreader.app.nlp.ClauseKind
+import com.engreader.app.nlp.ConnectedSpeech
+import com.engreader.app.nlp.Kind
+import com.engreader.app.nlp.Paragraphs
 import com.engreader.app.nlp.SentenceAnalysis
+import com.engreader.app.nlp.SpeechFeature
 import com.engreader.app.ui.components.HairLine
 import com.engreader.app.ui.components.Tag
 import com.engreader.app.ui.theme.Palette
@@ -47,13 +55,20 @@ import com.engreader.app.ui.theme.Palette
 /**
  * Long-sentence breakdown.
  *
- * Order matters: the sentence first (so the user can re-read it), then the
- * backbone, then clause by clause, then the notes. Reading it top to bottom walks
- * from "what does this sentence say" to "how is it built".
+ * Order matters: the sentence first (so the user can re-read it), then how it is said,
+ * then the backbone, then clause by clause, then the notes. Reading it top to bottom
+ * walks from "what does this sentence say" to "how is it built".
+ *
+ * [onSpeakPhrase] plays a phrase with the sheet still open — `true` for the 0.6×
+ * comparison pace — so a pattern can be heard without leaving the breakdown.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AnalysisSheet(analysis: SentenceAnalysis, onDismiss: () -> Unit) {
+fun AnalysisSheet(
+    analysis: SentenceAnalysis,
+    onSpeakPhrase: (String, Boolean) -> Unit,
+    onDismiss: () -> Unit,
+) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -97,6 +112,9 @@ fun AnalysisSheet(analysis: SentenceAnalysis, onDismiss: () -> Unit) {
                     color = MaterialTheme.colorScheme.onSurface,
                 )
             }
+
+            Spacer(Modifier.height(16.dp))
+            ConnectedSpeechSection(analysis.sentence, onSpeakPhrase)
 
             Spacer(Modifier.height(16.dp))
             Label("句子主干")
@@ -303,4 +321,138 @@ private fun roleColor(role: ChunkRole) = when (role) {
     ChunkRole.Appositive -> Palette.InkMuted
     ChunkRole.Connector -> Palette.InkMuted
     ChunkRole.Other -> Palette.InkMuted
+}
+
+/**
+ * How the sentence is actually said — the patterns the spelling hides.
+ *
+ * A rule table rather than a transcription of the recording (see [ConnectedSpeech]):
+ * each row is "this is the rule that applies here", and can be played at the
+ * comparison pace so the join is heard rather than only described.
+ */
+@Composable
+private fun ConnectedSpeechSection(sentence: String, onSpeakPhrase: (String, Boolean) -> Unit) {
+    val features = remember(sentence) {
+        val tokens = Paragraphs.split(sentence).firstOrNull()?.tokens ?: emptyList()
+        ConnectedSpeech.explain(sentence, tokens)
+    }
+    HairLine()
+    Spacer(Modifier.height(14.dp))
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Label("怎么读")
+        Spacer(Modifier.weight(1f))
+        PhraseButton("正常") { onSpeakPhrase(sentence, false) }
+        Spacer(Modifier.width(6.dp))
+        PhraseButton("0.6×") { onSpeakPhrase(sentence, true) }
+    }
+    Spacer(Modifier.height(8.dp))
+    if (features.isEmpty()) {
+        Text(
+            text = "这句没有明显的连读、缩读或弱读，按字面读就可以。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        return
+    }
+    Text(
+        text = "英语说快时词和词会粘在一起，下面是这句里会发生的几处。",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Spacer(Modifier.height(10.dp))
+    features.forEach { feature ->
+        FeatureRow(feature, onPlay = { onSpeakPhrase(feature.written, true) })
+    }
+}
+
+@Composable
+private fun FeatureRow(feature: SpeechFeature, onPlay: () -> Unit) {
+    val (tint, fill) = kindColor(feature.kind)
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(bottom = 12.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainer)
+            .padding(12.dp),
+        verticalAlignment = Alignment.Top,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Tag(feature.kind.label, tint, fill)
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = buildAnnotatedString {
+                        withStyle(
+                            SpanStyle(
+                                fontFamily = FontFamily.Serif,
+                                fontWeight = FontWeight.Medium,
+                            )
+                        ) { append(feature.written) }
+                        withStyle(SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant)) {
+                            append("  →  ")
+                        }
+                        withStyle(
+                            SpanStyle(
+                                color = MaterialTheme.colorScheme.primary,
+                                fontWeight = FontWeight.Bold,
+                            )
+                        ) { append(feature.sounds) }
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = feature.tip,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.width(8.dp))
+        Icon(
+            Icons.AutoMirrored.Filled.VolumeUp,
+            contentDescription = "慢速播放",
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier
+                .size(20.dp)
+                .clickable(onClick = onPlay),
+        )
+    }
+}
+
+@Composable
+private fun PhraseButton(label: String, onClick: () -> Unit) {
+    Row(
+        Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainer)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 5.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            Icons.AutoMirrored.Filled.VolumeUp,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(14.dp),
+        )
+        Spacer(Modifier.width(4.dp))
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.primary,
+        )
+    }
+}
+
+private fun kindColor(kind: Kind): Pair<Color, Color> = when (kind) {
+    Kind.Reduction -> Palette.Clay to Palette.ClaySoft
+    Kind.Assimilation -> Palette.Pine to Palette.PineSoft
+    Kind.Flap -> Palette.Amber to Palette.AmberSoft
+    Kind.Elision -> Palette.InkMuted to Palette.PineSoft
+    Kind.Linking -> Palette.PineBright to Palette.PineSoft
+    Kind.WeakForm -> Palette.Clay to Palette.AmberSoft
 }

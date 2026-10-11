@@ -58,6 +58,17 @@ class SettingsRepository(context: Context) {
         get() = prefs.getBoolean(KEY_HIGHLIGHT, true)
         set(value) = prefs.edit().putBoolean(KEY_HIGHLIGHT, value).apply()
 
+    /**
+     * Mark words whose review has come due while reading, so review happens in context.
+     *
+     * Independent of [highlightSavedWords]: a reader may want the whole wordbook marked,
+     * or only the handful that the schedule says are slipping, and turning one off must
+     * not turn the other off.
+     */
+    var highlightDueWords: Boolean
+        get() = prefs.getBoolean(KEY_HIGHLIGHT_DUE, true)
+        set(value) = prefs.edit().putBoolean(KEY_HIGHLIGHT_DUE, value).apply()
+
     /** Show the Chinese translation panel under each paragraph. */
     var showTranslation: Boolean
         get() = prefs.getBoolean(KEY_SHOW_TRANSLATION, true)
@@ -93,6 +104,7 @@ class SettingsRepository(context: Context) {
         const val KEY_SPEECH_VOICE = "speech_voice"
         const val KEY_AUTO_SAVE = "auto_save"
         const val KEY_HIGHLIGHT = "highlight_saved"
+        const val KEY_HIGHLIGHT_DUE = "highlight_due"
         const val KEY_SHOW_TRANSLATION = "show_translation"
         const val KEY_SPEAK_TRANSLATION = "speak_translation"
         const val KEY_DAILY_GOAL = "daily_goal"

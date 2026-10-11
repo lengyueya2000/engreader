@@ -43,6 +43,7 @@ sealed interface Overlay {
     data class Reading(val articleId: Long, val paragraph: Int = 0) : Overlay
     data object Settings : Overlay
     data object Review : Overlay
+    data object VocabTest : Overlay
     data object BookShelf : Overlay
     data class BookDetail(val bookId: Long) : Overlay
 }
@@ -140,6 +141,7 @@ fun AppRoot(container: AppContainer) {
                         )
                         Tab.Progress -> ProgressScreen(
                             onOpenSettings = { overlays.add(Overlay.Settings) },
+                            onOpenVocabTest = { overlays.add(Overlay.VocabTest) },
                         )
                     }
                 }
@@ -158,6 +160,7 @@ fun AppRoot(container: AppContainer) {
                         )
                     }
                     Overlay.Review -> com.engreader.app.ui.wordbook.ReviewScreen(onBack = pop)
+                    Overlay.VocabTest -> com.engreader.app.ui.vocab.VocabTestScreen(onBack = pop)
                     Overlay.Settings -> SettingsScreen(onBack = pop)
                     Overlay.BookShelf -> BookShelfScreen(
                         onBack = pop,

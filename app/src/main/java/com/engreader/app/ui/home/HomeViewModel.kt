@@ -8,9 +8,18 @@ import com.engreader.app.data.AppContainer
 import com.engreader.app.data.ProgressSnapshot
 import com.engreader.app.model.Article
 import com.engreader.app.model.Book
+import com.engreader.app.nlp.AdaptiveReader
+import com.engreader.app.nlp.Readiness
 import com.engreader.app.nlp.VocabularyProfile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+
+/** The article the reader should read next, and the reason to show beside it. */
+data class Recommendation(
+    val article: Article,
+    val readiness: Readiness,
+    val reason: String,
+)
 
 /** What the home screen needs to render, resolved in one repository pass. */
 data class HomeState(
@@ -41,6 +50,14 @@ data class HomeState(
      * list of twenty would delay the first frame for a decoration.
      */
     val unknownCounts: Map<Long, Int> = emptyMap(),
+    /**
+     * The article nearest the reader's i+1, with the reason to show on its card.
+     *
+     * Null until the profiling pass has run, and null when no listed article is long
+     * enough to judge: a recommendation drawn from a twenty-word caption would be
+     * arithmetic rather than advice.
+     */
+    val recommendation: Recommendation? = null,
 )
 
 class HomeViewModel(private val container: AppContainer) : ViewModel() {
@@ -65,29 +82,56 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
             progress = progress,
             dueWords = progress.dueNow,
         )
-        state = state.copy(unknownCounts = unknownCounts(list))
+        val profile = profile(list)
+        state = state.copy(unknownCounts = profile.counts, recommendation = profile.recommendation)
     }
 
     /**
-     * Unknown study-worthy words per article, for the rows on screen.
+     * The unknown-word counts for the rows, and the i+1 pick, from one dictionary pass.
      *
-     * Capped at the first few articles and wrapped in `runCatching`: a profiled
-     * article is one dictionary pass, and the home list is a browsing surface where
-     * a missing badge is much better than a stalled screen.
+     * Capped at the first few articles and wrapped in `runCatching`: a profiled article
+     * is one dictionary pass, and the home list is a browsing surface where a missing
+     * badge is much better than a stalled screen. The recommendation rides along on the
+     * same pass, so it costs nothing beyond what the badges already pay.
      */
-    private suspend fun unknownCounts(articles: List<Article>): Map<Long, Int> {
+    private suspend fun profile(articles: List<Article>): Profile {
         val known = runCatching { container.wordbook.knownLemmas() }.getOrDefault(emptySet())
-        val out = HashMap<Long, Int>()
+        // The vocabulary estimate is the only thing that knows anything about a reader
+        // who has not built a wordbook yet; without it a fresh install has no signal at
+        // all, and the pick below would be "shortest" dressed up as i+1.
+        val estimate = runCatching { container.vocabTest.latest()?.estimate }.getOrNull()
+        val hasSignal = known.isNotEmpty() || estimate != null
+        val counts = HashMap<Long, Int>()
+        val readiness = ArrayList<Readiness>()
+        val byId = HashMap<Long, Article>()
         for (article in articles.take(MAX_PROFILED_ROWS)) {
             runCatching {
                 val lemmas = container.articles.contentLemmas(article)
                 if (lemmas.size < VocabularyProfile.MIN_PROFILED_LEMMAS) return@runCatching
-                val result = container.vocabulary.assess(lemmas, known)
-                if (result.unknown.isNotEmpty()) out[article.id] = result.unknown.size
+                val baseline = AdaptiveReader.baselineKnown(lemmas, estimate) { lemma ->
+                    container.dictionary.lookup(lemma)?.frq ?: 0
+                }
+                val result = container.vocabulary.assess(lemmas, known + baseline)
+                // A zero-unknown article keeps no badge, but it is still a candidate for
+                // the recommendation — it is the right pick when everything else is hard.
+                if (result.unknown.isNotEmpty()) counts[article.id] = result.unknown.size
+                readiness += Readiness(article.id, result.unknown.size, lemmas.size)
+                byId[article.id] = article
             }
         }
-        return out
+        val pick = AdaptiveReader.pick(readiness)
+        val article = pick?.let { byId[it.id] }
+        return Profile(
+            counts = counts,
+            recommendation = if (!hasSignal || pick == null || article == null) {
+                null
+            } else {
+                Recommendation(article, pick, AdaptiveReader.reason(pick))
+            },
+        )
     }
+
+    private data class Profile(val counts: Map<Long, Int>, val recommendation: Recommendation?)
 
     /** Installs the bundled passages on first launch so there is always something to read. */
     suspend fun installSeedIfEmpty() {

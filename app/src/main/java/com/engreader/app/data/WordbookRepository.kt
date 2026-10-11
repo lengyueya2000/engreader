@@ -258,6 +258,24 @@ class WordbookRepository(
     }
 
     /**
+     * Lemmas whose review has come due, for the highlight in the article body.
+     *
+     * The same condition [due] uses — saved, not mastered, past its box's interval —
+     * but returned as a set of spellings rather than cards: the reader only needs to
+     * ask "is this word on the list" while it paints a paragraph, and asking per word
+     * would be a query per word. Mastering parks a word at `Long.MAX_VALUE`, so a
+     * mastered word can never appear here.
+     */
+    suspend fun dueLemmas(): Set<String> = withContext(Dispatchers.IO) {
+        db.readableDatabase.rawQuery(
+            "SELECT lemma FROM word WHERE mastered = 0 AND dueAt <= ?",
+            arrayOf(System.currentTimeMillis().toString()),
+        ).use { c ->
+            buildSet { while (c.moveToNext()) add(c.getString(0).lowercase()) }
+        }
+    }
+
+    /**
      * Applies a review outcome. [correct] promotes the word; a miss demotes it so
      * it reappears in the same session's queue.
      *

@@ -60,5 +60,7 @@ class AppContainer(context: Context) {
 
     val progress = ProgressRepository(userDb, dictionary)
 
+    val vocabTest = VocabTestRepository(userDb, dictionary)
+
     val settings = SettingsRepository(appContext)
 }

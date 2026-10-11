@@ -55,6 +55,7 @@ fun TypographySheet(
     lineHeight: Float,
     theme: ReadingTheme,
     highlightSaved: Boolean,
+    highlightDue: Boolean,
     showTranslation: Boolean,
     speechRate: Float,
     speechLocale: String,
@@ -66,6 +67,7 @@ fun TypographySheet(
     onLineHeight: (Float) -> Unit,
     onTheme: (ReadingTheme) -> Unit,
     onHighlightSaved: (Boolean) -> Unit,
+    onHighlightDue: (Boolean) -> Unit,
     onShowTranslation: (Boolean) -> Unit,
     onSpeechRate: (Float) -> Unit,
     onSpeechLocale: (String) -> Unit,
@@ -176,6 +178,14 @@ fun TypographySheet(
                 detail = "读过的生词在正文里带下划线，方便复现记忆",
                 checked = highlightSaved,
                 onCheckedChange = onHighlightSaved,
+            )
+
+            Spacer(Modifier.height(6.dp))
+            ToggleRow(
+                label = "高亮该复习的词",
+                detail = "按记忆曲线到期该复习的词，在正文里标成琥珀色，边读边过",
+                checked = highlightDue,
+                onCheckedChange = onHighlightDue,
             )
 
             Spacer(Modifier.height(6.dp))

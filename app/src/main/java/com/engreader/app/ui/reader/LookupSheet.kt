@@ -39,10 +39,15 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import com.engreader.app.dict.PartOfSpeech
+import com.engreader.app.dict.RootBreakdown
 import com.engreader.app.ui.components.BandChip
 import com.engreader.app.ui.components.HairLine
 import com.engreader.app.ui.components.Tag
@@ -305,6 +310,10 @@ fun LookupSheet(
                     }
                 }
 
+                if (state.roots != null) {
+                    RootsBlock(state.roots)
+                }
+
                 if (entry.tag.isNotBlank()) {
                     Spacer(Modifier.height(10.dp))
                     Text(
@@ -397,6 +406,91 @@ fun LookupSheet(
                 }
             }
             Spacer(Modifier.height(8.dp))
+        }
+    }
+}
+
+/**
+ * The word cut into morphemes: `unhappy` as `un` + `happy`.
+ *
+ * The cut is shown whole before the parts are explained, so the reader sees the shape
+ * first. Letters the table could not account for are shown in the running colour
+ * rather than hidden — the panel is a memory aid, not a claim to have analysed the
+ * word — and the caveat says so, because the match is on spelling and `several` really
+ * does look like `sever` + `-al`.
+ */
+@Composable
+private fun RootsBlock(breakdown: RootBreakdown) {
+    Spacer(Modifier.height(14.dp))
+    HairLine()
+    Spacer(Modifier.height(12.dp))
+    Text(
+        text = "词根词缀",
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.primary,
+    )
+    Spacer(Modifier.height(2.dp))
+    Text(
+        text = "按拼写拆的，用来帮你记；不是词源考证，和释义对不上时以释义为准。",
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Spacer(Modifier.height(8.dp))
+    Text(
+        text = buildAnnotatedString {
+            breakdown.segments.forEachIndexed { index, segment ->
+                if (index > 0) {
+                    withStyle(SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant)) {
+                        append("  +  ")
+                    }
+                }
+                val labelled = segment.affix != null
+                withStyle(
+                    SpanStyle(
+                        color = if (labelled) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurface,
+                        fontWeight = if (labelled) FontWeight.Bold else FontWeight.Normal,
+                        fontFamily = FontFamily.Serif,
+                    )
+                ) { append(segment.text) }
+            }
+        },
+        style = MaterialTheme.typography.bodyLarge,
+        color = MaterialTheme.colorScheme.onSurface,
+    )
+    Spacer(Modifier.height(10.dp))
+    breakdown.affixes.forEach { affix ->
+        Row(
+            Modifier.fillMaxWidth().padding(vertical = 4.dp),
+            verticalAlignment = Alignment.Top,
+        ) {
+            Box(
+                Modifier
+                    .width(52.dp)
+                    .clip(RoundedCornerShape(5.dp))
+                    .background(MaterialTheme.colorScheme.surfaceContainer)
+                    .padding(vertical = 3.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = affix.kind.label,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    text = "${affix.text}  ${affix.meaning}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Text(
+                    text = "例：${affix.example}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }

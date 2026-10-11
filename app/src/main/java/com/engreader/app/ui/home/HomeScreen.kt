@@ -38,6 +38,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.engreader.app.model.Article
 import com.engreader.app.model.Book
+import com.engreader.app.nlp.AdaptiveReader
+import com.engreader.app.nlp.Fit
 import com.engreader.app.ui.books.BookCover
 import com.engreader.app.ui.books.rememberCover
 import com.engreader.app.ui.components.DifficultyChip
@@ -45,6 +47,7 @@ import com.engreader.app.ui.components.EmptyState
 import com.engreader.app.ui.components.HairLine
 import com.engreader.app.ui.components.LoadingBlock
 import com.engreader.app.ui.components.SectionHeader
+import com.engreader.app.ui.components.Tag
 import com.engreader.app.ui.containerViewModel
 import com.engreader.app.ui.theme.Palette
 
@@ -119,6 +122,21 @@ fun HomeScreen(
                     ) { onOpenArticle(article.id) }
                 }
             }
+
+            // Skipped when the best fit is the article already under 继续阅读: the card
+            // above has it, and two cards pointing at one piece reads as a bug.
+            state.recommendation
+                ?.takeIf { it.article.id != state.continueReading?.id }
+                ?.let { recommendation ->
+                    item {
+                        Spacer(Modifier.height(20.dp))
+                        SectionHeader(
+                            title = "为你推荐",
+                            modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
+                        )
+                        RecommendCard(recommendation) { onOpenArticle(recommendation.article.id) }
+                    }
+                }
 
             if (state.recent.size > 1) {
                 item {
@@ -319,6 +337,63 @@ private fun ContinueCard(
                 )
             }
         }
+    }
+}
+
+/**
+ * The i+1 pick: the article whose unknown-word share sits closest to comfort.
+ *
+ * The tint follows the fit, and the reason is spelled out rather than left to the
+ * colour, because "偏易" and "刚好" are the whole point of the card — a bare title
+ * would be indistinguishable from the rows below it.
+ */
+@Composable
+private fun RecommendCard(recommendation: Recommendation, onClick: () -> Unit) {
+    val fit = AdaptiveReader.fit(recommendation.readiness.rate)
+    val tint = when (fit) {
+        Fit.Comfort -> Palette.Pine
+        Fit.Easy -> Palette.PineBright
+        Fit.Hard -> Palette.Amber
+    }
+    val fill = if (fit == Fit.Hard) Palette.AmberSoft else Palette.PineSoft
+    Column(
+        Modifier
+            .padding(horizontal = 20.dp)
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainer)
+            .clickable(onClick = onClick)
+            .padding(16.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Tag(fit.chip, tint, fill)
+            Spacer(Modifier.weight(1f))
+            Text(
+                text = "${recommendation.readiness.unknown} 个生词",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.height(10.dp))
+        Text(
+            text = recommendation.article.title,
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.onSurface,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = recommendation.reason,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(10.dp))
+        Text(
+            text = "开始读 →",
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.primary,
+        )
     }
 }
 

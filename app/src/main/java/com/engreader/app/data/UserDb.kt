@@ -133,6 +133,7 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
         db.execSQL("CREATE INDEX idx_quiz_article ON quiz(articleId)")
 
         createBookTable(db)
+        createVocabTable(db)
     }
 
     /**
@@ -167,6 +168,35 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
         )
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_book_recent ON book(lastReadAt DESC)")
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_article_book ON article(bookId, chapterIndex)")
+    }
+
+    /**
+     * One sitting of the vocabulary-size test.
+     *
+     * The estimate is stored with the interval it came with, and with the raw counts
+     * behind it, because the interval is the honest part of the answer: a bar chart of
+     * point estimates drawn from 64 yes/no answers would look far more precise than
+     * the test is. `sampled` and `known` let the screen redraw a past test's own
+     * confidence rather than re-deriving it from a number that has since been rounded.
+     *
+     * `IF NOT EXISTS` for the same reason as [createBookTable]: this runs from both
+     * `onCreate` and `onUpgrade`.
+     */
+    private fun createVocabTable(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS vocab_test (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                takenAt  INTEGER NOT NULL,
+                estimate INTEGER NOT NULL,
+                low      INTEGER NOT NULL,
+                high     INTEGER NOT NULL,
+                sampled  INTEGER NOT NULL DEFAULT 0,
+                known    INTEGER NOT NULL DEFAULT 0
+            )
+            """.trimIndent()
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_vocab_taken ON vocab_test(takenAt)")
     }
 
     /**
@@ -205,6 +235,12 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
             // every existing row starts at 0, which is the top of the text, and that is
             // the honest answer for an article whose position was never recorded.
             addColumn(db, "article", "readParagraph", "INTEGER NOT NULL DEFAULT 0")
+        }
+        if (oldVersion < 6) {
+            // The vocabulary-size test's history. A new table rather than a column, so
+            // there is nothing to backfill: an upgrade simply starts with no history,
+            // which is the truth — the test did not exist before.
+            createVocabTable(db)
         }
     }
 
@@ -246,6 +282,6 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
 
     companion object {
         const val NAME = "engreader.db"
-        const val VERSION = 5
+        const val VERSION = 6
     }
 }

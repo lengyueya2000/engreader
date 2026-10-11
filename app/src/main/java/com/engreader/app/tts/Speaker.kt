@@ -320,12 +320,38 @@ class Speaker(private val context: Context) {
     }
 
     /** Speaks a short word in isolation, used by the look-up sheet and the wordbook. */
-    fun sayWord(word: String, rate: Float = 0.8f) {
-        if (_state.value != SpeechState.Ready || word.isBlank()) return
+    fun sayWord(word: String, rate: Float = WORD_RATE) {
+        // The raw form, not `spoken`: a dictionary headword is spelled as it is listed,
+        // and the rewrite that helps a sentence would spell `Dr` as `Doctor` here.
+        sayOneShot(word, rate)
+    }
+
+    /**
+     * Speaks a phrase or a whole sentence at a walking pace, for the connected-speech
+     * panel's slow half.
+     *
+     * Goes through the same preparation as read-aloud rather than [sayWord]'s raw path,
+     * because the caller hands it a sentence as often as a two-word phrase and that
+     * sentence may carry a number or an abbreviation.
+     */
+    fun saySlow(text: String) = sayOneShot(spoken(text, SpeechRole.Reading), SLOW_RATE)
+
+    /** The same phrase at the reader's own rate, so the two can be compared. */
+    fun sayPhrase(text: String) = sayOneShot(spoken(text, SpeechRole.Reading), rate)
+
+    /**
+     * One utterance that must not advance the reading queue, at a rate of its own.
+     *
+     * Marked as a one-shot so its completion is swallowed: the queue is advanced by the
+     * same event stream, and a look-up or a slow replay firing mid-article would
+     * otherwise skip the reader to the next sentence.
+     */
+    private fun sayOneShot(text: String, rate: Float) {
+        if (_state.value != SpeechState.Ready || text.isBlank()) return
         oneShot = true
         if (_backend.value == SpeechBackend.Bundled) {
             neural.speak(
-                text = word,
+                text = text,
                 role = SpeechRole.Reading,
                 rate = rate,
                 onStart = {},
@@ -335,7 +361,7 @@ class Speaker(private val context: Context) {
         } else {
             val tts = engine ?: run { oneShot = false; return }
             tts.setSpeechRate(rate)
-            tts.speak(word, TextToSpeech.QUEUE_FLUSH, null, "word:${word.lowercase()}")
+            tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "one:${text.take(24).lowercase()}")
             tts.setSpeechRate(this.rate)
         }
     }
@@ -471,6 +497,12 @@ class Speaker(private val context: Context) {
     private companion object {
         const val TAG = "Speaker"
         const val PREVIEW_ID = "preview"
+
+        /** A headword on its own is easier to catch a shade slower than running prose. */
+        const val WORD_RATE = 0.8f
+
+        /** The connected-speech comparison rate: slow enough to hear the joins. */
+        const val SLOW_RATE = 0.6f
 
         /** Neutral sentence: covers the sounds a newsreader voice has to get right. */
         const val DEFAULT_PREVIEW =

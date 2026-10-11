@@ -1,6 +1,7 @@
 package com.engreader.app.ui.progress
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -42,6 +43,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import com.engreader.app.data.AppContainer
 import com.engreader.app.data.ProgressSnapshot
+import com.engreader.app.data.VocabResult
 import com.engreader.app.dict.DifficultyBand
 import com.engreader.app.ui.components.EmptyState
 import com.engreader.app.ui.components.HairLine
@@ -59,11 +61,16 @@ class ProgressViewModel(private val container: AppContainer) : ViewModel() {
     var loading by mutableStateOf(true)
         private set
 
+    /** The last vocabulary-size test, so the entry card can show its number. */
+    var vocab by mutableStateOf<VocabResult?>(null)
+        private set
+
     val goalMinutes: Int get() = container.settings.dailyGoalMinutes
 
     suspend fun load() {
         loading = true
         snapshot = container.progress.snapshot()
+        vocab = container.vocabTest.latest()
         loading = false
     }
 }
@@ -76,7 +83,7 @@ class ProgressViewModel(private val container: AppContainer) : ViewModel() {
  * words the user keeps looking up.
  */
 @Composable
-fun ProgressScreen(onOpenSettings: () -> Unit) {
+fun ProgressScreen(onOpenSettings: () -> Unit, onOpenVocabTest: () -> Unit) {
     val viewModel = containerViewModel(key = "progress") { ProgressViewModel(it) }
     val snapshot = viewModel.snapshot
 
@@ -192,6 +199,12 @@ fun ProgressScreen(onOpenSettings: () -> Unit) {
                 Spacer(Modifier.height(20.dp))
             }
 
+            item {
+                SectionHeader("词汇量", Modifier.padding(horizontal = 20.dp, vertical = 10.dp))
+                VocabCard(viewModel.vocab, onOpenVocabTest)
+                Spacer(Modifier.height(20.dp))
+            }
+
             if (snapshot.topWords.isNotEmpty()) {
                 item {
                     SectionHeader("反复查的词", Modifier.padding(horizontal = 20.dp, vertical = 10.dp))
@@ -222,6 +235,70 @@ fun ProgressScreen(onOpenSettings: () -> Unit) {
         }
     }
 }
+
+/**
+ * Entry point to the vocabulary-size test, and the last result if there is one.
+ *
+ * The interval travels with the number even here: the card is the only place most
+ * readers will ever see this figure, and a bare "8200 词" on a stats screen reads as a
+ * measurement rather than as the estimate it is.
+ */
+@Composable
+private fun VocabCard(vocab: VocabResult?, onOpen: () -> Unit) {
+    Column(
+        Modifier
+            .padding(horizontal = 20.dp)
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainer)
+            .clickable(onClick = onOpen)
+            .padding(16.dp),
+    ) {
+        if (vocab == null) {
+            Text(
+                text = "还没测过",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = "64 个词，约 2 分钟，估一个词汇量。之后每隔一段时间再测，能看到增长曲线。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else {
+            Row(verticalAlignment = Alignment.Bottom) {
+                Text(
+                    text = "${vocab.estimate}",
+                    style = MaterialTheme.typography.headlineMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    text = "词",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(bottom = 4.dp),
+                )
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = "区间 ${vocab.low}–${vocab.high} · 最高频 5 万词范围内 · 上次 ${vocab.takenAt.let(::shortDate)}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.height(10.dp))
+        Text(
+            text = if (vocab == null) "开始测试 →" else "再测一次 →",
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.primary,
+        )
+    }
+}
+
+/** `yyyy-MM-dd` from the shared day key, shortened to `MM-dd` for a card line. */
+private fun shortDate(millis: Long): String = com.engreader.app.data.DayKey.of(millis).drop(5)
 
 /**
  * Reading speed, with the change against the previous fortnight.

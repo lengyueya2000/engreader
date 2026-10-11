@@ -353,6 +353,28 @@ class Dictionary(private val context: Context) : Lexicon, FamilyLexicon {
     /** Related forms of [entry] for the look-up sheet's family panel. */
     fun family(entry: WordEntry): List<WordForm> = WordFamily.related(this, entry)
 
+    /**
+     * The [offset]-th headword in a COCA rank band, or null past the end.
+     *
+     * The vocabulary-size test needs the same word for the same `(band, offset)`, so
+     * the query is ordered — by rank, then spelling to break ties — and the caller
+     * picks offsets rather than rows. What counts as eligible is [BAND_FILTER]: a plain
+     * lowercase headword of two letters or more with a Chinese gloss, so the test never
+     * puts a phrase, a proper noun or an unglossed stub in front of the reader.
+     */
+    fun wordAtRank(from: Int, to: Int, offset: Int): String? =
+        open().rawQuery(
+            "SELECT word FROM word WHERE $BAND_FILTER ORDER BY frq, word LIMIT 1 OFFSET ?",
+            arrayOf(from.toString(), to.toString(), offset.toString()),
+        ).use { if (it.moveToFirst()) it.getString(0) else null }
+
+    /** How many headwords the band holds, so the sampler knows how wide it can stride. */
+    fun countInRank(from: Int, to: Int): Int =
+        open().rawQuery(
+            "SELECT COUNT(*) FROM word WHERE $BAND_FILTER",
+            arrayOf(from.toString(), to.toString()),
+        ).use { if (it.moveToFirst()) it.getInt(0) else 0 }
+
     /** Prefix suggestions for the wordbook search field. */
     override fun suggest(prefix: String, limit: Int): List<Pair<String, String>> {
         val p = prefix.trim().lowercase()
@@ -415,6 +437,17 @@ class Dictionary(private val context: Context) : Lexicon, FamilyLexicon {
 
         /** Entries kept in the look-up cache. A few hundred taps' worth, a few tens of KB. */
         private const val CACHE_LIMIT = 512
+
+        /**
+         * What counts as a word the vocabulary-size test may ask about.
+         *
+         * Shared by [wordAtRank] and [countInRank] so an offset can never drift from the
+         * count it was drawn against. `GLOB` is case-sensitive where `LIKE` is not,
+         * which is what makes the lowercase test exact.
+         */
+        private const val BAND_FILTER =
+            "frq BETWEEN ? AND ? AND translation <> '' " +
+                "AND word GLOB '[a-z]*' AND word NOT GLOB '*[^a-z]*' AND length(word) >= 2"
 
         /**
          * Escapes the `LIKE` wildcards so a typed prefix is matched literally.

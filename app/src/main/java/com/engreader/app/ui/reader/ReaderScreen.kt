@@ -315,7 +315,8 @@ fun ReaderScreen(
     val margin = with(density) { SCROLL_MARGIN.toPx() }
     // One instance for the whole list, so an unchanged wordbook lets every paragraph
     // skip recomposition instead of being redrawn on each state change.
-    val savedLemmas = remember(state.savedLemmas) { SavedLemmaSet(state.savedLemmas) }
+    val savedLemmas = remember(state.savedLemmas) { LemmaSet(state.savedLemmas) }
+    val dueLemmas = remember(state.dueLemmas) { LemmaSet(state.dueLemmas) }
     // The flat index of each paragraph's first sentence. The flat list is built
     // paragraph by paragraph, so this is normally just a running sum; it is computed
     // rather than assumed because a paragraph whose text holds no sentences at all
@@ -538,7 +539,9 @@ fun ReaderScreen(
                             paragraph = rp.paragraph,
                             sentences = rp.sentences,
                             savedLemmas = savedLemmas,
+                            dueLemmas = dueLemmas,
                             highlightSaved = state.highlightSaved,
+                            highlightDue = state.highlightDue,
                             listening = state.listening,
                             speakingSentenceIndex = state.flatSentences
                                 .getOrNull(state.speakingSentence)
@@ -558,6 +561,11 @@ fun ReaderScreen(
                             subtleColor = theme.subtle,
                             highlightColor = if (theme.isDark) Color(0xFF2E4A40) else Color(0xFFDCEDE4),
                             savedColor = if (theme.isDark) Color(0xFF7FC8B0) else Color(0xFF1F5A4A),
+                            // Amber, against the green of a saved word: a due word is
+                            // also saved, so the two styles land on the same span and
+                            // have to be told apart at a glance.
+                            dueColor = if (theme.isDark) Color(0xFFF0D9A8) else Color(0xFF7A4408),
+                            dueBackground = if (theme.isDark) Color(0xFF4A3A16) else Color(0xFFFBEBD3),
                             fontSize = state.fontSize,
                             lineHeightMultiplier = state.lineHeight,
                             onWordTap = { word, sentence ->
@@ -707,7 +715,11 @@ fun ReaderScreen(
     }
 
     state.analysis?.let { analysis ->
-        AnalysisSheet(analysis = analysis, onDismiss = viewModel::dismissAnalysis)
+        AnalysisSheet(
+            analysis = analysis,
+            onSpeakPhrase = viewModel::speakPhrase,
+            onDismiss = viewModel::dismissAnalysis,
+        )
     }
 
     if (state.newWordsVisible) {
@@ -763,6 +775,7 @@ fun ReaderScreen(
             lineHeight = state.lineHeight,
             theme = state.theme,
             highlightSaved = state.highlightSaved,
+            highlightDue = state.highlightDue,
             showTranslation = state.showTranslation,
             speechRate = state.speechRate,
             speechLocale = state.speechLocale,
@@ -774,6 +787,7 @@ fun ReaderScreen(
             onLineHeight = viewModel::setLineHeight,
             onTheme = viewModel::setTheme,
             onHighlightSaved = viewModel::setHighlightSaved,
+            onHighlightDue = viewModel::setHighlightDue,
             onShowTranslation = viewModel::setShowTranslation,
             onSpeechRate = viewModel::setSpeechRate,
             onSpeechLocale = viewModel::setSpeechLocale,
@@ -842,8 +856,10 @@ private fun TranslationNotice(
 private fun ParagraphBlock(
     paragraph: Paragraph,
     sentences: List<Sentence>,
-    savedLemmas: SavedLemmaSet,
+    savedLemmas: LemmaSet,
+    dueLemmas: LemmaSet,
     highlightSaved: Boolean,
+    highlightDue: Boolean,
     /** True while the article is being read aloud, so a tap jumps playback. */
     listening: Boolean,
     /**
@@ -869,6 +885,8 @@ private fun ParagraphBlock(
     subtleColor: Color,
     highlightColor: Color,
     savedColor: Color,
+    dueColor: Color,
+    dueBackground: Color,
     fontSize: Int,
     lineHeightMultiplier: Float,
     onWordTap: (String, String) -> Unit,
@@ -889,7 +907,9 @@ private fun ParagraphBlock(
                     indexInParagraph = index,
                     paragraph = paragraph,
                     savedLemmas = savedLemmas,
+                    dueLemmas = dueLemmas,
                     highlightSaved = highlightSaved,
+                    highlightDue = highlightDue,
                     listening = listening,
                     highlighted = index == speakingSentenceIndex,
                     flatIndex = if (firstFlatIndex >= 0) firstFlatIndex + index else -1,
@@ -898,6 +918,8 @@ private fun ParagraphBlock(
                     subtleColor = subtleColor,
                     highlightColor = highlightColor,
                     savedColor = savedColor,
+                    dueColor = dueColor,
+                    dueBackground = dueBackground,
                     fontSize = fontSize,
                     lineHeightMultiplier = lineHeightMultiplier,
                     onWordTap = onWordTap,
@@ -928,15 +950,22 @@ private fun ParagraphBlock(
         val spokenRange = remember(paragraph, speakingSentenceIndex) {
             spokenSentence?.let { it.start until it.end }
         }
-        val annotated = remember(paragraph, savedLemmas, spokenSentence, highlightSaved, highlightColor, savedColor) {
+        val annotated = remember(
+            paragraph, savedLemmas, dueLemmas, spokenSentence,
+            highlightSaved, highlightDue, highlightColor, savedColor, dueColor, dueBackground,
+        ) {
             buildEnglish(
                 text = paragraph.text,
                 tokens = paragraph.tokens,
                 highlight = spokenRange,
                 savedLemmas = savedLemmas.values,
+                dueLemmas = dueLemmas.values,
                 highlightSaved = highlightSaved,
+                highlightDue = highlightDue,
                 highlightColor = highlightColor,
                 savedColor = savedColor,
+                dueColor = dueColor,
+                dueBackground = dueBackground,
             )
         }
 
@@ -1054,8 +1083,10 @@ private fun SentenceBlock(
     /** Index of this sentence inside its paragraph, which is what playback jumps to. */
     indexInParagraph: Int,
     paragraph: Paragraph,
-    savedLemmas: SavedLemmaSet,
+    savedLemmas: LemmaSet,
+    dueLemmas: LemmaSet,
     highlightSaved: Boolean,
+    highlightDue: Boolean,
     listening: Boolean,
     highlighted: Boolean,
     /** Flat index of this sentence, which is what the auto-scroll looks up. */
@@ -1066,6 +1097,8 @@ private fun SentenceBlock(
     subtleColor: Color,
     highlightColor: Color,
     savedColor: Color,
+    dueColor: Color,
+    dueBackground: Color,
     fontSize: Int,
     lineHeightMultiplier: Float,
     onWordTap: (String, String) -> Unit,
@@ -1078,15 +1111,22 @@ private fun SentenceBlock(
             .filter { it.start >= sentence.start && it.start < sentence.end }
             .map { WordSpan(it.start - sentence.start, it.end.coerceAtMost(sentence.end) - sentence.start, it.text) }
     }
-    val annotated = remember(sentence, tokens, savedLemmas, highlighted, highlightSaved, highlightColor, savedColor) {
+    val annotated = remember(
+        sentence, tokens, savedLemmas, dueLemmas, highlighted,
+        highlightSaved, highlightDue, highlightColor, savedColor, dueColor, dueBackground,
+    ) {
         buildEnglish(
             text = sentence.text,
             tokens = tokens,
             highlight = if (highlighted) sentence.text.indices else null,
             savedLemmas = savedLemmas.values,
+            dueLemmas = dueLemmas.values,
             highlightSaved = highlightSaved,
+            highlightDue = highlightDue,
             highlightColor = highlightColor,
             savedColor = savedColor,
+            dueColor = dueColor,
+            dueBackground = dueBackground,
         )
     }
 
@@ -1136,24 +1176,31 @@ private fun SentenceBlock(
  * is replaced rather than mutated.
  */
 @Immutable
-private class SavedLemmaSet(val values: Set<String>) {
+private class LemmaSet(val values: Set<String>) {
     operator fun contains(lemma: String): Boolean = lemma in values
-    override fun equals(other: Any?): Boolean = other is SavedLemmaSet && values == other.values
+    override fun equals(other: Any?): Boolean = other is LemmaSet && values == other.values
     override fun hashCode(): Int = values.hashCode()
 }
 
 /**
- * The English run styled for the reader: the spoken sentence highlighted, and every
- * word already in the wordbook underlined. [tokens] are offsets into [text].
+ * The English run styled for the reader: the spoken sentence highlighted, every word
+ * already in the wordbook underlined, and every word whose review is due tinted.
+ *
+ * The due pass runs last so it wins the span: a due word is also a saved word, and the
+ * point of the mark is to pick it out of the saved ones. [tokens] are offsets into [text].
  */
 private fun buildEnglish(
     text: String,
     tokens: List<WordSpan>,
     highlight: IntRange?,
     savedLemmas: Set<String>,
+    dueLemmas: Set<String>,
     highlightSaved: Boolean,
+    highlightDue: Boolean,
     highlightColor: Color,
     savedColor: Color,
+    dueColor: Color,
+    dueBackground: Color,
 ) = buildAnnotatedString {
     append(text)
     highlight?.let { addStyle(SpanStyle(background = highlightColor), it.first, it.last + 1) }
@@ -1165,6 +1212,22 @@ private fun buildEnglish(
                     SpanStyle(
                         color = savedColor,
                         textDecoration = TextDecoration.Underline,
+                        fontWeight = FontWeight.Medium,
+                    ),
+                    token.start,
+                    token.end,
+                )
+            }
+        }
+    }
+    if (highlightDue) {
+        tokens.forEach { token ->
+            val lemma = Tokenizer.normalize(token.text)
+            if (lemma.isNotEmpty() && dueLemmas.contains(lemma)) {
+                addStyle(
+                    SpanStyle(
+                        color = dueColor,
+                        background = dueBackground,
                         fontWeight = FontWeight.Medium,
                     ),
                     token.start,

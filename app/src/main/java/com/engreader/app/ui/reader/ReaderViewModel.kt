@@ -5,7 +5,11 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.ViewModel
 import com.engreader.app.data.AppContainer
+import com.engreader.app.dict.PartOfSpeech
+import com.engreader.app.dict.RootBreakdown
+import com.engreader.app.dict.Roots
 import com.engreader.app.dict.WordEntry
+import com.engreader.app.dict.WordForm
 import com.engreader.app.model.Article
 import com.engreader.app.model.Book
 import com.engreader.app.model.ChapterRef
@@ -56,6 +60,14 @@ data class ReaderState(
     val analysis: SentenceAnalysis? = null,
     val analysisSentence: String = "",
     val savedLemmas: Set<String> = emptySet(),
+    /**
+     * Lemmas whose review has come due, marked in the body so review happens in context.
+     *
+     * A subset of [savedLemmas] in practice — a word is only scheduled once it is saved
+     * — but kept separate because the two are styled differently and can be turned on
+     * and off independently.
+     */
+    val dueLemmas: Set<String> = emptySet(),
     val quiz: List<QuizQuestion> = emptyList(),
     val quizVisible: Boolean = false,
     val fontSize: Int = 19,
@@ -67,6 +79,8 @@ data class ReaderState(
     val translationStatus: TranslationStatus = TranslationStatus.Idle,
     val translationError: String? = null,
     val highlightSaved: Boolean = true,
+    /** Whether words whose review is due are marked in the body. */
+    val highlightDue: Boolean = true,
     val speechRate: Float = 0.95f,
     val speechLocale: String = "en-GB",
     /** Bundled voice the reader picked, or blank to use the accent's default. */
@@ -132,10 +146,12 @@ data class LookupState(
     val entry: WordEntry?,
     val saved: Boolean,
     val loading: Boolean = false,
-    val glosses: List<Pair<com.engreader.app.dict.PartOfSpeech, String>> = emptyList(),
+    val glosses: List<Pair<PartOfSpeech, String>> = emptyList(),
     val inSentence: String = "",
     /** Related forms of the same word, shown so derivations are not learnt twice. */
-    val family: List<com.engreader.app.dict.WordForm> = emptyList(),
+    val family: List<WordForm> = emptyList(),
+    /** The word cut into prefix, root and suffix, when the table recognises it. */
+    val roots: RootBreakdown? = null,
     /**
      * True when the sheet should lead with the English definition.
      *
@@ -147,14 +163,37 @@ data class LookupState(
     val showChinese: Boolean = false,
 )
 
+/** Everything the look-up sheet shows, resolved in one background pass. */
+private data class LookupParts(
+    val entry: WordEntry?,
+    val glosses: List<Pair<PartOfSpeech, String>>,
+    val family: List<WordForm>,
+    val roots: RootBreakdown?,
+)
+
+/**
+ * Reads an entry's glosses, family and morpheme breakdown.
+ *
+ * The root cutter needs to know whether a remainder stands on its own — `un` + `happy`
+ * yes, `un` + `derstand` no — so the dictionary is handed to it as the predicate. That
+ * is a query per candidate, which is why this runs on the IO dispatcher with the rest.
+ */
+private fun AppContainer.lookupParts(entry: WordEntry?): LookupParts = LookupParts(
+    entry = entry,
+    glosses = entry?.let { dictionary.glosses(it.translation) } ?: emptyList(),
+    family = entry?.let { dictionary.family(it) } ?: emptyList(),
+    roots = entry?.let { Roots.explain(it.lemma) { candidate -> dictionary.lookup(candidate) != null } },
+)
+
 /** Builds the sheet's view of an entry, including its gloss breakdown. */
 private fun AppContainer.lookupState(
     query: String,
     entry: WordEntry?,
     saved: Boolean,
     sentence: String,
-    glosses: List<Pair<com.engreader.app.dict.PartOfSpeech, String>> = emptyList(),
-    family: List<com.engreader.app.dict.WordForm> = emptyList(),
+    glosses: List<Pair<PartOfSpeech, String>> = emptyList(),
+    family: List<WordForm> = emptyList(),
+    roots: RootBreakdown? = null,
 ) = LookupState(
     query = query,
     entry = entry,
@@ -163,6 +202,7 @@ private fun AppContainer.lookupState(
     glosses = glosses,
     inSentence = sentence,
     family = family,
+    roots = roots,
 )
 
 /**
@@ -284,6 +324,7 @@ class ReaderViewModel(
             paragraphs = paragraphs,
             flatSentences = flat,
             savedLemmas = container.wordbook.all().map { it.lemma.lowercase() }.toSet(),
+            dueLemmas = container.wordbook.dueLemmas(),
             quiz = article.quiz,
             fontSize = settings.fontSize,
             lineHeight = settings.lineHeight,
@@ -296,6 +337,7 @@ class ReaderViewModel(
                 TranslationStatus.Idle
             },
             highlightSaved = settings.highlightSavedWords,
+            highlightDue = settings.highlightDueWords,
             speechRate = settings.speechRate,
             speechLocale = settings.speechLocale,
             speechVoice = settings.speechVoice,
@@ -368,8 +410,12 @@ class ReaderViewModel(
     /** Saves every word in the article's new-word list, so a hard text can be pre-studied. */
     fun saveUnknownWords() {
         val unknown = state.vocabulary?.unknown.orEmpty()
+        val lemmas = unknown.map { it.lowercase() }
         state = state.copy(
-            savedLemmas = state.savedLemmas + unknown.map { it.lowercase() },
+            savedLemmas = state.savedLemmas + lemmas,
+            // Saving schedules the word for review now, so it is due from this moment:
+            // marking it here keeps the body's amber highlight in step with the write.
+            dueLemmas = state.dueLemmas + lemmas,
             newWordsVisible = false,
         )
         // The panel closes immediately and the writes continue on the container's
@@ -587,19 +633,16 @@ class ReaderViewModel(
         state = state.copy(
             lookup = LookupState(query = query, entry = null, saved = false, loading = true, inSentence = sentence),
         )
-        // The dictionary is a SQLite file and the gloss/family breakdown are two more
-        // queries; all of it used to run on the main thread under the sheet's spinner.
-        val (entry, glosses, family) = withContext(Dispatchers.IO) {
-            val found = container.dictionary.lookup(query)
-            Triple(
-                found,
-                found?.let { container.dictionary.glosses(it.translation) } ?: emptyList(),
-                found?.let { container.dictionary.family(it) } ?: emptyList(),
-            )
+        // The dictionary is a SQLite file and the gloss/family/root work is several
+        // more queries; all of it used to run on the main thread under the sheet's
+        // spinner.
+        val parts = withContext(Dispatchers.IO) {
+            container.lookupParts(container.dictionary.lookup(query))
         }
         // A tap that arrived while this was reading has already shown its own card, and
         // its answer is the one the reader is waiting for.
         if (generation != cardGeneration) return
+        val entry = parts.entry
         val saved = entry?.let { container.wordbook.contains(it.lemma) } ?: false
         // Once a word has been answered correctly the Chinese gloss steps back and
         // the English definition leads, with the gloss still one tap away. Only when
@@ -609,8 +652,9 @@ class ReaderViewModel(
             entry.hasEnglishDefinition &&
             container.wordbook.isKnown(entry.lemma)
         state = state.copy(
-            lookup = container.lookupState(query, entry, saved, sentence)
-                .copy(englishFirst = englishFirst, glosses = glosses, family = family),
+            lookup = container.lookupState(
+                query, entry, saved, sentence, parts.glosses, parts.family, parts.roots,
+            ).copy(englishFirst = englishFirst),
         )
         if (entry != null) {
             lookups++
@@ -620,6 +664,9 @@ class ReaderViewModel(
                 state = state.copy(
                     lookup = state.lookup?.copy(saved = true),
                     savedLemmas = state.savedLemmas + entry.lemma.lowercase(),
+                    // Saving schedules the first review for now, so the word is due the
+                    // moment it is saved; the body marks it without a reload.
+                    dueLemmas = state.dueLemmas + entry.lemma.lowercase(),
                 )
             }
         }
@@ -641,19 +688,17 @@ class ReaderViewModel(
         val lookup = state.lookup ?: return
         // The reading being left is offered as the alternative, so the switch can be
         // undone: without it the chip vanished and there was no way back.
-        val (entry, glosses, family) = withContext(Dispatchers.IO) {
+        val parts = withContext(Dispatchers.IO) {
             val found = container.dictionary
                 .lookupHeadword(headword, lookup.query, previous = lookup.entry) ?: return@withContext null
-            Triple(
-                found,
-                container.dictionary.glosses(found.translation),
-                container.dictionary.family(found),
-            )
+            container.lookupParts(found)
         } ?: return
+        val entry = parts.entry ?: return
         val saved = container.wordbook.contains(entry.lemma)
         state = state.copy(
             lookup = container.lookupState(
-                lookup.query, entry, saved, lookup.inSentence, glosses, family,
+                lookup.query, entry, saved, lookup.inSentence,
+                parts.glosses, parts.family, parts.roots,
             ).copy(
                 englishFirst = entry.hasEnglishDefinition &&
                     container.wordbook.isKnown(entry.lemma),
@@ -672,12 +717,16 @@ class ReaderViewModel(
             state = state.copy(
                 lookup = lookup.copy(saved = false),
                 savedLemmas = state.savedLemmas - entry.lemma.lowercase(),
+                // Removing the word takes it out of the review queue too, so the body
+                // must stop marking it.
+                dueLemmas = state.dueLemmas - entry.lemma.lowercase(),
             )
         } else {
             container.wordbook.save(entry)
             state = state.copy(
                 lookup = lookup.copy(saved = true),
                 savedLemmas = state.savedLemmas + entry.lemma.lowercase(),
+                dueLemmas = state.dueLemmas + entry.lemma.lowercase(),
             )
         }
     }
@@ -787,6 +836,11 @@ class ReaderViewModel(
     fun setHighlightSaved(value: Boolean) {
         container.settings.highlightSavedWords = value
         state = state.copy(highlightSaved = value)
+    }
+
+    fun setHighlightDue(value: Boolean) {
+        container.settings.highlightDueWords = value
+        state = state.copy(highlightDue = value)
     }
 
     fun setSpeechRate(rate: Float) {
@@ -1057,6 +1111,17 @@ class ReaderViewModel(
 
     fun speakWord(word: String) {
         container.speaker.sayWord(word)
+    }
+
+    /**
+     * Plays a phrase for the connected-speech panel: [slow] is the 0.6× comparison
+     * pace, otherwise the reader's own rate, so the two can be heard back to back.
+     *
+     * One-shot either way — the panel is opened from a tap, not from read-aloud, and
+     * a phrase spoken here must not advance the reading queue.
+     */
+    fun speakPhrase(text: String, slow: Boolean) {
+        if (slow) container.speaker.saySlow(text) else container.speaker.sayPhrase(text)
     }
 
     // ----------------------------------------------------------------- quiz
