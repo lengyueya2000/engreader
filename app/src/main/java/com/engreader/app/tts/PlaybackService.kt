@@ -181,12 +181,21 @@ class PlaybackService : Service() {
      * speaker, which is better than going silent.
      */
     private fun requestFocus() {
-        val attributes = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_MEDIA)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-            .build()
-        val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-            .setAudioAttributes(attributes)
+        // Built once and reused for the life of the service. The platform identifies a
+        // focus request by its listener, so a request built fresh on every start is a
+        // different client from the one already on the stack — and asking for focus
+        // again makes the framework hand `AUDIOFOCUS_LOSS` to the old one. That loss is
+        // this service's own pause trigger, so every start after the first paused itself
+        // a few milliseconds in: the voice never began, and the speaker button looked
+        // dead from the second tap onwards. One request, re-requested, is a no-op
+        // refresh of a client the framework already knows.
+        val request = focusRequest ?: AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build(),
+            )
             .setOnAudioFocusChangeListener { change ->
                 // Anything but a duck means the reader should stop talking: a call, or
                 // another player taking over for good.
@@ -197,7 +206,7 @@ class PlaybackService : Service() {
                 }
             }
             .build()
-        focusRequest = request
+            .also { focusRequest = it }
         runCatching { audioManager.requestAudioFocus(request) }
     }
 
