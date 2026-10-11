@@ -101,6 +101,37 @@ class ParagraphsTest {
         assertTrue(texts.contains("first-ever"))
         assertTrue(texts.contains("didn't"))
     }
+
+    /**
+     * The text-only path exists so a book search does not build word spans it never
+     * reads. A search hit reports a paragraph *index*, and the reader and the
+     * translation are indexed the same way, so the two splits have to agree paragraph
+     * for paragraph — not merely in length.
+     */
+    @Test
+    fun `the text-only split agrees with the tokenizing one`() {
+        val body = "One line.\n\nAnother para.\n\n  Third.  \n\n\n\nFourth, with\n" +
+            "a hard wrap inside it.\n\n   \n\nFifth."
+        assertEquals(
+            Paragraphs.split(body).map { it.text },
+            Paragraphs.texts(body),
+        )
+    }
+
+    @Test
+    fun `the text-only split trims, drops blanks and breaks on a single newline`() {
+        // A lone newline is a boundary, the same as a blank line. Book text never
+        // relies on that: BookText flattens source hard wraps before storing, so a
+        // paragraph that was wrapped at 72 columns arrives here as one line.
+        val texts = Paragraphs.texts("  First.  \n\n\n\nSecond,\nwrapped.\n\n   \n\nThird.")
+        assertEquals(listOf("First.", "Second,", "wrapped.", "Third."), texts)
+    }
+
+    @Test
+    fun `the text-only split of a blank body is empty`() {
+        assertTrue(Paragraphs.texts("").isEmpty())
+        assertTrue(Paragraphs.texts("\n\n  \n\n").isEmpty())
+    }
 }
 
 class TokenizerTest {

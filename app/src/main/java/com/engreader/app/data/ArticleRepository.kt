@@ -15,6 +15,7 @@ import com.engreader.app.source.ArticleExtractor
 import com.engreader.app.source.ArticleFetcher
 import com.engreader.app.source.Catalog
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -300,6 +301,11 @@ class ArticleRepository(
      * The scan is done in memory rather than with SQL `LIKE`, because a paragraph is the
      * unit of a result and the paragraph boundaries are the reader's, not the database's
      * — `LIKE` would have to be re-derived from the same text afterwards anyway.
+     *
+     * Reading a whole book off disk is the expensive part, so the loop checks for
+     * cancellation: the reader cancels the previous search on every keystroke, and
+     * without a check here a cancelled scan would still read every remaining chapter
+     * to the end while the next one waits behind it.
      */
     suspend fun search(
         bookId: Long,
@@ -323,19 +329,22 @@ class ArticleRepository(
             val title = c.getColumnIndexOrThrow("title")
             val body = c.getColumnIndexOrThrow("body")
             while (c.moveToNext() && hits.size < limit) {
+                // Once per chapter: a chapter is the largest unit the scan cannot
+                // interrupt, so this bounds the work left after a cancel.
+                ensureActive()
                 val rowId = c.getLong(idIndex)
                 val chapter = c.getInt(chapterIndex)
                 val chapterTitle = c.getString(title).orEmpty()
                 val text = c.getString(body).orEmpty()
-                Paragraphs.split(text).forEachIndexed { index, paragraph ->
+                Paragraphs.texts(text).forEachIndexed { index, paragraph ->
                     if (hits.size >= limit) return@forEachIndexed
-                    if (paragraph.text.contains(needle, ignoreCase = true)) {
+                    if (paragraph.contains(needle, ignoreCase = true)) {
                         hits += SearchHit(
                             articleId = rowId,
                             chapterIndex = chapter,
                             chapterTitle = chapterTitle,
                             paragraphIndex = index,
-                            text = paragraph.text,
+                            text = paragraph,
                         )
                     }
                 }

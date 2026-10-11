@@ -26,18 +26,37 @@ object Paragraphs {
      */
     private val WORD = Tokenizer.WORD
 
-    fun split(body: String): List<Paragraph> =
-        body.split(Regex("\n\\s*\n|\\n"))
+    /**
+     * Where one paragraph ends and the next begins.
+     *
+     * Compiled once: the search path runs this over every chapter of a book on each
+     * query, and building the pattern per call was pure overhead.
+     */
+    private val BREAK = Regex("\n\\s*\n|\\n")
+
+    /**
+     * The paragraph texts of [body], without tokenizing them.
+     *
+     * Searching a book only needs each paragraph's text, and building the word spans
+     * for a whole book costs several times what the match itself does. [split] is
+     * defined in terms of this, so the two can never disagree about where a paragraph
+     * starts — which is what keeps the paragraph index a search hit reports pointing
+     * at the same paragraph the reader and the translation are indexed by.
+     */
+    fun texts(body: String): List<String> =
+        body.split(BREAK)
             .map { it.trim() }
             .filter { it.isNotEmpty() }
-            .map { text ->
-                Paragraph(
-                    text = text,
-                    tokens = WORD.findAll(text).map {
-                        WordSpan(it.range.first, it.range.last + 1, it.value)
-                    }.toList(),
-                )
-            }
+
+    fun split(body: String): List<Paragraph> =
+        texts(body).map { text ->
+            Paragraph(
+                text = text,
+                tokens = WORD.findAll(text).map {
+                    WordSpan(it.range.first, it.range.last + 1, it.value)
+                }.toList(),
+            )
+        }
 
     /**
      * Maps a character offset from a click into the word covering it. Returns null
