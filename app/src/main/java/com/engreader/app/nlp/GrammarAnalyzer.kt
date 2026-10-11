@@ -40,7 +40,6 @@ data class Clause(
     val rest: String,
     val start: Int,
     val end: Int,
-    val depth: Int,
 )
 
 data class GrammarNote(val label: String, val detail: String)
@@ -97,6 +96,21 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
         "may", "might", "must", "ought", "need", "dare",
     )
 
+    /**
+     * Verbs whose stem ends in `-ing` rather than carrying it as a suffix.
+     *
+     * `-ing` is read as the participle ending, which is what makes `revealing` non-finite
+     * — but the three letters are only an ending when there is a verb underneath them.
+     * These are the English verbs there are not: `bring`, `sing`, `spring` and the rest
+     * of the `-ing`/`-ang`/`-ung` family. Every one of them was ruled out of being a
+     * finite verb *and* counted as a participle marker, so a sentence that opened
+     * "Bring the letter." had no finite verb at all and its clause went unsegmented.
+     */
+    private val ING_STEM_VERBS = setOf(
+        "bring", "cling", "fling", "ring", "sing", "sling", "spring", "sting",
+        "swing", "wring",
+    )
+
     /** Multi-word subordinators, matched before single tokens. */
     private val PHRASAL_SUBORDINATORS = listOf(
         "as if", "as though", "as long as", "as soon as", "as far as", "so that",
@@ -117,9 +131,7 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
 
         val markers = findClauseMarkers(sentence, tokens)
         val segments = segment(sentence, markers)
-        val clauses = segments.mapIndexed { index, seg ->
-            buildClause(seg, index, depth = if (seg.kind == ClauseKind.Main) 0 else 1)
-        }
+        val clauses = segments.mapIndexed { index, seg -> buildClause(seg, index) }
 
         // A sentence whose subject is separated from its verb by a relative or
         // participial phrase ("The report, published in 2020, revealed the evidence")
@@ -374,6 +386,7 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
 
     private fun isParticiple(word: String): Boolean {
         val w = word.lowercase()
+        if (w in ING_STEM_VERBS) return false
         return (w.endsWith("ing") || w.endsWith("ed") || w.endsWith("en")) && isVerb(w)
     }
 
@@ -569,7 +582,7 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
         out += Segment(text, start, start + text.length, kind, marker)
     }
 
-    private fun buildClause(segment: Segment, index: Int, depth: Int): Clause {
+    private fun buildClause(segment: Segment, index: Int): Clause {
         val tokens = Tokenizer.words(segment.text)
         val lower = tokens.map { it.lowercase() }
         val offsets = wordOffsets(segment.text, tokens)
@@ -632,7 +645,6 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
             rest = rest,
             start = segment.start,
             end = segment.end,
-            depth = depth,
         )
     }
 
@@ -882,7 +894,7 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
         // dictionary entry or suffix rule reaches.
         if (PartOfSpeechParser.contractionPos(w) == PartOfSpeech.Verb) return true
         if (index > 0 && lower[index - 1] == "to") return false
-        if (w.endsWith("ing")) return false
+        if (w.endsWith("ing") && w !in ING_STEM_VERBS) return false
         return posOf(w) == PartOfSpeech.Verb
     }
 

@@ -391,25 +391,33 @@ class NeuralTts(private val context: Context) {
             if (prefetchingText == text) return
             prefetchingText = text
         }
-        engineWorker.execute {
-            // The engine was replaced while this was queued; generating now would
-            // either use a freed native handle or record a clip for the wrong voice.
-            if (engineGeneration.get() != engineGen || engineFor(role) !== engine) {
-                synchronized(prefetchLock) { if (prefetchingText == text) prefetchingText = null }
-                return@execute
-            }
-            val audio = runCatching { engine.tts.generate(text = text, sid = sid, speed = rate) }.getOrNull()
-            synchronized(prefetchLock) {
-                if (prefetchingText == text) prefetchingText = null
-                val samples = audio?.samples
-                // A clip nobody asked for is harmless — `speak` only takes the one
-                // whose text and voice match — so no utterance token is checked here.
-                // Checking one would drop the clip in the normal case, because the
-                // next `speak` bumps the token while this generation is still running.
-                if (samples != null && samples.isNotEmpty() && engineGeneration.get() == engineGen) {
-                    prefetched = Clip(text, role, rate, sid, samples, audio.sampleRate, engineGen)
+        // `prefetchingText` is set before the task is queued, so a rejection — the worker
+        // is shut down once the voice is released — has to clear it. Left set, that text
+        // would be refused by the dedupe check above for the rest of the process.
+        val queued = runCatching {
+            engineWorker.execute {
+                // The engine was replaced while this was queued; generating now would
+                // either use a freed native handle or record a clip for the wrong voice.
+                if (engineGeneration.get() != engineGen || engineFor(role) !== engine) {
+                    synchronized(prefetchLock) { if (prefetchingText == text) prefetchingText = null }
+                    return@execute
+                }
+                val audio = runCatching { engine.tts.generate(text = text, sid = sid, speed = rate) }.getOrNull()
+                synchronized(prefetchLock) {
+                    if (prefetchingText == text) prefetchingText = null
+                    val samples = audio?.samples
+                    // A clip nobody asked for is harmless — `speak` only takes the one
+                    // whose text and voice match — so no utterance token is checked here.
+                    // Checking one would drop the clip in the normal case, because the
+                    // next `speak` bumps the token while this generation is still running.
+                    if (samples != null && samples.isNotEmpty() && engineGeneration.get() == engineGen) {
+                        prefetched = Clip(text, role, rate, sid, samples, audio.sampleRate, engineGen)
+                    }
                 }
             }
+        }
+        if (queued.isFailure) {
+            synchronized(prefetchLock) { if (prefetchingText == text) prefetchingText = null }
         }
     }
 
@@ -544,7 +552,15 @@ class NeuralTts(private val context: Context) {
         // A negative return is an error code, not a size; the fallback is half a
         // second. Either way the buffer has to be a whole number of frames, and a
         // mono float frame is four bytes — an unaligned size is rejected outright.
-        val base = if (requested > 0) requested else rate / 2 * BYTES_PER_FRAME
+        //
+        // `getMinBufferSize` is the smallest buffer the device will accept, not a
+        // recommendation: it leaves about two [CHUNK_SAMPLES] writes of headroom, so a
+        // playback thread descheduled for that long — a GC pause, or the engine worker
+        // saturating the cores with a long synthesis — underruns and the sentence clicks.
+        // Doubling it buys four chunks of headroom for ~90 ms of extra latency, which is
+        // still far below the pause between two sentences.
+        val minimum = if (requested > 0) requested else rate / 2 * BYTES_PER_FRAME
+        val base = minimum * BUFFER_MULTIPLIER
         val bufferBytes = ((base + BYTES_PER_FRAME - 1) / BYTES_PER_FRAME) * BYTES_PER_FRAME
         return AudioTrack.Builder()
             .setAudioAttributes(
@@ -683,6 +699,9 @@ class NeuralTts(private val context: Context) {
          * be heard as the sentence stubbornly continuing under the new one.
          */
         const val CHUNK_SAMPLES = 1024
+
+        /** Headroom over `getMinBufferSize`; see [openTrack]. */
+        const val BUFFER_MULTIPLIER = 2
 
         const val DRAIN_TIMEOUT_MS = 10_000L
         const val DRAIN_POLL_MS = 10L

@@ -75,7 +75,11 @@ class ProgressRepository(
         // only written when the reader closes, so the two can disagree mid-session.
         val lookups = count("SELECT COUNT(*) FROM lookup")
 
-        val week = days.take(7).sumOf { it.seconds }
+        // The last seven calendar days, not the seven most recent days that happen to
+        // have rows: a reader who studies every other day would otherwise see a "本周"
+        // figure reaching back a fortnight.
+        val weekKeys = DayKey.recent(7, System.currentTimeMillis())
+        val week = days.filter { it.day in weekKeys }.sumOf { it.seconds }
 
         ProgressSnapshot(
             streakDays = streak(days.map { it.day }),

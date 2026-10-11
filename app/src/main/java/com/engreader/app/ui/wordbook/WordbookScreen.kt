@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
@@ -285,7 +286,10 @@ private fun WordRow(
             BandChip(band)
             Spacer(Modifier.width(8.dp))
             StatusTag(word)
-            if (word.correct + word.wrong > 0) {
+            // `accuracy` reads as 0% for a word that has never been tested, which is
+            // indistinguishable from always wrong, so it is only shown once there is
+            // at least one review behind it.
+            if (word.attempts > 0) {
                 Spacer(Modifier.width(8.dp))
                 Text(
                     text = "正确率 ${(word.accuracy * 100).toInt()}%",
@@ -406,7 +410,10 @@ private fun SmallAction(label: String, onClick: () -> Unit, danger: Boolean = fa
             .clip(RoundedCornerShape(8.dp))
             .background(MaterialTheme.colorScheme.surfaceContainer)
             .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 8.dp),
+            // A label and 8dp of padding came out around 31dp tall, well under the 48dp
+            // a touch target needs. Reserved on the background so the text stays centred.
+            .heightIn(min = 48.dp)
+            .padding(horizontal = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         if (danger) {

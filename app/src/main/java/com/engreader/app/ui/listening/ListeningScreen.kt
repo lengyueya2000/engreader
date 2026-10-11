@@ -285,14 +285,6 @@ private fun Progress(state: ListeningSession.State) {
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            Spacer(Modifier.weight(1f))
-            if (!state.advanceChapter && state.bookId > 0L) {
-                Text(
-                    text = "读完本章停下",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
         }
     }
 }

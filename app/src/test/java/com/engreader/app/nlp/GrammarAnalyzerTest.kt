@@ -57,6 +57,17 @@ class GrammarAnalyzerTest {
     }
 
     @Test
+    fun `a verb whose stem ends in ing is still a finite verb`() {
+        // `bring`, `sing`, `spring` and the rest of the family are not participles: the
+        // three letters are part of the stem. They were ruled out of being finite verbs
+        // *and* counted as participle markers, so a sentence opening with one had no
+        // verb anywhere and its clause went unsegmented.
+        val analysis = analyzer.analyze("Bring the report to the minister.")
+        val main = analysis.clauses.first { it.kind == ClauseKind.Main }
+        assertEquals("Bring", main.verb.trim())
+    }
+
+    @Test
     fun `a because-clause is separated from the main clause`() {
         val analysis = analyzer.analyze(
             "The minister resigned because officials criticised the delay.",

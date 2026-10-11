@@ -24,10 +24,10 @@ import android.os.IBinder
  * application-wide [Speaker], and this only keeps the process alive, says what is
  * playing, and puts play/pause/stop on the lock screen.
  *
- * The controls work through [Hooks], which the reader registers while it is speaking;
- * nothing here reaches into the UI. Pausing keeps the session and its notification
- * alive — that is what makes the play button reappear — while stopping tears the whole
- * thing down, because the queue lives in the reader and cannot be rebuilt from here.
+ * The controls work through [Hooks], which [ListeningSession] registers once when the
+ * container is built; nothing here reaches into the UI. Pausing keeps the session and
+ * its notification alive — that is what makes the play button reappear — while stopping
+ * tears the whole thing down, and the queue it belongs to goes with it.
  */
 class PlaybackService : Service() {
 
@@ -75,7 +75,6 @@ class PlaybackService : Service() {
             )
             isActive = true
         }
-        requestFocus()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -104,6 +103,13 @@ class PlaybackService : Service() {
             else -> {
                 readExtras(intent)
                 playing = true
+                // Asked for here rather than in `onCreate`, which also runs for the
+                // commands above. Those are only ever delivered to a service that is
+                // already playing, so a service created to receive one is a stale
+                // command being retired — and taking audio focus for it would silence
+                // whatever the reader is actually listening to, a moment before
+                // `control` shut this one down again.
+                requestFocus()
                 startForeground(NOTIFICATION_ID, notification())
                 inForeground = true
                 publish()
@@ -135,6 +141,11 @@ class PlaybackService : Service() {
     }
 
     override fun onDestroy() {
+        // Explicit rather than relying on the platform to take the notification down
+        // with the service: this one is `setOngoing(true)`, and a foreground service
+        // that goes away without clearing its own notification leaves a card the reader
+        // cannot swipe away and that opens nothing.
+        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
         session?.isActive = false
         session?.release()
         session = null

@@ -405,11 +405,16 @@ object SpokenText {
      * of its own. Every other spelling is already correct and is left alone: `5 p.m.`,
      * `5 P.M.`, `5 pm` and `5 PM` all transcribe as "five pm", and the undotted forms
      * also include the verb `am`, which must not be touched.
+     *
+     * The match is anchored to a preceding digit, which is the only thing that makes it
+     * a time. Without the anchor the shape is just as common in names and initials, and
+     * `J. P. Morgan` came back as "J. p morgan" — the `P.` glued to the `M` of the
+     * surname, in every article that mentioned him.
      */
     private fun spellMeridiem(text: String): String {
         if (!text.contains('.')) return text
-        return text.replace(Regex("\\b([apAP])\\.\\s+([mM])\\.?")) { match ->
-            "${match.groupValues[1].lowercase()} ${match.groupValues[2].lowercase()}"
+        return text.replace(Regex("(\\d)\\s*([apAP])\\.\\s+([mM])\\.?")) { match ->
+            "${match.groupValues[1]} ${match.groupValues[2].lowercase()} ${match.groupValues[3].lowercase()}"
         }
     }
 

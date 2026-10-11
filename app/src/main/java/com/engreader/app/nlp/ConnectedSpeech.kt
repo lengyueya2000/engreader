@@ -100,7 +100,11 @@ object ConnectedSpeech {
      * spans the reader highlights.
      */
     fun explain(sentence: String, tokens: List<WordSpan>): List<SpeechFeature> {
-        if (tokens.size < 2) return emptyList()
+        // Not `< 2`: the rules that need a boundary skip themselves on a short list, and
+        // the two that live inside one word — the flap and the weak form — do not. A
+        // one-word paragraph is a heading or a shouted line, and `Water.` is exactly the
+        // case the flap rule is written for.
+        if (tokens.isEmpty()) return emptyList()
         val out = mutableListOf<SpeechFeature>()
         val lower = tokens.map { Tokenizer.normalize(it.text) }
 
@@ -205,7 +209,13 @@ object ConnectedSpeech {
                         end = tokens[i].end,
                         tip = "美音里两个元音之间的 `t` 变浊，听起来接近 `d`",
                     )
-                    return@flapped
+                    // One feature per word — the written form and the span are the same
+                    // whichever /t/ was found, and a second entry for the same span would
+                    // only be dropped by `explain`'s overlap pass. This was a
+                    // `return@flapped`, which left the whole function: the first word in a
+                    // sentence that flapped ended the scan, so `water bottle` reported
+                    // `water` and nothing else, and every later word went unexamined.
+                    break
                 }
                 at += if (doubled) 2 else 1
             }

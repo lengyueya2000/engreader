@@ -80,7 +80,9 @@ fun ListeningBar(
             Icon(Icons.Outlined.SkipPrevious, contentDescription = "上一句", tint = MaterialTheme.colorScheme.onPrimary)
         }
         IconButton(onClick = onToggle) {
-            Icon(Icons.Filled.Pause, contentDescription = "停止朗读", tint = MaterialTheme.colorScheme.onPrimary)
+            // The icon is a pause and the tap pauses; the label used to say 停止朗读,
+            // which is what a screen reader announced for a button that does not stop.
+            Icon(Icons.Filled.Pause, contentDescription = "暂停朗读", tint = MaterialTheme.colorScheme.onPrimary)
         }
         IconButton(onClick = onNext) {
             Icon(Icons.Outlined.SkipNext, contentDescription = "下一句", tint = MaterialTheme.colorScheme.onPrimary)

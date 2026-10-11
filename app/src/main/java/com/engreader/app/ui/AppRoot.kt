@@ -80,14 +80,20 @@ fun AppRoot(container: AppContainer) {
         // composed yet — so the URI waits here until the shelf is on screen to take it.
         var pendingImport by remember { mutableStateOf<Uri?>(null) }
 
+        // One way in to the shelf, so it cannot be stacked on itself. The import
+        // callback and the home tab's shelf button both come through here, and adding
+        // the overlay unconditionally pushed a second shelf on a second tap — two
+        // back-presses to get out of one screen.
+        val openShelf: () -> Unit = {
+            if (overlays.lastOrNull() !is Overlay.BookShelf) overlays.add(Overlay.BookShelf)
+        }
+
         val importLauncher = rememberLauncherForActivityResult(
             ActivityResultContracts.OpenDocument(),
         ) { uri ->
             if (uri != null) {
                 pendingImport = uri
-                if (overlays.lastOrNull() !is Overlay.BookShelf) {
-                    overlays.add(Overlay.BookShelf)
-                }
+                openShelf()
             }
         }
         val pickBook: () -> Unit = { importLauncher.launch(BookPicker.MIME_TYPES) }
@@ -146,7 +152,7 @@ fun AppRoot(container: AppContainer) {
                             onOpenArticle = openArticle,
                             onBrowse = { tab = Tab.Discover },
                             onOpenBook = { overlays.add(Overlay.BookDetail(it)) },
-                            onOpenShelf = { overlays.add(Overlay.BookShelf) },
+                            onOpenShelf = openShelf,
                             onImportBook = pickBook,
                         )
                         Tab.Discover -> DiscoverScreen(

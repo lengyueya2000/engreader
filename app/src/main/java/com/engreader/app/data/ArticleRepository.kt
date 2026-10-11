@@ -116,7 +116,13 @@ class ArticleRepository(
             // under the new English. It is dropped only when the text really changed:
             // rebuilding costs a network round-trip, and a re-fetch that returned the
             // same body leaves it valid.
-            if (!bodyUnchanged(existingId, body)) values.put("translation", "")
+            if (!bodyUnchanged(existingId, body)) {
+                values.put("translation", "")
+                // The stored quiz was built from the old body too, and its questions
+                // quote the old sentences. Unlike the translation it is regenerated on
+                // demand, so clearing it costs nothing but a rebuild.
+                values.put("quizJson", "")
+            }
             db.writableDatabase.update("article", values, "id = ?", arrayOf(existingId.toString()))
             existingId
         } else {

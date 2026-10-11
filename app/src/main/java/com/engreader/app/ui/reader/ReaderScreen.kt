@@ -6,6 +6,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,6 +18,7 @@ import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -25,6 +27,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -228,6 +231,7 @@ fun ReaderScreen(
     val spokenBounds = remember { SpokenBounds() }
     var showTypography by remember { mutableStateOf(false) }
     var showQuiz by remember { mutableStateOf(false) }
+    var preparingQuiz by remember { mutableStateOf(false) }
     val context = LocalContext.current
     /**
      * Asked for the first time the reader presses play, not at launch.
@@ -573,18 +577,33 @@ fun ReaderScreen(
                     item {
                         Spacer(Modifier.height(24.dp))
                         Row(
-                            Modifier.padding(horizontal = 22.dp),
+                            Modifier
+                                // Scrollable rather than merely clipped: three labels of
+                                // different lengths do not fit one row on a narrow screen,
+                                // and the row's own `softWrap = false` means the overflow
+                                // was cut off with no way to reach it.
+                                .horizontalScroll(rememberScrollState())
+                                .padding(horizontal = 22.dp),
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
                             ReaderAction(
-                                label = "做理解题",
+                                label = if (preparingQuiz) "出题中…" else "做理解题",
                                 icon = Icons.Outlined.Checklist,
                                 surface = if (theme.isDark) Color(0xFF262A2E) else Color(0xFFF0EBE1),
                                 content = theme.body,
                                 accent = if (theme.isDark) Palette.Mint else Palette.Pine,
+                                busy = preparingQuiz,
                             ) {
+                                if (preparingQuiz) return@ReaderAction
+                                // Building the questions re-reads the whole article and
+                                // looks every candidate up in the dictionary, which is the
+                                // heaviest thing the reader does on demand. Awaiting it
+                                // before showing the sheet left the tap looking ignored
+                                // for as long as it took.
+                                preparingQuiz = true
                                 scope.launch {
                                     viewModel.prepareQuiz()
+                                    preparingQuiz = false
                                     showQuiz = true
                                 }
                             }
@@ -1395,17 +1414,27 @@ private fun ReaderAction(
     surface: Color,
     content: Color,
     accent: Color,
+    /** Swaps the icon for a spinner and refuses taps, while the action is working. */
+    busy: Boolean = false,
     onClick: () -> Unit,
 ) {
     Row(
         Modifier
             .clip(RoundedCornerShape(10.dp))
             .background(surface)
-            .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 10.dp),
+            .clickable(enabled = !busy, onClick = onClick)
+            // The three of these are a row of small chips, which came out around 38dp
+            // tall — under the 48dp a touch target needs. The height is reserved on the
+            // background rather than by growing the padding, so the label stays centred.
+            .heightIn(min = 48.dp)
+            .padding(horizontal = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(icon, contentDescription = null, tint = accent, modifier = Modifier.size(18.dp))
+        if (busy) {
+            CircularProgressIndicator(strokeWidth = 2.dp, color = accent, modifier = Modifier.size(18.dp))
+        } else {
+            Icon(icon, contentDescription = null, tint = accent, modifier = Modifier.size(18.dp))
+        }
         Spacer(Modifier.width(6.dp))
         // Three of these share one row; without this the last label wraps to two
         // lines and the buttons no longer line up.

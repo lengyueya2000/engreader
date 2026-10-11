@@ -93,6 +93,12 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
      * is one dictionary pass, and the home list is a browsing surface where a missing
      * badge is much better than a stalled screen. The recommendation rides along on the
      * same pass, so it costs nothing beyond what the badges already pay.
+     *
+     * The pass itself runs on `Dispatchers.Default` rather than on the caller's. `load`
+     * is called from a `LaunchedEffect`, so the caller's dispatcher is the main thread —
+     * and a dictionary lookup per lemma over several articles is enough work to drop
+     * frames while the list is being drawn. Only the body is moved: the two suspend calls
+     * above already pick their own dispatcher, and moving them would nest the hops.
      */
     private suspend fun profile(articles: List<Article>): Profile {
         val known = runCatching { container.wordbook.knownLemmas() }.getOrDefault(emptySet())
@@ -101,34 +107,36 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
         // all, and the pick below would be "shortest" dressed up as i+1.
         val estimate = runCatching { container.vocabTest.latest()?.estimate }.getOrNull()
         val hasSignal = known.isNotEmpty() || estimate != null
-        val counts = HashMap<Long, Int>()
-        val readiness = ArrayList<Readiness>()
-        val byId = HashMap<Long, Article>()
-        for (article in articles.take(MAX_PROFILED_ROWS)) {
-            runCatching {
-                val lemmas = container.articles.contentLemmas(article)
-                if (lemmas.size < VocabularyProfile.MIN_PROFILED_LEMMAS) return@runCatching
-                val baseline = AdaptiveReader.baselineKnown(lemmas, estimate) { lemma ->
-                    container.dictionary.lookup(lemma)?.frq ?: 0
+        return withContext(Dispatchers.Default) {
+            val counts = HashMap<Long, Int>()
+            val readiness = ArrayList<Readiness>()
+            val byId = HashMap<Long, Article>()
+            for (article in articles.take(MAX_PROFILED_ROWS)) {
+                runCatching {
+                    val lemmas = container.articles.contentLemmas(article)
+                    if (lemmas.size < VocabularyProfile.MIN_PROFILED_LEMMAS) return@runCatching
+                    val baseline = AdaptiveReader.baselineKnown(lemmas, estimate) { lemma ->
+                        container.dictionary.lookup(lemma)?.frq ?: 0
+                    }
+                    val result = container.vocabulary.assess(lemmas, known + baseline)
+                    // A zero-unknown article keeps no badge, but it is still a candidate for
+                    // the recommendation — it is the right pick when everything else is hard.
+                    if (result.unknown.isNotEmpty()) counts[article.id] = result.unknown.size
+                    readiness += Readiness(article.id, result.unknown.size, lemmas.size)
+                    byId[article.id] = article
                 }
-                val result = container.vocabulary.assess(lemmas, known + baseline)
-                // A zero-unknown article keeps no badge, but it is still a candidate for
-                // the recommendation — it is the right pick when everything else is hard.
-                if (result.unknown.isNotEmpty()) counts[article.id] = result.unknown.size
-                readiness += Readiness(article.id, result.unknown.size, lemmas.size)
-                byId[article.id] = article
             }
+            val pick = AdaptiveReader.pick(readiness)
+            val article = pick?.let { byId[it.id] }
+            Profile(
+                counts = counts,
+                recommendation = if (!hasSignal || pick == null || article == null) {
+                    null
+                } else {
+                    Recommendation(article, pick, AdaptiveReader.reason(pick))
+                },
+            )
         }
-        val pick = AdaptiveReader.pick(readiness)
-        val article = pick?.let { byId[it.id] }
-        return Profile(
-            counts = counts,
-            recommendation = if (!hasSignal || pick == null || article == null) {
-                null
-            } else {
-                Recommendation(article, pick, AdaptiveReader.reason(pick))
-            },
-        )
     }
 
     private data class Profile(val counts: Map<Long, Int>, val recommendation: Recommendation?)

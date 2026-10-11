@@ -134,6 +134,20 @@ class SpokenTextTest {
     }
 
     @Test
+    fun `a meridiem shape inside a name is left alone`() {
+        // The rule is anchored to a digit because the same shape is everywhere in names
+        // and initials, and a meridiem it is not: `J. P. Morgan` used to be handed to the
+        // voice as "J. p morgan", with the `P.` glued to the surname's first letter.
+        for (text in listOf(
+            "J. P. Morgan was there.",
+            "A. M. Turing wrote it down.",
+            "Dr. P. Martin arrived late.",
+        )) {
+            assertEquals(text, SpokenText.of(text))
+        }
+    }
+
+    @Test
     fun `an illustration note is dropped`() {
         assertEquals(
             "This was invitation enough.",

@@ -115,11 +115,36 @@ class ConnectedSpeechTest {
     }
 
     @Test
-    fun `a single token has nothing to explain`() {
+    fun `a single word still gets the rules that live inside it`() {
+        // A one-word paragraph is a heading or a shouted line. The flap is a rule about
+        // one word, so it needs no neighbour — this used to return nothing at all,
+        // because the whole rule table was skipped below two tokens.
+        val sentence = "Water."
+        val tokens = tokensOf(sentence)
+        assertEquals(1, tokens.size)
+        val feature = ConnectedSpeech.explain(sentence, tokens).single()
+        assertEquals(Kind.Flap, feature.kind)
+        assertEquals("wader", feature.sounds)
+    }
+
+    @Test
+    fun `a single word with no rule of its own explains nothing`() {
         val sentence = "Go."
         val tokens = tokensOf(sentence)
         assertEquals(1, tokens.size)
         assertTrue(ConnectedSpeech.explain(sentence, tokens).isEmpty())
+    }
+
+    @Test
+    fun `a flap in an early word does not end the scan`() {
+        // The flap loop used to `return` from the whole function on its first hit, so a
+        // sentence reported the first word that flapped and then nothing — `water
+        // bottle` explained `water` and stopped.
+        val features = explain("The water bottle is on the table.")
+        assertEquals(
+            listOf("water", "bottle"),
+            features.filter { it.kind == Kind.Flap }.map { it.written },
+        )
     }
 
     @Test

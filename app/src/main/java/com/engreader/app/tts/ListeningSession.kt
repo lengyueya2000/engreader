@@ -3,6 +3,7 @@ package com.engreader.app.tts
 import com.engreader.app.data.AppContainer
 import com.engreader.app.nlp.Paragraphs
 import com.engreader.app.nlp.Sentences
+import com.engreader.app.nlp.Tokenizer
 import com.engreader.app.translate.SentenceAlignment
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -10,9 +11,11 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Which sleep timer the listener picked.
@@ -76,8 +79,15 @@ object SleepTimer {
  */
 class ListeningSession(private val container: AppContainer) {
 
-    /** One thing to say: an English sentence, and its Chinese when there is one. */
-    private class Spoken(val text: String, val chinese: String?, val paragraph: Int)
+    /**
+     * One thing to say: an English sentence, and its Chinese when there is one.
+     *
+     * [words] is the running total of English words up to and including this sentence,
+     * not this sentence's own count. A flush has to report how much of the piece has
+     * been covered, and summing the queue on every flush would be O(n) work on the
+     * main thread for a number that only ever grows by one sentence's worth.
+     */
+    private class Spoken(val text: String, val chinese: String?, val paragraph: Int, val words: Int)
 
     data class State(
         /** True once a piece is loaded, whether or not the voice is currently going. */
@@ -100,13 +110,7 @@ class ListeningSession(private val container: AppContainer) {
         val sleep: SleepOption = SleepOption.Off,
         /** Epoch millis the clock-based sleep option fires, or 0 when there is none. */
         val sleepUntil: Long = 0L,
-        /** False when the listener asked to stop at the end of this piece instead. */
-        val advanceChapter: Boolean = true,
-    ) {
-        val hasNextChapter: Boolean get() = chapterCount > 1 && chapterIndex < chapterCount - 1
-        val hasPreviousChapter: Boolean get() = chapterCount > 1 && chapterIndex > 0
-        val positionLabel: String get() = if (total == 0) "" else "${index + 1} / $total"
-    }
+    )
 
     private val _state = MutableStateFlow(State())
     val state: StateFlow<State> = _state.asStateFlow()
@@ -114,7 +118,22 @@ class ListeningSession(private val container: AppContainer) {
     private var queue: List<Spoken> = emptyList()
     private var collectJob: Job? = null
     private var timerJob: Job? = null
+    private var loadJob: Job? = null
+    private var advanceJob: Job? = null
     private var lastIndex = -1
+
+    /**
+     * Bumped by every [open] and [stop].
+     *
+     * Loading a piece suspends — reading the article, splitting the body — and so does
+     * looking up the next chapter. The session can be replaced or stopped across any of
+     * those suspensions, so a continuation captures the value it started under and
+     * checks it before touching the queue or the voice. Without it, opening B while A
+     * was still loading ended with A's sentences being spoken under B's title, and
+     * stopping while a chapter lookup was in flight started the next chapter of a
+     * session the listener had already dismissed.
+     */
+    private var sessionGeneration = 0
 
     /**
      * Where a pause left off, so resuming continues instead of restarting.
@@ -189,12 +208,15 @@ class ListeningSession(private val container: AppContainer) {
         if (!current.active || queue.isEmpty()) return
         val from = if (pausedIndex >= 0) pausedIndex else current.index
         pausedIndex = -1
+        // The clock starts again here rather than at pause(): time spent paused is not
+        // listening time, and `startedAt` is what the next flush measures against.
+        startedAt = System.currentTimeMillis()
         speakAt(from)
-        openService()
     }
 
     fun stop() {
         val current = _state.value
+        sessionGeneration++
         cancelJobs()
         container.speaker.stop()
         lastIndex = -1
@@ -230,10 +252,6 @@ class ListeningSession(private val container: AppContainer) {
         if (_state.value.active) startSleepTimer()
     }
 
-    fun setAdvanceChapter(value: Boolean) {
-        _state.update { it.copy(advanceChapter = value) }
-    }
-
     /**
      * Playback speed, shared with the reader's own setting.
      *
@@ -250,12 +268,28 @@ class ListeningSession(private val container: AppContainer) {
     // -------------------------------------------------------------------- queue
 
     private fun open(articleId: Long, fromIndex: Int) {
+        // The outgoing piece is flushed first, while the queue and the clock that
+        // describe it are still in place. Rolling into the next chapter and switching
+        // straight from one article to another both come through here, and without this
+        // the time spent on the piece being left would be dropped.
+        if (_state.value.active && _state.value.articleId != articleId) writeProgress(_state.value)
         cancelJobs()
         container.speaker.stop()
         lastIndex = -1
         pausedIndex = -1
         ending = false
+        startedAt = 0L
         queue = emptyList()
+        val generation = ++sessionGeneration
+        // The voice is asked for before the body is read, so the model loads while the
+        // text is being split instead of after it. Loading it lazily on the first
+        // `speak` would drop that first sentence: `Speaker.speak` is a no-op until the
+        // engine reports Ready, and nothing retries it.
+        container.speaker.prepare(
+            rate = container.settings.speechRate,
+            localeTag = container.settings.speechLocale,
+            voiceId = container.settings.speechVoice,
+        )
         // The sleep choice survives a chapter change — it was a promise about the
         // sitting, not about the piece — so it is carried into the fresh state.
         _state.update {
@@ -265,24 +299,48 @@ class ListeningSession(private val container: AppContainer) {
                 loading = true,
                 sleep = it.sleep,
                 sleepUntil = it.sleepUntil,
-                advanceChapter = it.advanceChapter,
             )
         }
-        container.appScope.launch {
-            if (!load(articleId)) {
+        loadJob = container.appScope.launch {
+            if (!load(articleId, generation)) {
+                if (generation != sessionGeneration) return@launch
                 _state.update { it.copy(active = false, loading = false, error = "这篇内容读不出来") }
                 return@launch
             }
+            // The session was replaced or stopped while the body was being read.
+            if (generation != sessionGeneration) return@launch
+            // The voice is still loading its model when the body is already split, and
+            // `Speaker.speak` before it is Ready reports the utterance as failed rather
+            // than queueing it. Waiting here is what makes the first sentence audible
+            // when listening is started from a screen that never prepared the voice —
+            // the book shelf's chapter row is the one that does that.
+            awaitVoice()
+            if (generation != sessionGeneration) return@launch
             // Started before the first utterance: the event flow has no replay, so a
             // collector that arrived late would miss the end of the sentence it came for.
             collectJob = container.appScope.launch { observeEvents() }
             startSleepTimer()
             speakAt(fromIndex.coerceIn(0, (queue.size - 1).coerceAtLeast(0)))
-            openService()
         }
     }
 
-    private suspend fun load(articleId: Long): Boolean {
+    /**
+     * Waits for the voice to finish loading, or for it to give up.
+     *
+     * A bounded wait rather than an unbounded one: the model is 19 MB and a device with
+     * no usable voice reports [SpeechState.Unavailable], and a queue that waited for a
+     * voice that never arrives would sit on a loading spinner forever with no way to
+     * find out why. On timeout the first [Speaker.speak] reports the failure and the
+     * session stops with a reason.
+     */
+    private suspend fun awaitVoice(timeoutMs: Long = VOICE_WAIT_MS) {
+        if (container.speaker.state.value != SpeechState.Preparing) return
+        withTimeoutOrNull(timeoutMs) {
+            container.speaker.state.first { it != SpeechState.Preparing }
+        }
+    }
+
+    private suspend fun load(articleId: Long, generation: Int): Boolean {
         val article = container.articles.get(articleId) ?: return false
         val book = if (article.bookId > 0L) container.books.bookOfChapter(articleId) else null
         val chapters = if (article.bookId > 0L) container.books.chapters(article.bookId) else emptyList()
@@ -291,16 +349,19 @@ class ListeningSession(private val container: AppContainer) {
         // runs while the listener is waiting for the first sentence.
         val spoken = withContext(Dispatchers.Default) {
             buildList {
+                var cumulative = 0
                 Paragraphs.split(article.body).forEachIndexed { paragraphIndex, paragraph ->
                     val english = Sentences.split(paragraph.text).map { it.text }
                     val chinese = translation.getOrNull(paragraphIndex)
                         ?.let { SentenceAlignment.align(english, it) }
                     english.forEachIndexed { sentenceIndex, text ->
-                        add(Spoken(text, chinese?.getOrNull(sentenceIndex), paragraphIndex))
+                        cumulative += Tokenizer.countWords(text)
+                        add(Spoken(text, chinese?.getOrNull(sentenceIndex), paragraphIndex, cumulative))
                     }
                 }
             }
         }
+        if (generation != sessionGeneration) return false
         queue = spoken
         startedAt = System.currentTimeMillis()
         _state.update {
@@ -331,6 +392,11 @@ class ListeningSession(private val container: AppContainer) {
             return
         }
         ending = false
+        // Any sentence spoken from here on supersedes a pause, whichever way the
+        // listener got here. Left set, a resume() after a skip would jump back to the
+        // sentence the pause had left off on instead of the one now playing.
+        pausedIndex = -1
+        val wasPlaying = _state.value.playing
         lastIndex = index
         val spoken = queue[index]
         _state.update {
@@ -351,13 +417,22 @@ class ListeningSession(private val container: AppContainer) {
         if (container.settings.speakTranslation) container.speaker.prepareTranslation()
         container.speaker.speak(queue[index].text, UtteranceId.english(index))
         prefetchAfter(index)
+        // The notification's middle button and the lock screen both read `playing`, and
+        // a skip or a seek from a paused state starts audio without going through
+        // resume(). Without this the shade would still offer 继续 while the voice was
+        // already going. Starting the service and updating it are the same call: an
+        // ACTION_START on a service that is already up only rewrites its notification.
+        if (!wasPlaying) openService()
     }
 
     private fun speakTranslationAt(index: Int, chinese: String) {
         container.speaker.speak(chinese, UtteranceId.translation(index), SpeechRole.Translation)
-        queue.getOrNull(index + 1)?.let {
-            container.speaker.prefetch(it.text, SpeechRole.Translation)
-        }
+        // What follows this Chinese line is the next sentence's English, so that is what
+        // is worth synthesising now. Prefetching the next *Chinese* line here asked the
+        // Mandarin engine for a sentence that would not be wanted for another two
+        // utterances, and left the English one — the one actually about to play —
+        // to be synthesised from scratch after the Chinese finished.
+        queue.getOrNull(index + 1)?.let { container.speaker.prefetch(it.text, SpeechRole.Reading) }
     }
 
     /**
@@ -423,6 +498,10 @@ class ListeningSession(private val container: AppContainer) {
      * is not just the reader with the screen off: twenty minutes of a novel should not
      * need a hand on the phone. A standalone article, the last chapter, and a listener
      * who asked to stop at the end all end the session instead.
+     *
+     * "Stop at the end of this piece" is [SleepOption.EndOfPiece] rather than a flag of
+     * its own: it is one of the sleep choices the listener picks from, and a second
+     * switch for the same promise could disagree with it.
      */
     private fun endOfPiece() {
         if (ending) return
@@ -436,19 +515,23 @@ class ListeningSession(private val container: AppContainer) {
             pause()
             return
         }
-        if (!current.advanceChapter || current.bookId <= 0L) {
+        if (current.bookId <= 0L) {
             stop()
             return
         }
-        container.appScope.launch {
+        val generation = sessionGeneration
+        advanceJob = container.appScope.launch {
             val next = runCatching {
                 container.books.chapterIdAt(current.bookId, current.chapterIndex + 1)
             }.getOrNull()
+            // The session was stopped, or replaced with another piece, while the next
+            // chapter was being looked up.
+            if (generation != sessionGeneration) return@launch
             if (next == null) {
                 stop()
                 return@launch
             }
-            writeProgress(current)
+            // `open` flushes the piece being left itself, so there is no second call here.
             open(next, 0)
         }
     }
@@ -470,7 +553,14 @@ class ListeningSession(private val container: AppContainer) {
                 if (left <= 0L) break
                 delay(minOf(left, 1_000L))
             }
-            if (_state.value.active) pause()
+            if (_state.value.active) {
+                // The clock has run out, so the choice goes back to 关 and the label
+                // clears. Left armed, `sleepUntil` stayed in the past: the screen would
+                // read 即将停止 for the rest of the sitting, and a chapter change would
+                // re-arm on a deadline that had already passed and stop instantly.
+                _state.update { it.copy(sleep = SleepOption.Off, sleepUntil = 0L) }
+                pause()
+            }
         }
     }
 
@@ -484,6 +574,10 @@ class ListeningSession(private val container: AppContainer) {
         collectJob = null
         timerJob?.cancel()
         timerJob = null
+        loadJob?.cancel()
+        loadJob = null
+        advanceJob?.cancel()
+        advanceJob = null
     }
 
     /**
@@ -491,15 +585,24 @@ class ListeningSession(private val container: AppContainer) {
      *
      * Listening is reading: without this, an article heard all the way through would
      * still be offered from the top, and the time spent would not count towards the
-     * daily goal.
+     * daily goal. The session row is what the goal, the streak and the speed chart are
+     * built from, so it is written here as well as the article's own running total.
      */
     private fun writeProgress(current: State) {
         val articleId = current.articleId
         if (articleId <= 0L || !current.active) return
-        val paragraph = queue.getOrNull(current.index)?.paragraph
-        val seconds = ((System.currentTimeMillis() - startedAt) / 1000L).toInt()
-        startedAt = System.currentTimeMillis()
+        val spoken = queue.getOrNull(current.index)
+        val paragraph = spoken?.paragraph
+        // `stop()` reaches here on a piece that never finished loading, when there is no
+        // start time to measure from — the difference would be the whole epoch.
+        val now = System.currentTimeMillis()
+        val seconds = if (startedAt <= 0L) 0 else ((now - startedAt) / 1000L).toInt()
+        startedAt = if (startedAt <= 0L) 0L else now
         if (paragraph == null && seconds <= 0) return
+        // Coverage, not words gained: it repeats across the flushes of one sitting and
+        // the speed figure takes the maximum per article. Reported only alongside real
+        // seconds, because a row with time and no position would drag the average down.
+        val words = if (seconds > 0) spoken?.words ?: 0 else 0
         container.appScope.launch {
             if (paragraph != null) {
                 runCatching { container.articles.setReadParagraph(articleId, paragraph) }
@@ -510,6 +613,19 @@ class ListeningSession(private val container: AppContainer) {
                     runCatching { container.books.addReadSeconds(current.bookId, seconds) }
                 }
             }
+            runCatching { container.wordbook.recordSession(articleId, seconds, words, 0) }
         }
+    }
+
+    private companion object {
+        /**
+         * How long [awaitVoice] waits for the bundled model before giving up.
+         *
+         * Generous: the graph is 19 MB and a cold load on a slow device takes a few
+         * seconds, and the cost of waiting too long is only that the first sentence
+         * starts late. The cost of not waiting long enough is the session stopping on
+         * its first line, which reads as the feature being broken.
+         */
+        const val VOICE_WAIT_MS = 15_000L
     }
 }

@@ -142,10 +142,10 @@ object Sentences {
         if (bare in SENTENCE_FINAL) return !continuesPhrase(s, after)
         if (bare in ABBREVIATIONS) return false
         if (bare in AMBIGUOUS && continuesPhrase(s, after)) return false
-        // Decimal or version number: digit on both sides.
-        if (terminator > 0 && terminator + 1 < s.length &&
-            s[terminator - 1].isDigit() && s[terminator + 1].isDigit()
-        ) return false
+        // No decimal test here: `3.5` never reaches this point. A terminator only gets
+        // this far when what follows it is whitespace (or a closer and then whitespace),
+        // and the digit of a decimal is neither, so the check that used to sit here could
+        // not be true. The doc above still holds, by way of that whitespace requirement.
         return true
     }
 

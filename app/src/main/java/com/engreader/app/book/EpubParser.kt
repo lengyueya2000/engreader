@@ -161,10 +161,21 @@ object EpubParser {
      * An OPF or XHTML part is not necessarily UTF-8 — books from older converters are
      * windows-1252 or UTF-16, and their declaration says so. Reading those as UTF-8
      * mangles every accented character before the extractor ever sees it.
+     *
+     * A byte-order mark is decided from the bytes, before the declaration is read. Java's
+     * UTF-8 decoder does not remove one, so a BOM'd file used to keep the character and
+     * it opened the first word of the first paragraph — `\uFEFFCHAPTER` is not a word
+     * the tokenizer or the dictionary recognises. The Latin-1 preview cannot be used to
+     * find it either: the three UTF-8 bytes decode to `ï»¿`, not to U+FEFF, which is why
+     * the test that was here never matched anything.
      */
     private fun decodeXml(bytes: ByteArray): String {
+        if (bytes.size >= 3 && bytes[0] == 0xEF.toByte() &&
+            bytes[1] == 0xBB.toByte() && bytes[2] == 0xBF.toByte()
+        ) {
+            return String(bytes, 3, bytes.size - 3, Charsets.UTF_8)
+        }
         val head = String(bytes, 0, minOf(bytes.size, 200), Charsets.ISO_8859_1)
-        if (head.startsWith("\uFEFF")) return String(bytes, Charsets.UTF_8)
         val declared = Regex("encoding\\s*=\\s*[\"']([A-Za-z0-9._-]+)[\"']")
             .find(head)?.groupValues?.get(1) ?: return String(bytes, Charsets.UTF_8)
         val charset = runCatching { java.nio.charset.Charset.forName(declared) }.getOrNull()

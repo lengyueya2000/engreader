@@ -245,7 +245,15 @@ class Speaker(private val context: Context) {
         role: SpeechRole = SpeechRole.Reading,
         flush: Boolean = true,
     ) {
-        if (_state.value != SpeechState.Ready) return
+        // Nothing was handed to a voice, so nothing will ever report this utterance
+        // finished. The read-aloud queue advances on that report and waits for it
+        // indefinitely, so returning silently here stranded the reader on one sentence
+        // with the button still reading "pause" and no sound. Reporting the failure is
+        // what lets the queue stop and say so.
+        if (_state.value != SpeechState.Ready) {
+            emit(SpeechEvent.Failed(utteranceId))
+            return
+        }
         oneShot = false
         _speaking.value = true
         // The Chinese half is an addition to the English read-aloud, never a
@@ -406,7 +414,11 @@ class Speaker(private val context: Context) {
 
     private fun emit(event: SpeechEvent) {
         scope.launch {
-            _speaking.value = event is SpeechEvent.Finished
+            // `emit` is only ever reached to report an utterance ending, so the voice has
+            // stopped by the time this runs. The flag used to be set the other way round,
+            // which reported "speaking" for exactly the finished case and "not speaking"
+            // for a failure — the opposite of both.
+            _speaking.value = false
             _events.emit(event)
         }
     }

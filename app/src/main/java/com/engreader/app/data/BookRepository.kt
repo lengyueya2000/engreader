@@ -4,6 +4,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.database.Cursor
 import android.net.Uri
+import android.util.Log
 import com.engreader.app.book.BookFormat
 import com.engreader.app.book.BookText
 import com.engreader.app.book.EpubParser
@@ -298,13 +299,20 @@ class BookRepository(
 
     private fun writeCover(bookId: Long, bytes: ByteArray, extension: String): String {
         val dir = coversDir()
-        if (!dir.exists() && !dir.mkdirs()) return ""
+        if (!dir.exists() && !dir.mkdirs()) {
+            Log.w(TAG, "cover directory unavailable for book $bookId")
+            return ""
+        }
         val ext = extension.ifBlank { "jpg" }
         val file = File(dir, "$bookId.$ext")
         return try {
             file.writeBytes(bytes)
             file.name
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            // The book still imports without its cover, so this must not fail the
+            // import — but swallowing it silently leaves a shelf of blank covers with
+            // nothing anywhere to say why.
+            Log.w(TAG, "could not write cover for book $bookId", e)
             ""
         }
     }
@@ -341,6 +349,8 @@ class BookRepository(
     )
 
     private companion object {
+        const val TAG = "BookRepository"
+
         /** `sourceId` for a book chapter, so `Catalog.displayName` can label it. */
         const val BOOK_SOURCE = "book"
 

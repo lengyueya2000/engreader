@@ -215,7 +215,10 @@ object RssParser {
         var total = 0
         while (total <= MAX_FEED_BYTES) {
             val read = stream.read(buffer)
-            if (read < 0) break
+            // `<= 0`, not `< 0`: a stream that reports zero bytes without being at its
+            // end — a socket wrapper around a connection the server has stopped
+            // feeding — leaves `total` unchanged, so the loop would ask again forever.
+            if (read <= 0) break
             total += read
             out.write(buffer, 0, read)
         }

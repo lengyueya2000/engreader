@@ -59,7 +59,6 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
             """.trimIndent()
         )
         db.execSQL("CREATE UNIQUE INDEX idx_article_url ON article(url) WHERE url <> ''")
-        db.execSQL("CREATE INDEX idx_article_book ON article(bookId, chapterIndex)")
 
         db.execSQL(
             """
@@ -118,6 +117,10 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
         )
         db.execSQL("CREATE INDEX idx_session_day ON session(day)")
         db.execSQL("CREATE INDEX idx_session_article ON session(articleId)")
+        // The reading-speed figure windows the table by `finishedAt`, which neither of
+        // the two indices above can serve; without this it is a full scan of a table
+        // that grows by one row per flush for the life of the install.
+        db.execSQL("CREATE INDEX idx_session_finished ON session(finishedAt)")
 
         db.execSQL(
             """
@@ -242,6 +245,24 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
             // which is the truth — the test did not exist before.
             createVocabTable(db)
         }
+        if (oldVersion < 7) {
+            // An index only: nothing to backfill, and the table it serves is untouched.
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_session_finished ON session(finishedAt)")
+        }
+    }
+
+    /**
+     * Accepts a database written by a newer build instead of throwing.
+     *
+     * `SQLiteOpenHelper`'s default is to raise, and this app ships as an APK through
+     * GitHub Releases, so installing an older build over a newer one is an ordinary
+     * thing for a user to do. Every upgrade path here only ever adds columns and
+     * tables, so a newer schema is a superset of the older one: the older build can
+     * read and write it safely, and refusing to open would leave the app unusable
+     * with no way to recover the wordbook.
+     */
+    override fun onDowngrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        // Intentionally empty: keep the newer schema as it is.
     }
 
     /**
@@ -282,6 +303,6 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
 
     companion object {
         const val NAME = "engreader.db"
-        const val VERSION = 6
+        const val VERSION = 7
     }
 }

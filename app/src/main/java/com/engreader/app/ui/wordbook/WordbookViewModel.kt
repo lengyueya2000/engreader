@@ -93,17 +93,24 @@ class WordbookViewModel(private val container: AppContainer) : ViewModel() {
 
     suspend fun setMastered(lemma: String, mastered: Boolean) {
         container.wordbook.setMastered(lemma, mastered)
+        // `dueAt` moves with the flag: mastering parks the word at Long.MAX_VALUE and
+        // un-mastering sets it to now, so a copy that only flips `mastered` would leave
+        // the row claiming not to be due when the database says it is, and the word
+        // would stay missing from 待复习 until the list was reloaded.
         state = state.copy(
-            words = state.words.map { if (it.lemma == lemma) it.copy(mastered = mastered) else it },
+            words = state.words.map {
+                if (it.lemma != lemma) {
+                    it
+                } else {
+                    it.copy(
+                        mastered = mastered,
+                        dueAt = if (mastered) Long.MAX_VALUE else System.currentTimeMillis(),
+                    )
+                }
+            },
         )
         refreshCounts()
     }
-
-    suspend fun lookup(lemma: String): WordEntry? = withContext(Dispatchers.IO) {
-        container.dictionary.lookup(lemma)
-    }
-
-    suspend fun dueWords(limit: Int = 20): List<SavedWord> = container.wordbook.due(limit)
 
     /** Due words with the sentence each was met in, for context-first review. */
     suspend fun dueCards(limit: Int = 30): List<ReviewCard> = container.wordbook.dueCards(limit)
@@ -139,13 +146,6 @@ class WordbookViewModel(private val container: AppContainer) : ViewModel() {
         state = state.copy(dueCount = counts.first, total = counts.second, mastered = counts.third)
         applyFilter()
     }
-
-    /** Related forms of a saved word, shown under its gloss. */
-    suspend fun family(word: SavedWord): List<com.engreader.app.dict.WordForm> =
-        withContext(Dispatchers.IO) {
-            container.dictionary.lookup(word.lemma)?.let { container.dictionary.family(it) }
-                ?: emptyList()
-        }
 
     /** Applies a review result, which moves the word along the Leitner boxes. */
     suspend fun review(lemma: String, correct: Boolean) {

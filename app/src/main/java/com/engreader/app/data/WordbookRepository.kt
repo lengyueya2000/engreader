@@ -22,11 +22,17 @@ data class SavedWord(
     val wrong: Int,
     val note: String,
 ) {
+    /** Reviews answered, right or wrong. Zero means the word has never been tested. */
+    val attempts: Int get() = correct + wrong
+
+    /**
+     * Share of reviews answered correctly.
+     *
+     * Meaningless when [attempts] is zero, and it reads as 0% rather than as "no
+     * data" — callers that display it have to check [attempts] first.
+     */
     val accuracy: Float
-        get() {
-            val total = correct + wrong
-            return if (total == 0) 0f else correct.toFloat() / total
-        }
+        get() = if (attempts == 0) 0f else correct.toFloat() / attempts
 
     val isDue: Boolean get() = dueAt <= System.currentTimeMillis()
 }
@@ -67,23 +73,45 @@ class WordbookRepository(
      * Deliberately does not write a look-up row: the look-up that led here is
      * recorded by the caller, and recording it again here would double every count
      * on the stats screen for any word the user saves.
+     *
+     * An update-then-insert inside one transaction rather than `INSERT … ON CONFLICT
+     * … DO UPDATE`: that syntax is SQLite 3.24, and the platform SQLite is 3.18 on
+     * API 26, 3.19 on 27 and 3.22 on 28 — every device below Android 10 would fail
+     * the statement with a syntax error and the wordbook would silently stop saving.
      */
     suspend fun save(entry: WordEntry) = withContext(Dispatchers.IO) {
         val now = System.currentTimeMillis()
-        db.writableDatabase.execSQL(
-            """
-            INSERT INTO word (lemma, display, translation, phonetic, firstSeenAt, seenCount, dueAt)
-            VALUES (?, ?, ?, ?, ?, 1, ?)
-            ON CONFLICT(lemma) DO UPDATE SET
-                seenCount = seenCount + 1,
-                display = excluded.display,
-                translation = excluded.translation,
-                phonetic = excluded.phonetic
-            """.trimIndent(),
-            arrayOf(
-                entry.lemma, entry.queried, entry.translation, entry.phonetic, now, now,
-            ),
-        )
+        val database = db.writableDatabase
+        database.beginTransaction()
+        try {
+            val bumped = database.compileStatement(
+                "UPDATE word SET seenCount = seenCount + 1, display = ?, " +
+                    "translation = ?, phonetic = ? WHERE lemma = ?",
+            ).use { statement ->
+                statement.bindString(1, entry.queried)
+                statement.bindString(2, entry.translation)
+                statement.bindString(3, entry.phonetic)
+                statement.bindString(4, entry.lemma)
+                statement.executeUpdateDelete()
+            }
+            if (bumped == 0) {
+                database.insert(
+                    "word", null,
+                    ContentValues().apply {
+                        put("lemma", entry.lemma)
+                        put("display", entry.queried)
+                        put("translation", entry.translation)
+                        put("phonetic", entry.phonetic)
+                        put("firstSeenAt", now)
+                        put("seenCount", 1)
+                        put("dueAt", now)
+                    },
+                )
+            }
+            database.setTransactionSuccessful()
+        } finally {
+            database.endTransaction()
+        }
         Unit
     }
 
@@ -426,5 +454,29 @@ object DayKey {
             cal.get(java.util.Calendar.MONTH) + 1,
             cal.get(java.util.Calendar.DAY_OF_MONTH),
         )
+    }
+
+    /**
+     * The keys of the last [days] calendar days, ending with [now]'s own day.
+     *
+     * A set rather than a count so callers can filter rows by it: the activity tables
+     * have no row for a day with no reading, so "the last seven days" cannot be
+     * expressed as the first seven rows of a descending list — that reaches back as
+     * many calendar days as there were quiet ones.
+     *
+     * Stepped with `Calendar` rather than by subtracting 24 hours, for the reason
+     * `ProgressRepository.streak` documents: on a DST transition day that subtraction
+     * lands on the wrong calendar date.
+     */
+    fun recent(days: Int, now: Long): Set<String> {
+        if (days <= 0) return emptySet()
+        val cal = java.util.Calendar.getInstance()
+        cal.timeInMillis = now
+        return buildSet {
+            repeat(days) {
+                add(of(cal.timeInMillis))
+                cal.add(java.util.Calendar.DAY_OF_MONTH, -1)
+            }
+        }
     }
 }

@@ -66,7 +66,6 @@ data class ReaderState(
      */
     val dueLemmas: Set<String> = emptySet(),
     val quiz: List<QuizQuestion> = emptyList(),
-    val quizVisible: Boolean = false,
     val fontSize: Int = 19,
     val lineHeight: Float = 1.75f,
     val theme: ReadingTheme = ReadingTheme.Paper,
@@ -223,14 +222,23 @@ class ReaderViewModel(
     /** Which engine is speaking, so the settings sheet can say so. */
     val speechBackend: StateFlow<SpeechBackend> get() = container.speaker.backend
 
-    /** The bundled voices, for the picker. */
-    val voices: StateFlow<List<VoiceCatalog.BundledVoice>> get() = container.speaker.voices
-
     /** The voice in use, shown so the reader can see what is loaded. */
     val activeVoice: StateFlow<VoiceCatalog.BundledVoice?> get() = container.speaker.activeVoice
 
     private var lookups = 0
     private var sessionStart = 0L
+
+    /**
+     * True while the shared queue is playing this piece, so [sessionStart] is parked.
+     *
+     * The queue counts its own wall-clock time and writes the same rows, so exactly one
+     * of the two is allowed to hold the clock. See [handOverClock].
+     */
+    private var queueOwnsClock = false
+
+    /** Whether the reader is on screen, so the clock is not restarted in the background. */
+    private var foreground = true
+
     private var translationJob: Job? = null
 
     /**
@@ -426,24 +434,33 @@ class ReaderViewModel(
      * reading of a piece leaves several rows. The seconds are the increment since the
      * last flush, and the words are the piece's coverage as of now, which is why the
      * statistics aggregate the words per article rather than summing them.
+     *
+     * A look-up count is flushed even when no time has passed, so a tap that lands in
+     * the same second as the previous flush — or while the queue owns the clock — still
+     * reaches the database instead of waiting for the next interval that has seconds to
+     * report.
      */
     fun flushProgress() {
         savePosition()
-        if (sessionStart == 0L) return
-        val now = System.currentTimeMillis()
-        val seconds = ((now - sessionStart) / 1000).toInt()
-        if (seconds <= 0) return
-        sessionStart = now
-        val words = coveredWords()
-        val bookId = state.article?.bookId ?: 0
         val count = lookups
+        val seconds = if (sessionStart == 0L) {
+            0
+        } else {
+            ((System.currentTimeMillis() - sessionStart) / 1000).toInt()
+        }
+        if (seconds <= 0 && count <= 0) return
+        if (seconds > 0) sessionStart = System.currentTimeMillis()
+        val words = if (seconds > 0) coveredWords() else 0
+        val bookId = state.article?.bookId ?: 0
         lookups = 0
         container.appScope.launch {
             container.wordbook.recordSession(articleId, seconds, words, count)
-            container.articles.addReadSeconds(articleId, seconds)
-            // Time on a chapter is time on the book: without this the shelf would show
-            // a book that was read for an hour as never having been opened.
-            if (bookId > 0) container.books.addReadSeconds(bookId, seconds)
+            if (seconds > 0) {
+                container.articles.addReadSeconds(articleId, seconds)
+                // Time on a chapter is time on the book: without this the shelf would show
+                // a book that was read for an hour as never having been opened.
+                if (bookId > 0) container.books.addReadSeconds(bookId, seconds)
+            }
         }
     }
 
@@ -573,12 +590,18 @@ class ReaderViewModel(
      * notification's stop button.
      */
     fun onEnterBackground() {
+        foreground = false
         flushProgress()
+        // The clock stops here and starts again in [onEnterForeground]. Leaving the
+        // timestamp at "now" only discarded the gap when the reader came back; a reader
+        // killed while the phone was in a pocket banked the whole time it was away.
+        sessionStart = 0L
     }
 
     /** Restarts the reading clock after [onEnterBackground] stopped it. */
     fun onEnterForeground() {
-        if (state.article != null) sessionStart = System.currentTimeMillis()
+        foreground = true
+        if (state.article != null && !queueOwnsClock) sessionStart = System.currentTimeMillis()
     }
 
     // ------------------------------------------------------------- chapters
@@ -762,24 +785,6 @@ class ReaderViewModel(
     }
 
     /**
-     * Turns "read the Chinese after the English" on or off.
-     *
-     * Takes effect on the next utterance rather than restarting what is playing: the
-     * queue reads this flag when a sentence finishes, so switching it on mid-sentence
-     * adds the Chinese to the sentence already being read, and switching it off drops
-     * the Chinese from the pair in progress.
-     */
-    fun setSpeakTranslation(speak: Boolean) {
-        container.settings.speakTranslation = speak
-        state = state.copy(speakTranslation = speak)
-        if (!speak) return
-        container.speaker.prepareTranslation()
-        if (state.translation.isEmpty() && state.translationStatus != TranslationStatus.Loading) {
-            requestTranslation()
-        }
-    }
-
-    /**
      * Fetches the paragraph translations for the open article.
      *
      * Held here rather than in the reader screen so a translation survives the
@@ -860,6 +865,10 @@ class ReaderViewModel(
      * outlive the screen it belongs to. What stays here is the binding between the
      * queue's flat sentence index and the paragraph on screen — both sides build that
      * list with the same split, so the numbers name the same sentence.
+     *
+     * Leaving the reader deliberately does not stop the voice. Listening is meant to
+     * carry on with the phone in a pocket, and the notification holds the stop button
+     * for when it should not.
      */
     fun startListening(fromIndex: Int = 0) {
         container.listening.start(articleId, fromIndex)
@@ -879,15 +888,8 @@ class ReaderViewModel(
     fun pauseListening() = container.listening.pause()
 
     /**
-     * Ends the session: the voice, the notification and the queue all go.
-     *
-     * Leaving the reader deliberately does not call this. Listening is meant to carry
-     * on with the phone in a pocket, and the notification holds the stop button for
-     * when it should not.
+     * Taps a sentence while listening to jump playback to it.
      */
-    fun stopListening() = container.listening.stop()
-
-    /** Taps a sentence while listening to jump playback to it. */
     fun speakSentence(index: Int) {
         if (!state.listening) return
         container.listening.seek(index)
@@ -911,11 +913,38 @@ class ReaderViewModel(
             container.listening.state.collect { session ->
                 val mine = session.active && session.articleId == articleId
                 val listening = mine && session.playing
+                handOverClock(listening)
                 val index = if (listening) session.index else -1
                 if (state.listening != listening || state.speakingSentence != index) {
                     state = state.copy(listening = listening, speakingSentence = index)
                 }
             }
+        }
+    }
+
+    /**
+     * Stops the reader's clock while the shared queue is playing this piece, and starts
+     * it again when it is not.
+     *
+     * Both this screen and the queue count wall-clock time and write it to the same
+     * tables, so a reader left open behind a playing queue recorded every second twice —
+     * the daily goal, the streak and the reading-speed chart all read from those rows.
+     * Handing the clock over at the moment the queue takes it, rather than subtracting
+     * afterwards, also banks the reader's own partial interval first, so the seconds
+     * either side of the handover are counted once each and none is lost.
+     *
+     * The restart is skipped while the reader is in the background: the queue can be
+     * paused from the lock screen, and starting the clock there would count time the
+     * phone spent in a pocket.
+     */
+    private fun handOverClock(toQueue: Boolean) {
+        if (toQueue == queueOwnsClock) return
+        queueOwnsClock = toQueue
+        if (toQueue) {
+            flushProgress()
+            sessionStart = 0L
+        } else if (foreground) {
+            sessionStart = System.currentTimeMillis()
         }
     }
 
@@ -953,10 +982,6 @@ class ReaderViewModel(
         if (questions.isNotEmpty()) container.articles.saveQuiz(articleId, questions)
         state = state.copy(quiz = questions)
         return questions
-    }
-
-    fun setQuizVisible(visible: Boolean) {
-        state = state.copy(quizVisible = visible)
     }
 
     /**
