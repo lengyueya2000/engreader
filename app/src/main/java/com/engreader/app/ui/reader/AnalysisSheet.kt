@@ -361,7 +361,11 @@ private fun ConnectedSpeechSection(sentence: String, onSpeakPhrase: (String, Boo
     )
     Spacer(Modifier.height(10.dp))
     features.forEach { feature ->
-        FeatureRow(feature, onPlay = { onSpeakPhrase(feature.written, true) })
+        // At the reader's own rate, not the slow one: a bare speaker icon reads as
+        // "play this", and the point of the row is to hear the join as it really
+        // sounds. The slow half of the comparison is the 0.6x button above, which
+        // covers the whole sentence and is labelled.
+        FeatureRow(feature, onPlay = { onSpeakPhrase(feature.written, false) })
     }
 }
 
@@ -414,7 +418,7 @@ private fun FeatureRow(feature: SpeechFeature, onPlay: () -> Unit) {
         Spacer(Modifier.width(8.dp))
         Icon(
             Icons.AutoMirrored.Filled.VolumeUp,
-            contentDescription = "慢速播放",
+            contentDescription = "播放",
             tint = MaterialTheme.colorScheme.primary,
             modifier = Modifier
                 .size(20.dp)

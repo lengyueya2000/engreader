@@ -328,6 +328,16 @@ class NeuralTts(private val context: Context) {
             return
         }
         engineWorker.execute {
+            // Superseded while this sat in the queue behind another request's
+            // synthesis. `generate` is a blocking native call that cannot be
+            // interrupted, so a request that has already started is stuck paying for
+            // audio nobody will hear; this is the one point where abandoned work can
+            // still be dropped, and without it tapping one word and then another makes
+            // the second wait for the first to be built and then thrown away.
+            if (stale(token)) {
+                onDone()
+                return@execute
+            }
             // A prefetch for this very sentence may have been queued ahead of this
             // task; the FIFO worker means it has finished by now, so look again
             // before paying for a second synthesis of the same text.
@@ -663,8 +673,16 @@ class NeuralTts(private val context: Context) {
     private companion object {
         const val TAG = "NeuralTts"
 
-        /** ~0.2 s of audio per write, small enough that a skip is felt immediately. */
-        const val CHUNK_SAMPLES = 4096
+        /**
+         * Audio per write: ~46 ms at the bundled voices' 22.05 kHz.
+         *
+         * This is the granularity of a skip. The write blocks until the track has room,
+         * so the loop only notices that it has been superseded at a chunk boundary —
+         * the reader taps a word while a sentence is playing and the sentence keeps
+         * sounding for up to one chunk. At 4096 samples that was 186 ms, long enough to
+         * be heard as the sentence stubbornly continuing under the new one.
+         */
+        const val CHUNK_SAMPLES = 1024
 
         const val DRAIN_TIMEOUT_MS = 10_000L
         const val DRAIN_POLL_MS = 10L
