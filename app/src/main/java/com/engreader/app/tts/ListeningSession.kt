@@ -5,6 +5,7 @@ import com.engreader.app.nlp.Paragraphs
 import com.engreader.app.nlp.Sentences
 import com.engreader.app.nlp.Tokenizer
 import com.engreader.app.translate.SentenceAlignment
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -12,6 +13,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.onSubscription
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -146,6 +148,22 @@ class ListeningSession(private val container: AppContainer) {
     /** Set while the end of a piece is being handled, so a second event cannot repeat it. */
     private var ending = false
 
+    /**
+     * True between asking for a piece and its first sentence actually being handed over.
+     *
+     * Loading a piece takes a while — the body is split, then the 19 MB voice is read out
+     * of the APK — and nothing is audible for the whole of it. That silence is what makes
+     * a listener tap again, and without this flag the second tap went to [resume], which
+     * starts from the sentence the state happens to hold rather than the one the piece was
+     * opened at: tapping twice threw the listener back to the top of the article. A pause
+     * arriving in the same window is honoured by clearing the flag, so the pending start
+     * does not play on after the listener asked for quiet.
+     */
+    private var starting = false
+
+    /** The sentence [starting] is heading for, so a pause in that window resumes there. */
+    private var startIndex = 0
+
     private var startedAt = 0L
 
     init {
@@ -182,6 +200,12 @@ class ListeningSession(private val container: AppContainer) {
         val current = _state.value
         when {
             !current.active || current.articleId != articleId -> open(articleId, fromIndex)
+            // Already on its way: the load starts playback at the requested sentence
+            // itself, so a second tap in that window is not a new instruction. It used to
+            // fall through to `resume` and restart the piece from the sentence the state
+            // happened to hold — the top of the article — which is exactly what a
+            // listener does when the first tap has not made a sound yet.
+            starting -> Unit
             current.playing -> pause()
             else -> resume()
         }
@@ -192,7 +216,13 @@ class ListeningSession(private val container: AppContainer) {
         val at = lastIndex
         container.speaker.stop()
         lastIndex = -1
-        pausedIndex = at
+        // A pause before the first sentence is a pause on the start itself. Nothing has
+        // been spoken, so `at` is -1 and there would be nothing to resume; the sentence
+        // the start was heading for is the one to come back to. Left unrecorded the load
+        // would also speak into the quiet the listener just asked for, which is why the
+        // flag is cleared here rather than only checked when the load finishes.
+        pausedIndex = if (starting) startIndex else at
+        starting = false
         _state.update { it.copy(playing = false) }
         writeProgress(_state.value)
         PlaybackService.setPlaying(
@@ -205,7 +235,16 @@ class ListeningSession(private val container: AppContainer) {
 
     fun resume() {
         val current = _state.value
-        if (!current.active || queue.isEmpty()) return
+        if (!current.active) return
+        // Nothing to resume: the piece has not started yet and is already on its way.
+        if (starting) return
+        if (queue.isEmpty()) {
+            // Active but with nothing to say: the piece's body never arrived, or a
+            // previous load left the session holding an empty queue. Doing nothing here
+            // is what a dead play button looks like, so the piece is fetched again.
+            if (!current.loading) open(current.articleId, current.index)
+            return
+        }
         val from = if (pausedIndex >= 0) pausedIndex else current.index
         pausedIndex = -1
         // The clock starts again here rather than at pause(): time spent paused is not
@@ -217,6 +256,7 @@ class ListeningSession(private val container: AppContainer) {
     fun stop() {
         val current = _state.value
         sessionGeneration++
+        starting = false
         cancelJobs()
         container.speaker.stop()
         lastIndex = -1
@@ -281,6 +321,8 @@ class ListeningSession(private val container: AppContainer) {
         startedAt = 0L
         queue = emptyList()
         val generation = ++sessionGeneration
+        starting = true
+        startIndex = fromIndex
         // The voice is asked for before the body is read, so the model loads while the
         // text is being split instead of after it. Loading it lazily on the first
         // `speak` would drop that first sentence: `Speaker.speak` is a no-op until the
@@ -316,9 +358,23 @@ class ListeningSession(private val container: AppContainer) {
             // the book shelf's chapter row is the one that does that.
             awaitVoice()
             if (generation != sessionGeneration) return@launch
+            // Paused while the voice was still loading. The piece is loaded and ready,
+            // but the listener asked for quiet after asking to listen, and the answer is
+            // the later of the two.
+            if (!starting) return@launch
             // Started before the first utterance: the event flow has no replay, so a
             // collector that arrived late would miss the end of the sentence it came for.
-            collectJob = container.appScope.launch { observeEvents() }
+            //
+            // Subscribing is not the same as having subscribed, and the queue advances
+            // only on that report. A sentence whose text is blank after rewriting — an
+            // apparatus note such as `[Illustration: ...]` — reports completion the
+            // instant it is handed over, so a first sentence of that kind could finish
+            // before this collector existed, losing the report and stranding the queue on
+            // a sentence that never ends. Waiting for the subscription closes the window.
+            val subscribed = CompletableDeferred<Unit>()
+            collectJob = container.appScope.launch { observeEvents(subscribed) }
+            withTimeoutOrNull(SUBSCRIBE_WAIT_MS) { subscribed.await() }
+            if (generation != sessionGeneration) return@launch
             startSleepTimer()
             speakAt(fromIndex.coerceIn(0, (queue.size - 1).coerceAtLeast(0)))
         }
@@ -387,6 +443,7 @@ class ListeningSession(private val container: AppContainer) {
     }
 
     private fun speakAt(index: Int) {
+        starting = false
         if (index !in queue.indices) {
             endOfPiece()
             return
@@ -453,15 +510,28 @@ class ListeningSession(private val container: AppContainer) {
         queue.getOrNull(index + 1)?.let { container.speaker.prefetch(it.text, SpeechRole.Reading) }
     }
 
-    private suspend fun observeEvents() {
-        container.speaker.events.collect { event ->
-            if (!_state.value.playing) return@collect
-            when (event) {
-                is SpeechEvent.Finished -> onFinished(event.utteranceId)
-                is SpeechEvent.Failed -> stop()
+    private suspend fun observeEvents(subscribed: CompletableDeferred<Unit>) {
+        container.speaker.events
+            // Signalled after the subscription is registered and before any event is
+            // delivered, which is what lets `open` know the queue will hear its sentence.
+            .onSubscription { subscribed.complete(Unit) }
+            .collect { event ->
+                if (!_state.value.playing) return@collect
+                when (event) {
+                    is SpeechEvent.Finished -> onFinished(event.utteranceId)
+                    // Only a failure of the sentence being read is this session's
+                    // failure. `speak` reports one for a request it could not hand to the
+                    // voice, and by the time that report arrives the queue may already be
+                    // on a newer sentence; stopping on it would end a session that is
+                    // playing fine.
+                    is SpeechEvent.Failed -> if (isCurrent(event.utteranceId)) stop()
+                }
             }
-        }
     }
+
+    /** True when [utteranceId] names the sentence the queue is on right now. */
+    private fun isCurrent(utteranceId: String): Boolean =
+        UtteranceId.parse(utteranceId)?.index == lastIndex
 
     /**
      * Advances the queue by one utterance.
@@ -627,5 +697,14 @@ class ListeningSession(private val container: AppContainer) {
          * its first line, which reads as the feature being broken.
          */
         const val VOICE_WAIT_MS = 15_000L
+
+        /**
+         * How long `open` waits for its event collector to be subscribed.
+         *
+         * Not a timeout that is expected to fire — subscribing is a scheduling hop, not
+         * work — it only keeps a collector that never started from hanging the session
+         * before its first sentence.
+         */
+        const val SUBSCRIBE_WAIT_MS = 2_000L
     }
 }

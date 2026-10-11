@@ -431,6 +431,12 @@ class Speaker(private val context: Context) {
      * @return the job doing the waiting, when there is one, so a one-shot can replace it.
      */
     private fun whenVoiceReady(onReady: () -> Unit, onUnavailable: () -> Unit): Job? {
+        // No voice was ever asked for, so there is no load to wait on and nothing to
+        // report a failure about: the request to speak is itself the first thing to ask
+        // for one. Reporting `Failed` here is what turned a speak that arrived before any
+        // `prepare` — a screen that never loaded the voice, a session started from
+        // somewhere that only draws text — into a read-aloud button that does nothing.
+        if (_state.value == SpeechState.Idle) prepare(rate, localeTag, voiceId)
         // Answered synchronously in the two cases that need no waiting, so the ordinary
         // path — the voice is already up — behaves exactly as it did before any of this.
         when (gateFor(_state.value)) {
