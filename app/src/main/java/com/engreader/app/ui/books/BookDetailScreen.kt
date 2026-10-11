@@ -1,6 +1,8 @@
 package com.engreader.app.ui.books
 
 import androidx.compose.foundation.Image
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -25,6 +27,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.outlined.Headphones
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -40,10 +43,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.engreader.app.model.Book
 import com.engreader.app.model.ChapterRef
+import com.engreader.app.ui.askForNotificationPermission
 import com.engreader.app.ui.components.EmptyState
 import com.engreader.app.ui.components.HairLine
 import com.engreader.app.ui.components.LoadingBlock
@@ -62,10 +67,15 @@ fun BookDetailScreen(
     bookId: Long,
     onBack: () -> Unit,
     onOpenChapter: (Long) -> Unit,
+    onListenChapter: (Long) -> Unit = {},
 ) {
     val viewModel = containerScopedViewModel(key = "book:$bookId") { BookDetailViewModel(it, bookId) }
     val state = viewModel.state
     var showAllChapters by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val notifications = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { }
 
     androidx.compose.runtime.LaunchedEffect(bookId) { viewModel.load() }
 
@@ -110,6 +120,17 @@ fun BookDetailScreen(
                                     "从第 1 章开始"
                                 },
                                 onOpen = { onOpenChapter(nextChapter.articleId) },
+                            )
+                            ListenRow(
+                                label = if (state.chapters.size > 1) {
+                                    "听这本书 · 从第 ${next + 1} 章开始"
+                                } else {
+                                    "听这一章"
+                                },
+                                onListen = {
+                                    askForNotificationPermission(context) { notifications.launch(it) }
+                                    onListenChapter(nextChapter.articleId)
+                                },
                             )
                         }
                     }
@@ -287,27 +308,62 @@ private fun BookHeader(book: Book, cover: android.graphics.Bitmap?) {
  */
 @Composable
 private fun ContinueRow(label: String, onOpen: () -> Unit) {
+    ActionRow(
+        icon = Icons.Filled.PlayArrow,
+        label = label,
+        background = MaterialTheme.colorScheme.primaryContainer,
+        foreground = MaterialTheme.colorScheme.onPrimaryContainer,
+        onClick = onOpen,
+    )
+}
+
+/**
+ * The listening counterpart of [ContinueRow]: same chapter, no screen to read.
+ *
+ * Deliberately the quieter of the two — reading is still the primary act, and this is the
+ * one taken on a commute — so it is a tinted row rather than a filled button.
+ */
+@Composable
+private fun ListenRow(label: String, onListen: () -> Unit) {
+    ActionRow(
+        icon = Icons.Outlined.Headphones,
+        label = label,
+        background = MaterialTheme.colorScheme.surfaceContainer,
+        foreground = MaterialTheme.colorScheme.primary,
+        onClick = onListen,
+    )
+}
+
+@Composable
+private fun ActionRow(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    background: androidx.compose.ui.graphics.Color,
+    foreground: androidx.compose.ui.graphics.Color,
+    onClick: () -> Unit,
+) {
     Row(
         Modifier
-            .padding(horizontal = 20.dp, vertical = 16.dp)
+            .padding(horizontal = 20.dp)
+            .padding(bottom = 16.dp)
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
-            .background(MaterialTheme.colorScheme.primaryContainer)
-            .clickable(onClick = onOpen)
+            .background(background)
+            .clickable(onClick = onClick)
             .padding(14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Icon(
-            Icons.Filled.PlayArrow,
+            icon,
             contentDescription = null,
-            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+            tint = foreground,
             modifier = Modifier.size(22.dp),
         )
         Spacer(Modifier.width(10.dp))
         Text(
             text = label,
             style = MaterialTheme.typography.titleSmall,
-            color = MaterialTheme.colorScheme.onPrimaryContainer,
+            color = foreground,
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
         )

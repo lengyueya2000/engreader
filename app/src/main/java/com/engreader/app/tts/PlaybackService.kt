@@ -63,6 +63,14 @@ class PlaybackService : Service() {
                     override fun onStop() {
                         Hooks.stop?.invoke()
                     }
+
+                    override fun onSkipToNext() {
+                        Hooks.next?.invoke()
+                    }
+
+                    override fun onSkipToPrevious() {
+                        Hooks.previous?.invoke()
+                    }
                 },
             )
             isActive = true
@@ -82,6 +90,10 @@ class PlaybackService : Service() {
             ACTION_PAUSE -> control { Hooks.pause?.invoke() }
 
             ACTION_RESUME -> control { Hooks.resume?.invoke() }
+
+            ACTION_NEXT -> control { Hooks.next?.invoke() }
+
+            ACTION_PREVIOUS -> control { Hooks.previous?.invoke() }
 
             ACTION_SET_PLAYING -> control {
                 readExtras(intent)
@@ -137,7 +149,9 @@ class PlaybackService : Service() {
                 .setActions(
                     PlaybackState.ACTION_PLAY or
                         PlaybackState.ACTION_PAUSE or
-                        PlaybackState.ACTION_STOP,
+                        PlaybackState.ACTION_STOP or
+                        PlaybackState.ACTION_SKIP_TO_NEXT or
+                        PlaybackState.ACTION_SKIP_TO_PREVIOUS,
                 )
                 .setState(
                     if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
@@ -182,8 +196,10 @@ class PlaybackService : Service() {
     }
 
     private fun notification(): Notification {
+        // The play/pause button is the middle one, which is the slot the compact view
+        // shows; the two skips are what a listener reaches for with a pocketed phone.
         val style = Notification.MediaStyle()
-            .setShowActionsInCompactView(0)
+            .setShowActionsInCompactView(1)
         session?.let { style.setMediaSession(it.sessionToken) }
 
         return Notification.Builder(this, CHANNEL_ID)
@@ -194,11 +210,25 @@ class PlaybackService : Service() {
             .addAction(
                 Notification.Action.Builder(
                     null,
+                    "上一句",
+                    serviceIntent(ACTION_PREVIOUS, 0),
+                ).build(),
+            )
+            .addAction(
+                Notification.Action.Builder(
+                    null,
                     if (playing) "暂停" else "继续",
                     serviceIntent(if (playing) ACTION_PAUSE else ACTION_RESUME, 1),
                 ).build(),
             )
-            .addAction(Notification.Action.Builder(null, "停止", serviceIntent(ACTION_STOP, 2)).build())
+            .addAction(
+                Notification.Action.Builder(
+                    null,
+                    "下一句",
+                    serviceIntent(ACTION_NEXT, 2),
+                ).build(),
+            )
+            .addAction(Notification.Action.Builder(null, "停止", serviceIntent(ACTION_STOP, 3)).build())
             .setOngoing(true)
             .setShowWhen(false)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
@@ -242,14 +272,16 @@ class PlaybackService : Service() {
     /**
      * What the service calls back into.
      *
-     * Plain lambdas rather than a binder: the reader registers them when it starts
-     * speaking, and they are gone with the reader, which is exactly when the service is
-     * gone too.
+     * Plain lambdas rather than a binder: [ListeningSession] registers them once when
+     * the container is built, and they stay for the life of the process — the lock
+     * screen has to keep working after every screen that could have owned them is gone.
      */
     object Hooks {
         var resume: (() -> Unit)? = null
         var pause: (() -> Unit)? = null
         var stop: (() -> Unit)? = null
+        var next: (() -> Unit)? = null
+        var previous: (() -> Unit)? = null
     }
 
     companion object {
@@ -261,6 +293,8 @@ class PlaybackService : Service() {
         private const val ACTION_STOP = "com.engreader.app.action.STOP_READING"
         private const val ACTION_PAUSE = "com.engreader.app.action.PAUSE_READING"
         private const val ACTION_RESUME = "com.engreader.app.action.RESUME_READING"
+        private const val ACTION_NEXT = "com.engreader.app.action.NEXT_SENTENCE"
+        private const val ACTION_PREVIOUS = "com.engreader.app.action.PREVIOUS_SENTENCE"
         private const val ACTION_SET_PLAYING = "com.engreader.app.action.SET_PLAYING"
 
         private const val EXTRA_TITLE = "title"

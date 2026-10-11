@@ -52,12 +52,17 @@ enum class Tab(val label: String, val filled: ImageVector, val outlined: ImageVe
  *
  * Each tab is a 56dp-wide column inside a 64dp bar, which keeps the touch target
  * above the 48dp minimum even though the icon itself is 24dp.
+ *
+ * [miniPlayer] sits directly above the tab row, inside the same column, so a playing
+ * piece is never covered by the bar. It draws nothing when there is nothing to play, so
+ * the slot costs no height until it is used.
  */
 @Composable
 fun AppShell(
     selected: Tab,
     onSelect: (Tab) -> Unit,
     dueCount: Int?,
+    miniPlayer: @Composable () -> Unit = {},
     content: @Composable (Modifier) -> Unit,
 ) {
     val navBar = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
@@ -66,6 +71,7 @@ fun AppShell(
         Box(Modifier.fillMaxWidth().weight(1f)) {
             content(Modifier.fillMaxSize())
         }
+        miniPlayer()
         Box(
             Modifier
                 .fillMaxWidth()

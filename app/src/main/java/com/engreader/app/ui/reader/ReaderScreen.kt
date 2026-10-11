@@ -1,9 +1,5 @@
 package com.engreader.app.ui.reader
 
-import android.Manifest
-import android.content.Context
-import android.content.pm.PackageManager
-import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -82,7 +78,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -94,6 +89,7 @@ import com.engreader.app.nlp.Tokenizer
 import com.engreader.app.nlp.WordSpan
 import com.engreader.app.translate.SentenceAlignment
 import com.engreader.app.tts.SpeechState
+import com.engreader.app.ui.askForNotificationPermission
 import com.engreader.app.ui.components.EmptyState
 import com.engreader.app.ui.components.HairLine
 import com.engreader.app.ui.containerScopedViewModel
@@ -168,23 +164,6 @@ private fun unclippedBounds(coordinates: LayoutCoordinates): Rect {
 }
 
 /**
- * Asks for the notification permission the playback notification needs, once.
- *
- * Only from Android 13, and only when it has not already been granted: below that the
- * permission does not exist, and a granted one would prompt for nothing. A refusal is
- * not an error — the voice is unaffected, the reader just cannot stop it from the
- * notification shade.
- */
-private fun askForNotificationPermission(context: Context, launch: (String) -> Unit) {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
-    val granted = ContextCompat.checkSelfPermission(
-        context,
-        Manifest.permission.POST_NOTIFICATIONS,
-    ) == PackageManager.PERMISSION_GRANTED
-    if (!granted) launch(Manifest.permission.POST_NOTIFICATIONS)
-}
-
-/**
  * The reading surface.
  *
  * Each paragraph is a single `Text` whose annotated string carries the styling for
@@ -208,6 +187,11 @@ fun ReaderScreen(
      * it found.
      */
     onOpenChapter: (Long, Int) -> Unit = { _, _ -> },
+    /**
+     * Opens the listening screen for a piece, which is the reader with the text taken
+     * away: a sleep timer, chapter advance, and nothing to look at.
+     */
+    onOpenListening: (Long) -> Unit = {},
     /**
      * A paragraph to land on in the piece being opened, or zero for its stored position.
      *
@@ -661,7 +645,10 @@ fun ReaderScreen(
                     theme = theme,
                     onBack = {
                         viewModel.flushProgress()
-                        viewModel.stopListening()
+                        // Playback is not stopped here on purpose: it belongs to the
+                        // app, and backing out of the text is exactly when a listener
+                        // wants the voice to carry on. The notification's stop button
+                        // is the way to end it.
                         onBack()
                     },
                     onOpenContents = { viewModel.setContentsVisible(true) },
@@ -675,7 +662,7 @@ fun ReaderScreen(
                         if (!state.listening) {
                             askForNotificationPermission(context) { notifications.launch(it) }
                         }
-                        viewModel.toggleListening(scope)
+                        viewModel.toggleListening()
                     },
                 )
 
@@ -687,6 +674,7 @@ fun ReaderScreen(
                         onPrevious = viewModel::previousSentence,
                         onToggle = viewModel::pauseListening,
                         onNext = viewModel::nextSentence,
+                        onExpand = { onOpenListening(articleId) },
                     )
                 }
             }

@@ -23,6 +23,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.OpenInFull
 import androidx.compose.material.icons.outlined.SkipNext
 import androidx.compose.material.icons.outlined.SkipPrevious
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -56,6 +57,14 @@ fun ListeningBar(
     onPrevious: () -> Unit,
     onToggle: () -> Unit,
     onNext: () -> Unit,
+    /**
+     * Opens the listening screen.
+     *
+     * This bar is the read-along control: the text is on screen and the voice follows
+     * the reader's eye. The listening screen is the other mode — nothing but the voice,
+     * with a sleep timer and chapter advance — for when the phone is going in a pocket.
+     */
+    onExpand: () -> Unit = {},
 ) {
     Row(
         modifier
@@ -87,6 +96,13 @@ fun ListeningBar(
                 text = "点击句子可跳转，再点一次继续",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.75f),
+            )
+        }
+        IconButton(onClick = onExpand) {
+            Icon(
+                Icons.Outlined.OpenInFull,
+                contentDescription = "听力模式",
+                tint = MaterialTheme.colorScheme.onPrimary,
             )
         }
     }

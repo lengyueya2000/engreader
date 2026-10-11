@@ -27,6 +27,8 @@ import com.engreader.app.ui.books.BookDetailScreen
 import com.engreader.app.ui.books.BookShelfScreen
 import com.engreader.app.ui.discover.DiscoverScreen
 import com.engreader.app.ui.home.HomeScreen
+import com.engreader.app.ui.listening.ListeningMiniPlayer
+import com.engreader.app.ui.listening.ListeningScreen
 import com.engreader.app.ui.progress.ProgressScreen
 import com.engreader.app.ui.reader.ReaderScreen
 import com.engreader.app.ui.settings.SettingsScreen
@@ -41,6 +43,13 @@ sealed interface Overlay {
      * position when it is zero.
      */
     data class Reading(val articleId: Long, val paragraph: Int = 0) : Overlay
+    /**
+     * The listening screen: the same queue as the reader, with the text taken away.
+     *
+     * [articleId] is what the queue was started on, and only tells the screen whether the
+     * piece it is showing is still the one playing.
+     */
+    data class Listening(val articleId: Long) : Overlay
     data object Settings : Overlay
     data object Review : Overlay
     data object VocabTest : Overlay
@@ -115,6 +124,14 @@ fun AppRoot(container: AppContainer) {
                 selected = tab,
                 onSelect = { tab = it },
                 dueCount = dueCount,
+                miniPlayer = {
+                    ListeningMiniPlayer(
+                        onOpen = {
+                            val playing = container.listening.state.value
+                            if (playing.active) overlays.add(Overlay.Listening(playing.articleId))
+                        },
+                    )
+                },
             ) { innerModifier ->                AnimatedContent(
                     targetState = tab,
                     transitionSpec = {
@@ -157,8 +174,13 @@ fun AppRoot(container: AppContainer) {
                             onSavedChanged = { refreshKey++ },
                             onOpenChapter = openChapter,
                             initialParagraph = overlay.paragraph,
+                            onOpenListening = { overlays.add(Overlay.Listening(it)) },
                         )
                     }
+                    is Overlay.Listening -> ListeningScreen(
+                        onBack = pop,
+                        onOpenArticle = { id -> overlays.add(Overlay.Reading(id)) },
+                    )
                     Overlay.Review -> com.engreader.app.ui.wordbook.ReviewScreen(onBack = pop)
                     Overlay.VocabTest -> com.engreader.app.ui.vocab.VocabTestScreen(onBack = pop)
                     Overlay.Settings -> SettingsScreen(onBack = pop)
@@ -176,6 +198,10 @@ fun AppRoot(container: AppContainer) {
                         bookId = overlay.bookId,
                         onBack = pop,
                         onOpenChapter = openArticle,
+                        onListenChapter = { id ->
+                            container.listening.start(id)
+                            overlays.add(Overlay.Listening(id))
+                        },
                     )
                 }
             }

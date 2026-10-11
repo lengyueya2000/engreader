@@ -8,6 +8,7 @@ import com.engreader.app.nlp.VocabularyGrader
 import com.engreader.app.nlp.VocabularyProfile
 import com.engreader.app.source.ArticleFetcher
 import com.engreader.app.source.SeedLibrary
+import com.engreader.app.tts.ListeningSession
 import com.engreader.app.tts.Speaker
 import com.engreader.app.translate.ParagraphTranslator
 import kotlinx.coroutines.CoroutineScope
@@ -63,4 +64,13 @@ class AppContainer(context: Context) {
     val vocabTest = VocabTestRepository(userDb, dictionary)
 
     val settings = SettingsRepository(appContext)
+
+    /**
+     * The read-aloud queue, shared by the reader and the listening screen.
+     *
+     * App-scoped on purpose: the voice has to keep going when the screen that started
+     * it is gone, which is the whole difference between listening and reading. Built
+     * last because it reads the repositories above.
+     */
+    val listening = ListeningSession(this)
 }

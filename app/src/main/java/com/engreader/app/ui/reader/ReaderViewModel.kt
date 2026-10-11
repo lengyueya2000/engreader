@@ -4,6 +4,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
 import com.engreader.app.data.AppContainer
 import com.engreader.app.dict.PartOfSpeech
 import com.engreader.app.dict.RootBreakdown
@@ -22,13 +23,9 @@ import com.engreader.app.nlp.Sentence
 import com.engreader.app.nlp.SentenceAnalysis
 import com.engreader.app.nlp.Sentences
 import com.engreader.app.nlp.VocabularyProfile
-import com.engreader.app.translate.SentenceAlignment
-import com.engreader.app.tts.PlaybackService
+import com.engreader.app.tts.ListeningSession
 import com.engreader.app.tts.SpeechBackend
-import com.engreader.app.tts.SpeechEvent
-import com.engreader.app.tts.SpeechRole
 import com.engreader.app.tts.SpeechState
-import com.engreader.app.tts.UtteranceId
 import com.engreader.app.tts.VoiceCatalog
 import com.engreader.app.ui.theme.ReadingTheme
 import kotlinx.coroutines.CancellationException
@@ -234,29 +231,16 @@ class ReaderViewModel(
 
     private var lookups = 0
     private var sessionStart = 0L
-    private var speechJob: Job? = null
     private var translationJob: Job? = null
-    private var lastSpokenIndex = -1
 
     /**
-     * Sentence-level Chinese for one paragraph, aligned once and kept.
+     * Collects the shared playback queue for as long as this screen is alive.
      *
-     * Aligning is a dynamic-programming fit over the paragraph and runs on the reading
-     * thread between two utterances, so it is done once per paragraph rather than once
-     * per sentence. The index is the cache key, and -1 means nothing is held; it is
-     * reset whenever the translation list is replaced.
+     * The queue itself outlives the screen — that is the point of it living in the
+     * container — so this only mirrors it into [state], and is cancelled with the
+     * ViewModel rather than with the playback.
      */
-    private var alignedParagraph = -1
-    private var alignedSentences: List<String?> = emptyList()
-
-    /**
-     * Where playback stopped when it was paused rather than ended.
-     *
-     * Kept so the lock-screen play button and the reader's own listen toggle both pick
-     * the sentence back up instead of starting the article again. Reset by every path
-     * that ends the session outright.
-     */
-    private var pausedIndex = -1
+    private var listeningJob: Job? = null
 
     /**
      * Paragraph the list is scrolled to, as reported by the screen.
@@ -350,9 +334,9 @@ class ReaderViewModel(
         // read: starting the high-water mark at the top would report the coverage of a
         // piece picked up at chapter's end as one paragraph.
         maxParagraph = readParagraph
-        // The article just replaced whatever the alignment was computed against, and a
-        // paragraph index means something else in the new one.
-        alignedParagraph = -1
+        // The queue in the container may be playing something else, or this very article
+        // from before it was reopened; either way this screen now follows it.
+        observeListening()
         container.articles.markOpened(articleId)
         sessionStart = System.currentTimeMillis()
         // A chapter of a book also advances the book: this is what makes "continue
@@ -813,8 +797,6 @@ class ReaderViewModel(
             try {
                 val translated = container.translator.translate(paragraphs, article.translation)
                 container.articles.setTranslation(article.id, translated)
-                // The alignment held for the old list no longer describes this one.
-                alignedParagraph = -1
                 state = state.copy(
                     translation = translated,
                     translationStatus = TranslationStatus.Ready,
@@ -873,240 +855,74 @@ class ReaderViewModel(
     /**
      * Starts sentence-by-sentence playback from [fromIndex].
      *
-     * The queue is advanced by the engine's completion callback rather than by a
-     * timer, so the highlight stays in step with the audio on slow devices.
+     * The queue lives in [ListeningSession], which is app-scoped: the voice has to keep
+     * going when the reader is gone, and a queue owned by this ViewModel could not
+     * outlive the screen it belongs to. What stays here is the binding between the
+     * queue's flat sentence index and the paragraph on screen — both sides build that
+     * list with the same split, so the numbers name the same sentence.
      */
-    fun startListening(scope: CoroutineScope, fromIndex: Int = 0) {
-        val sentences = state.flatSentences
-        if (sentences.isEmpty()) return
-        lastSpokenIndex = fromIndex.coerceIn(0, sentences.lastIndex)
-        state = state.copy(listening = true, speakingSentence = lastSpokenIndex)
-        speakAt(lastSpokenIndex)
-        observeSpeech(scope)
-        openPlaybackService()
+    fun startListening(fromIndex: Int = 0) {
+        container.listening.start(articleId, fromIndex)
     }
 
     /**
-     * Brings up the foreground service that keeps the voice alive off-screen.
+     * The reader's listen button.
      *
-     * The callbacks are the service's only way back in — it holds no reference to this
-     * ViewModel — so they are registered here and dropped in [stopListening]. They run
-     * on the app scope, which outlives any screen: the reader may well be off-screen
-     * when the lock-screen play button is pressed.
+     * Pauses rather than stops when this article is already loaded, so it matches the
+     * lock screen: pressing it again carries on from the same sentence instead of
+     * starting the article over.
      */
-    private fun openPlaybackService() {
-        val article = state.article ?: return
-        PlaybackService.Hooks.resume = { resumeListening() }
-        PlaybackService.Hooks.pause = { pauseListening() }
-        PlaybackService.Hooks.stop = { stopListening() }
-        PlaybackService.start(container.appContext, article.title, playbackSubtitle())
+    fun toggleListening() {
+        container.listening.toggle(articleId, firstSentenceAtReadPosition())
     }
 
-    /** What the notification says under the title: the book's name, or the article's. */
-    private fun playbackSubtitle(): String {
-        val article = state.article ?: return ""
-        val book = state.book?.title.orEmpty()
-        return if (book.isNotBlank()) book else article.subtitle.ifBlank { article.originLabel }
-    }
+    fun pauseListening() = container.listening.pause()
 
     /**
-     * Stops the voice but keeps the session, so the notification's play button works.
+     * Ends the session: the voice, the notification and the queue all go.
      *
-     * Stopping the service here instead would take the notification with it, and there
-     * would be nothing left on the lock screen to press. Used by both the reader's own
-     * pause button and the lock-screen one, which is what keeps the two consistent:
-     * either one can be resumed from the other.
+     * Leaving the reader deliberately does not call this. Listening is meant to carry
+     * on with the phone in a pocket, and the notification holds the stop button for
+     * when it should not.
      */
-    fun pauseListening() {
+    fun stopListening() = container.listening.stop()
+
+    /** Taps a sentence while listening to jump playback to it. */
+    fun speakSentence(index: Int) {
         if (!state.listening) return
-        val at = lastSpokenIndex
-        container.speaker.stop()
-        speechJob?.cancel()
-        speechJob = null
-        state = state.copy(listening = false, speakingSentence = -1)
-        lastSpokenIndex = -1
-        pausedIndex = at
-        val article = state.article
-        PlaybackService.setPlaying(
-            container.appContext,
-            playing = false,
-            title = article?.title.orEmpty(),
-            subtitle = playbackSubtitle(),
-        )
+        container.listening.seek(index)
     }
 
-    private fun resumeListening() {
-        resumeFrom(container.appScope)
-    }
+    fun nextSentence() = container.listening.next()
 
-    private fun speakAt(index: Int) {
-        val sentences = state.flatSentences
-        if (index !in sentences.indices) {
-            stopListening()
-            return
-        }
-        lastSpokenIndex = index
-        state = state.copy(speakingSentence = index, listening = true)
-        // The Chinese voice is only needed once playback starts, and it is wanted on
-        // every path in — the reader's button, the lock screen, a tap on a sentence —
-        // so it is asked for here rather than at each entry point. Idempotent.
-        if (state.speakTranslation) container.speaker.prepareTranslation()
-        container.speaker.speak(sentences[index].text, UtteranceId.english(index))
-        prefetchAfterEnglish(index)
-    }
+    fun previousSentence() = container.listening.previous()
 
     /**
-     * Reads the Chinese of sentence [index], which the queue plays after the English.
+     * Mirrors the shared queue into this screen's state.
      *
-     * The highlight deliberately stays on [index]: the Chinese is the second half of
-     * that sentence, not a move to another one, so the line under the reader's eye does
-     * not jump while its translation is being read.
+     * The reader is a view onto the session rather than its owner, so every change —
+     * a chapter rolling into the next one, the lock screen pausing, the sleep timer
+     * firing — arrives as state instead of as a call. A session playing some other
+     * article leaves this screen dark rather than highlighting its text.
      */
-    private fun speakTranslationAt(index: Int, chinese: String) {
-        container.speaker.speak(chinese, UtteranceId.translation(index), SpeechRole.Translation)
-        // What comes after this is the next English sentence, never the Chinese of this
-        // one again — the two helpers differ in exactly that.
-        state.flatSentences.getOrNull(index + 1)?.let {
-            container.speaker.prefetch(it.text, SpeechRole.Reading)
-        }
-    }
-
-    /**
-     * Synthesises whatever will be played after sentence [index] finishes.
-     *
-     * The next thing to be heard is the Chinese of this sentence when it is going to be
-     * read, and otherwise the English of the next one. Synthesis takes a sizeable
-     * fraction of the sentence's own duration, and that time used to be heard as a
-     * pause; the engine generates on its own thread, so this overlaps with playback
-     * rather than delaying it.
-     */
-    private fun prefetchAfterEnglish(index: Int) {
-        if (state.speakTranslation) {
-            chineseFor(index)?.let { chinese ->
-                container.speaker.prefetch(chinese, SpeechRole.Translation)
-                return
-            }
-        }
-        state.flatSentences.getOrNull(index + 1)?.let {
-            container.speaker.prefetch(it.text, SpeechRole.Reading)
-        }
-    }
-
-    /**
-     * The Chinese of one flat sentence, or null when there is none to read.
-     *
-     * Null is the ordinary answer for a paragraph the translator re-broke rather than
-     * re-split — [SentenceAlignment] refuses to guess there — and for an article whose
-     * translation has not arrived yet. The caller reads English only in that case,
-     * which is what the reader would hear with the switch off.
-     */
-    private fun chineseFor(index: Int): String? {
-        val flat = state.flatSentences.getOrNull(index) ?: return null
-        val chinese = state.translation.getOrNull(flat.paragraphIndex)?.takeIf { it.isNotBlank() }
-            ?: return null
-        if (alignedParagraph != flat.paragraphIndex) {
-            val english = state.paragraphs.getOrNull(flat.paragraphIndex)
-                ?.sentences?.map { it.text }.orEmpty()
-            alignedSentences = SentenceAlignment.align(english, chinese).orEmpty()
-            alignedParagraph = flat.paragraphIndex
-        }
-        return alignedSentences.getOrNull(flat.sentenceIndex)?.takeIf { it.isNotBlank() }
-    }
-
-    private fun observeSpeech(scope: CoroutineScope) {
-        if (speechJob?.isActive == true) return
-        speechJob = scope.launch {
-            container.speaker.events.collect { event ->
-                if (!state.listening) return@collect
-                when (event) {
-                    is SpeechEvent.Finished -> onUtteranceFinished(event.utteranceId)
-                    is SpeechEvent.Failed -> stopListening()
+    private fun observeListening() {
+        if (listeningJob?.isActive == true) return
+        listeningJob = viewModelScope.launch {
+            container.listening.state.collect { session ->
+                val mine = session.active && session.articleId == articleId
+                val listening = mine && session.playing
+                val index = if (listening) session.index else -1
+                if (state.listening != listening || state.speakingSentence != index) {
+                    state = state.copy(listening = listening, speakingSentence = index)
                 }
             }
         }
-    }
-
-    /**
-     * Advances the queue by one utterance.
-     *
-     * The English of sentence N is followed by its Chinese when the reader asked for it,
-     * and by the English of N+1 otherwise; the Chinese of N is always followed by the
-     * English of N+1.
-     */
-    private fun onUtteranceFinished(utteranceId: String) {
-        val spoken = UtteranceId.parse(utteranceId) ?: return
-        // Ignore a late callback from a sentence the user already skipped.
-        if (spoken.index != lastSpokenIndex) return
-        val next = spoken.index + 1
-        if (spoken.role == SpeechRole.Translation) {
-            if (next < state.flatSentences.size) speakAt(next) else stopListening()
-            return
-        }
-        val chinese = if (state.speakTranslation) chineseFor(spoken.index) else null
-        if (chinese != null) {
-            speakTranslationAt(spoken.index, chinese)
-            return
-        }
-        if (next < state.flatSentences.size) speakAt(next) else stopListening()
-    }
-
-    /**
-     * The reader's own listen button.
-     *
-     * Pauses rather than stops, so it matches the lock screen: the session stays up and
-     * pressing it again carries on from the same sentence instead of starting over.
-     */
-    fun toggleListening(scope: CoroutineScope) {
-        if (state.listening) pauseListening() else resumeFrom(scope)
-    }
-
-    /**
-     * Continues from where playback was paused, or from what the reader is looking at.
-     *
-     * Starting from the top of the article is wrong once the reader has scrolled: a
-     * chapter of a novel is thousands of words long, and the position they left the text
-     * at is exactly the part they want read to them.
-     */
-    private fun resumeFrom(scope: CoroutineScope) {
-        val from = if (pausedIndex >= 0) pausedIndex else firstSentenceAtReadPosition()
-        pausedIndex = -1
-        startListening(scope, from)
     }
 
     /** Flat index of the first sentence of the paragraph at the top of the list. */
     private fun firstSentenceAtReadPosition(): Int {
         val index = state.flatSentences.indexOfFirst { it.paragraphIndex >= readParagraph }
         return if (index < 0) 0 else index
-    }
-
-    /** Ends the session: the voice, the notification and the callbacks all go. */
-    fun stopListening() {
-        container.speaker.stop()
-        speechJob?.cancel()
-        speechJob = null
-        state = state.copy(listening = false, speakingSentence = -1)
-        lastSpokenIndex = -1
-        pausedIndex = -1
-        // Dropped before the service so a teardown cannot call back into a ViewModel
-        // that is being cleared.
-        PlaybackService.Hooks.resume = null
-        PlaybackService.Hooks.pause = null
-        PlaybackService.Hooks.stop = null
-        PlaybackService.stop(container.appContext)
-    }
-
-    /** Taps a sentence while listening to jump playback to it. */
-    fun speakSentence(index: Int) {
-        if (!state.listening) return
-        speakAt(index)
-    }
-
-    fun nextSentence() {
-        if (lastSpokenIndex + 1 < state.flatSentences.size) speakAt(lastSpokenIndex + 1)
-    }
-
-    fun previousSentence() {
-        if (lastSpokenIndex - 1 >= 0) speakAt(lastSpokenIndex - 1)
     }
 
     fun speakWord(word: String) {
@@ -1165,16 +981,15 @@ class ReaderViewModel(
     override fun onCleared() {
         super.onCleared()
         flushProgress()
-        speechJob?.cancel()
+        listeningJob?.cancel()
         searchJob?.cancel()
         // A translation already under way keeps running on the container's scope: it
         // writes straight to the article row, so leaving the reader mid-fetch should
         // still leave the article translated when the user comes back.
         //
-        // Leaving the reader also ends the playback session: the queue and the
-        // highlight are this ViewModel's, so a service left running would have nothing
-        // left to advance it.
-        stopListening()
+        // Playback is deliberately left alone. It belongs to the container now, and
+        // leaving the reader is exactly when a listener wants it to keep going — the
+        // notification carries the stop button for when it should not.
     }
 
     private companion object {
