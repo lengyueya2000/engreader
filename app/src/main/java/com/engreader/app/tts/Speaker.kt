@@ -6,6 +6,7 @@ import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.BufferOverflow
@@ -106,6 +107,24 @@ class Speaker(private val context: Context) {
      * a finished sentence, skipping the reader forward.
      */
     @Volatile private var oneShot = false
+
+    /**
+     * The one-shot waiting for the voice to load, so a newer one can replace it.
+     *
+     * A headword tapped twice in a row should be heard once, and heard as the second
+     * word — not as the first one arriving late on top of it.
+     */
+    private var pendingOneShot: Job? = null
+
+    /**
+     * Bumped by every [stop], so a request parked on the voice loading can tell that the
+     * reader asked for quiet while it waited.
+     *
+     * Without it, tapping the speaker and then pausing played the sentence anyway the
+     * moment the model finished loading — the pause arriving a second before the audio
+     * did, which reads as the button having been ignored.
+     */
+    @Volatile private var stopGeneration = 0
 
     /**
      * True while the Chinese voice is loading.
@@ -245,11 +264,26 @@ class Speaker(private val context: Context) {
         role: SpeechRole = SpeechRole.Reading,
         flush: Boolean = true,
     ) {
-        // Nothing was handed to a voice, so nothing will ever report this utterance
-        // finished. The read-aloud queue advances on that report and waits for it
-        // indefinitely, so returning silently here stranded the reader on one sentence
-        // with the button still reading "pause" and no sound. Reporting the failure is
-        // what lets the queue stop and say so.
+        whenVoiceReady(
+            onReady = { speakNow(text, utteranceId, role, flush) },
+            // Nothing was handed to a voice, so nothing will ever report this utterance
+            // finished. The read-aloud queue advances on that report and waits for it
+            // indefinitely, so staying silent here stranded the reader on one sentence
+            // with the button still reading "pause" and no sound. Reporting the failure
+            // is what lets the queue stop and say so.
+            onUnavailable = { emit(SpeechEvent.Failed(utteranceId)) },
+        )
+    }
+
+    /** The body of [speak], run once the voice is up. */
+    private fun speakNow(
+        text: String,
+        utteranceId: String,
+        role: SpeechRole,
+        flush: Boolean,
+    ) {
+        // Re-checked rather than assumed: this can run a moment after the wait, and a
+        // `stop` or `shutdown` in between leaves no voice to hand the sentence to.
         if (_state.value != SpeechState.Ready) {
             emit(SpeechEvent.Failed(utteranceId))
             return
@@ -311,6 +345,12 @@ class Speaker(private val context: Context) {
      * otherwise skip the reader to the next sentence.
      */
     fun preview(text: String = DEFAULT_PREVIEW) {
+        pendingOneShot?.cancel()
+        pendingOneShot = whenVoiceReady(onReady = { previewNow(text) }, onUnavailable = {})
+    }
+
+    /** The body of [preview], run once the voice is up. */
+    private fun previewNow(text: String) {
         if (_state.value != SpeechState.Ready) return
         oneShot = true
         if (_backend.value == SpeechBackend.Bundled) {
@@ -355,7 +395,14 @@ class Speaker(private val context: Context) {
      * otherwise skip the reader to the next sentence.
      */
     private fun sayOneShot(text: String, rate: Float) {
-        if (_state.value != SpeechState.Ready || text.isBlank()) return
+        if (text.isBlank()) return
+        pendingOneShot?.cancel()
+        pendingOneShot = whenVoiceReady(onReady = { sayOneShotNow(text, rate) }, onUnavailable = {})
+    }
+
+    /** The body of [sayOneShot], run once the voice is up. */
+    private fun sayOneShotNow(text: String, rate: Float) {
+        if (_state.value != SpeechState.Ready) return
         oneShot = true
         if (_backend.value == SpeechBackend.Bundled) {
             neural.speak(
@@ -374,8 +421,55 @@ class Speaker(private val context: Context) {
         }
     }
 
+    /**
+     * Runs [onReady] once the voice can actually speak, or [onUnavailable] when it cannot.
+     *
+     * The decision itself lives in [awaitVoiceThen], which is where the reasoning is;
+     * this only arranges for it to happen on the speaker's own scope and hands back the
+     * job so a one-shot can replace a request that is still waiting.
+     *
+     * @return the job doing the waiting, when there is one, so a one-shot can replace it.
+     */
+    private fun whenVoiceReady(onReady: () -> Unit, onUnavailable: () -> Unit): Job? {
+        // Answered synchronously in the two cases that need no waiting, so the ordinary
+        // path — the voice is already up — behaves exactly as it did before any of this.
+        when (gateFor(_state.value)) {
+            VoiceGate.Go -> {
+                onReady()
+                return null
+            }
+
+            VoiceGate.Unavailable -> {
+                onUnavailable()
+                return null
+            }
+
+            VoiceGate.Wait -> Unit
+        }
+        val generation = stopGeneration
+        return scope.launch {
+            when (awaitVoiceThen(state, READY_WAIT_MS, generation, { stopGeneration })) {
+                VoiceOutcome.Ready -> onReady()
+                VoiceOutcome.Unavailable -> onUnavailable()
+                // Dropped without a word: the queue reads `Failed` as "the voice is
+                // gone" and tears the session down, so reporting a pause would kill a
+                // session that had already moved on to a newer sentence. Nothing is left
+                // waiting either — `stop` is only reached from the queue's own pause,
+                // stop and piece-change, all of which issue a fresh speak or are done
+                // with the queue.
+                VoiceOutcome.Dropped -> Unit
+            }
+        }
+    }
+
     fun stop() {
         oneShot = false
+        // Bumped before the voice is silenced, so a request parked on the voice loading
+        // sees itself superseded when the load finishes instead of speaking into the
+        // quiet the reader just asked for.
+        stopGeneration++
+        pendingOneShot?.cancel()
+        pendingOneShot = null
         neural.stop()
         engine?.stop()
         _speaking.value = false
@@ -430,10 +524,21 @@ class Speaker(private val context: Context) {
      *
      * Reached only when the bundled voice fails to load, so it aims for "something
      * audible" rather than the best available voice: it sets the locale and accepts
-     * whatever voice the engine answers with.
+     * whatever voice the engine answers with. Idempotent, but not a no-op on a repeat
+     * call: see the state it settles below.
      */
     private fun startSystemEngine() {
-        if (engine != null) return
+        val existing = engine
+        if (existing != null) {
+            // Brought up by an earlier failed load. Nothing to start, but the state has
+            // to be settled here: the early return used to leave `Preparing` behind, and
+            // every `speak` after that reported a failure, so the second time the bundled
+            // voice failed to load the app went silent for good. Re-applying the config
+            // is also what carries a locale change through to the platform engine.
+            applySystemConfig(existing)
+            if (_state.value == SpeechState.Preparing) _state.value = SpeechState.Ready
+            return
+        }
         val listener = TextToSpeech.OnInitListener { status ->
             if (status != TextToSpeech.SUCCESS) {
                 _state.value = SpeechState.Unavailable
@@ -509,6 +614,14 @@ class Speaker(private val context: Context) {
     private companion object {
         const val TAG = "Speaker"
         const val PREVIEW_ID = "preview"
+
+        /**
+         * How long a request waits for a voice that is still loading.
+         *
+         * Long enough for the 19 MB model on a slow device, short enough that a voice
+         * which never arrives ends in a report instead of a request that hangs.
+         */
+        const val READY_WAIT_MS = 15_000L
 
         /** A headword on its own is easier to catch a shade slower than running prose. */
         const val WORD_RATE = 0.8f
