@@ -147,8 +147,8 @@ fun ProgressScreen(onOpenSettings: () -> Unit) {
                             modifier = Modifier.weight(1f),
                         )
                         StatBlock(
-                            value = "${snapshot.wordsRead}",
-                            label = "累计词量",
+                            value = "${snapshot.articlesStarted}",
+                            label = "读过的文章",
                             modifier = Modifier.weight(1f),
                         )
                     }
@@ -159,11 +159,6 @@ fun ProgressScreen(onOpenSettings: () -> Unit) {
                         StatBlock(
                             value = "${snapshot.lookups}",
                             label = "查词次数",
-                            modifier = Modifier.weight(1f),
-                        )
-                        StatBlock(
-                            value = "${snapshot.articlesStarted}",
-                            label = "读过的文章",
                             modifier = Modifier.weight(1f),
                         )
                         StatBlock(

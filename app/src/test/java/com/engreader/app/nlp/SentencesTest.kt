@@ -136,10 +136,8 @@ class ParagraphsTest {
     // ------------------------------------------------- reading coverage
 
     /**
-     * What a flush reports as read.
-     *
-     * Both 累计词量 and 阅读速度 are summed from this, so an off-by-one here silently
-     * skews every number on the statistics screen.
+     * What a flush reports as read, and what 阅读速度 is computed from, so an off-by-one
+     * here silently skews the figure.
      */
     private val prose = """
         The train was late again.

@@ -208,7 +208,7 @@ private fun Header(state: HomeState, onOpenShelf: () -> Unit, onImportBook: () -
             text = if (progress == null || progress.streakDays == 0) {
                 "每天 15 分钟，一年就是 90 小时的真实输入。"
             } else {
-                "已连续阅读 ${progress.streakDays} 天，累计 ${progress.wordsRead} 词。"
+                "已连续阅读 ${progress.streakDays} 天，本周 ${formatMinutes(progress.weekSeconds)}。"
             },
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,

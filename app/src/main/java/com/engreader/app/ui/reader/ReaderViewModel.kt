@@ -421,8 +421,7 @@ class ReaderViewModel(
      * Words of the piece the reader has actually got through.
      *
      * Paragraphs up to the furthest one reached, not the article's total word count.
-     * Writing the total on every flush made a piece abandoned after one paragraph
-     * count in full towards 累计词量, and made 阅读速度 climb with every trip to the
+     * Writing the total on every flush made 阅读速度 climb with every trip to the
      * background, because the speed is words over time and the words were being
      * counted again each time.
      *

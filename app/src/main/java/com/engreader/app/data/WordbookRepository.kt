@@ -32,7 +32,7 @@ data class SavedWord(
 }
 
 /** One day of study activity, for the streak and volume charts. */
-data class StudyDay(val day: String, val seconds: Int, val lookups: Int, val wordsRead: Int)
+data class StudyDay(val day: String, val seconds: Int, val lookups: Int)
 
 /**
  * A saved word together with the sentence it was first met in.
@@ -317,9 +317,9 @@ class WordbookRepository(
      * article the reader had got.
      *
      * [wordsRead] is coverage, not words gained, so it repeats across the flushes of one
-     * sitting and the statistics take the maximum per article. Storing the increment
-     * instead would need the position at the previous flush, which is not known once the
-     * reader has left and come back.
+     * sitting and the reading-speed figure takes the maximum per article. Storing the
+     * increment instead would need the position at the previous flush, which is not known
+     * once the reader has left and come back.
      */
     suspend fun recordSession(articleId: Long, seconds: Int, wordsRead: Int, lookups: Int) =
         withContext(Dispatchers.IO) {

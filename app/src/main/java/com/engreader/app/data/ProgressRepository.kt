@@ -11,15 +11,6 @@ data class ProgressSnapshot(
     val weekSeconds: Int,
     val articlesStarted: Int,
     val articlesFinished: Int,
-    /**
-     * Words in the distinct articles the reader has got through.
-     *
-     * Per article, the furthest the reader reached, not the sum over sessions and not
-     * the article's total: a session row records how far into the piece the reader was,
-     * so a piece read in three sittings has that figure written three times and a piece
-     * abandoned after one paragraph must not count in full.
-     */
-    val wordsRead: Int,
     val lookups: Int,
     val wordbookTotal: Int,
     val wordbookMastered: Int,
@@ -79,8 +70,6 @@ class ProgressRepository(
         val days = readDays(limit = 60)
         val byDay = days.associateBy { it.day }
 
-        val wordsRead = distinctWordsRead()
-
         // Look-ups are counted from the lookup table rather than from the session
         // rollup: every look-up writes a row there immediately, while a session is
         // only written when the reader closes, so the two can disagree mid-session.
@@ -103,7 +92,6 @@ class ProgressRepository(
                 "SELECT COUNT(DISTINCT articleId) FROM session " +
                     "WHERE seconds > 60 AND articleId IN (SELECT id FROM article WHERE bookId = 0)"
             ),
-            wordsRead = wordsRead,
             lookups = lookups,
             wordbookTotal = count("SELECT COUNT(*) FROM word"),
             wordbookMastered = count("SELECT COUNT(*) FROM word WHERE mastered = 1"),
@@ -119,19 +107,6 @@ class ProgressRepository(
             speed = readingSpeed(),
         )
     }
-
-    /**
-     * Words in the distinct articles that have been read.
-     *
-     * `MAX(wordsRead)` per article rather than `SUM`: a flush writes how far into the
-     * piece the reader had got, so summing counts every sitting over again. Reading on
-     * is monotonic within an article, so the largest figure is the furthest reached.
-     */
-    private fun distinctWordsRead(): Int =
-        db.readableDatabase.rawQuery(
-            "SELECT SUM(w) FROM (SELECT MAX(wordsRead) w FROM session GROUP BY articleId)",
-            null,
-        ).use { if (it.moveToFirst()) it.getInt(0) else 0 }
 
     /**
      * Reading speed over the last 14 days, against the 14 days before that.
@@ -185,13 +160,13 @@ class ProgressRepository(
 
     private fun readDays(limit: Int): List<StudyDay> =
         db.readableDatabase.rawQuery(
-            "SELECT day, SUM(seconds), SUM(lookups), SUM(wordsRead) FROM session " +
+            "SELECT day, SUM(seconds), SUM(lookups) FROM session " +
                 "GROUP BY day ORDER BY day DESC LIMIT ?",
             arrayOf(limit.toString()),
         ).use { c ->
             buildList {
                 while (c.moveToNext()) {
-                    add(StudyDay(c.getString(0), c.getInt(1), c.getInt(2), c.getInt(3)))
+                    add(StudyDay(c.getString(0), c.getInt(1), c.getInt(2)))
                 }
             }
         }
