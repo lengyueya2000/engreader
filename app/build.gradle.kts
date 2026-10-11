@@ -26,8 +26,8 @@ android {
         applicationId = "com.engreader.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 10
-        versionName = "1.3.4"
+        versionCode = 11
+        versionName = "1.3.5"
     }
 
     // One APK per ABI rather than one fat APK: the speech engine's native library is

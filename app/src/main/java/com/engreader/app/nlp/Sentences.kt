@@ -14,7 +14,8 @@ data class Sentence(
  * A plain "split on period" breaks on abbreviations, decimals and initials, so a
  * terminator only ends a sentence when it is followed by whitespace and the next
  * word does not continue an abbreviation. Quotation marks are carried with the
- * sentence they close.
+ * sentence they close, and a lowercase word after the terminator — with or without a
+ * closing quote in between — continues the sentence rather than starting a new one.
  */
 object Sentences {
 
@@ -109,10 +110,22 @@ object Sentences {
         if (after >= s.length) return true
         if (!s[after].isWhitespace()) {
             // Allow `."` / `.)` before the whitespace.
-            if (isCloser(s[after])) return after + 1 >= s.length || s[after + 1].isWhitespace()
-            return false
+            if (!isCloser(s[after])) return false
+            val next = after + 1
+            if (next >= s.length) return true
+            if (!s[next].isWhitespace()) return false
+            // A closing quote ends the sentence only when a new one follows it.
+            // `?" cried his wife` and `!" she said` are dialogue tags: breaking there
+            // hands the tag to the speaker as a sentence of its own, so the listener
+            // hears a full stop in the middle of what is one utterance.
+            return !continuesPhrase(s, next)
         }
-        if (s[terminator] != '.') return true
+        if (s[terminator] != '.') {
+            // `!`, `?` and `…` end a sentence far more often than not, but a lowercase
+            // word after them still continues the same one — `"How so? how can it
+            // affect them?"` is one question, not a question and a fragment.
+            return !continuesPhrase(s, after)
+        }
 
         val word = wordBefore(s, terminator)
         // `A.` is an initial in "J. Smith" but a one-letter word in "The grade is A."

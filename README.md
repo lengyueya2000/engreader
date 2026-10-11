@@ -101,6 +101,8 @@ python tools/voice/measure.py \
   --sheet speaker-info.txt --english-only
 ```
 
+**句子边界是朗读的最小单位，切错就等于在句子中间落了一个句号。** 朗读按句合成（见下文"句间停顿"），所以 `Sentences.split` 切在哪里，语音就在哪里走一遍句末语调并重新起头。原来的规则只在句点后面看下一个词是不是小写，收尾引号、叹号、问号、省略号一概不看：`“Do not you want to know who has taken it?” cried his wife, impatiently.` 被切成两句，第二句 `cried his wife, impatiently.` 单独合成，听感就是说到一半先落一个句号。现在句号以外的终止符、以及跟在收尾引号后面的情况，都按同一条规则处理——下一个词小写或数字就还在同一句里（`?” cried his wife`、`“How so? how can it affect them?”`），大写才是新句子（`He said “stop.” Then he left.`）。把 `tools/raw/pg1342.txt` 这类真实文本整段拼起来逐句切，改前有 4 句是被切出来的半句，改后为 0。
+
 ### 朗读前把书面语改写成人话
 
 内置语音是拿 espeak-ng 做音素化的，它读数字和符号用的是通用朗读规则，不是"有人在念小说"的规则。实测（用同一套内置语音合成、再用 faster-whisper 回听识别）发现四处一听就知道是机器在念的地方，朗读前统一改写：

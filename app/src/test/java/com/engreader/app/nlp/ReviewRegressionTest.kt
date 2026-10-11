@@ -47,6 +47,33 @@ class SentencesRegressionTest {
     }
 
     @Test
+    fun `a lowercase word after a closing quote continues the sentence`() {
+        // The closing quote ended the sentence unconditionally, so the dialogue tag
+        // was cut off and spoken as a sentence of its own: the listener heard a full
+        // stop in the middle of one utterance.
+        val out = Sentences.split(
+            "\u201CDo not you want to know who has taken it?\u201D cried his wife, impatiently."
+        )
+        assertEquals(1, out.size)
+        assertEquals(1, Sentences.split("\u201CWhat do you make of that?\u201D asked Holmes.").size)
+        assertEquals(1, Sentences.split("\u201CHello!\u201D she said.").size)
+        // A capitalised word after the quote is still a new sentence.
+        assertEquals(2, Sentences.split("He said \u201Cstop.\u201D Then he left.").size)
+        assertEquals(2, Sentences.split("\u201CI will not go.\u201D She left the room.").size)
+    }
+
+    @Test
+    fun `a lowercase word after an exclamation or question continues the sentence`() {
+        // `!`, `?` and `…` used to break unconditionally, so the second half of a
+        // question became a fragment starting mid-sentence.
+        assertEquals(1, Sentences.split("\u201CHow so? how can it affect them?\u201D").size)
+        assertEquals(1, Sentences.split("Stop! don\u2019t move!").size)
+        // A new sentence still starts on a capital.
+        assertEquals(2, Sentences.split("Nobody spoke! Nobody moved.").size)
+        assertEquals(2, Sentences.split("It was over\u2026 Nobody spoke again.").size)
+    }
+
+    @Test
     fun `the ordinary cases still hold`() {
         assertEquals(1, Sentences.split("Mr. Smith met Dr. Jones at 5 p.m. on Tuesday.").size)
         assertEquals(1, Sentences.split("The rate rose to 3.5 per cent.").size)
