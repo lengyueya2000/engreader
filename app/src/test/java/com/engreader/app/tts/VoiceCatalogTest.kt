@@ -158,4 +158,64 @@ class VoiceCatalogTest {
             assertTrue(voice.title.contains(voice.gender))
         }
     }
+
+    // -------------------------------------------------------- the Chinese voice
+
+    @Test
+    fun `the Chinese voice is not offered in the accent picker`() {
+        // It is not a choice the reader makes about the English text, it is the other
+        // half of one utterance. Offering it would also let it be picked as the voice
+        // the English is read with, which its front end cannot do.
+        assertTrue(VoiceCatalog.translation !in VoiceCatalog.all)
+        assertNull(VoiceCatalog.byId(VoiceCatalog.translation.id))
+        VoiceCatalog.accents.forEach { (tag, _) ->
+            assertTrue(VoiceCatalog.forLocale(tag).none { it.id == VoiceCatalog.translation.id })
+        }
+    }
+
+    @Test
+    fun `the Chinese voice is Mandarin and is a speaker of its own`() {
+        assertEquals("zh-CN", VoiceCatalog.translation.localeTag)
+        assertEquals(0, VoiceCatalog.translation.sid)
+        assertEquals(VoiceCatalog.translation.id, VoiceCatalog.translation.assetDir)
+    }
+
+    @Test
+    fun `the Chinese voice's front end is looked for beside its model`() {
+        // sherpa-onnx is handed absolute paths at runtime, but the relative asset paths
+        // are what `NeuralTts` unpacks from, so a drift between the two would leave the
+        // engine loading a lexicon that does not exist and reading nothing.
+        val voice = VoiceCatalog.translation
+        assertEquals("tts/${voice.assetDir}/lexicon.txt", VoiceCatalog.lexiconPath(voice))
+        assertTrue(VoiceCatalog.lexiconPath(voice).startsWith(VoiceCatalog.modelPath(voice).substringBeforeLast('/')))
+    }
+
+    @Test
+    fun `the rule FSTs are named in the order the engine wants them`() {
+        // Dates before numbers: `1837` has to be recognised as a year before the number
+        // rule can turn it into a cardinal, and phone numbers last because their pattern
+        // is the loosest of the three.
+        assertEquals(listOf("date.fst", "number.fst", "phone.fst"), VoiceCatalog.ruleFstNames)
+    }
+
+    @Test
+    fun `every path the Chinese engine is given is relative to the asset root`() {
+        // sherpa-onnx reads a relative path through the AssetManager and an absolute one
+        // from the filesystem, and refuses the mixture — an absolute path with an asset
+        // manager set is a fatal error inside the native library, not an exception the
+        // app can catch. So a leading slash here is a process abort on the first
+        // sentence, which is worth a test.
+        val voice = VoiceCatalog.translation
+        val paths = listOf(
+            VoiceCatalog.modelPath(voice),
+            VoiceCatalog.tokensPath(voice),
+            VoiceCatalog.lexiconPath(voice),
+        ) + VoiceCatalog.ruleFstPaths(voice).split(',')
+        paths.forEach { path ->
+            assertTrue("$path is absolute", !path.startsWith("/"))
+            assertTrue("$path is not namespaced under the voice's asset directory",
+                path.startsWith("tts/${voice.assetDir}/"))
+        }
+        assertEquals(VoiceCatalog.ruleFstNames.size, VoiceCatalog.ruleFstPaths(voice).split(',').size)
+    }
 }

@@ -32,6 +32,19 @@ import java.util.concurrent.atomic.AtomicInteger
  * the CPU at roughly a seventh of real time, so a six-second sentence is ready in
  * under a second.
  *
+ * A fourth voice reads the Chinese translation, and it is not an English voice with a
+ * different speaker: it is a Mandarin graph phonemised by a pinyin lexicon rather than
+ * by espeak-ng. The two front ends are mutually exclusive and cannot share an engine,
+ * which is why the Chinese voice lives in its own slot (see [SpeechRole]).
+ *
+ * ## Two engines at once
+ *
+ * When the reader asks for the translation to be read out, each English sentence is
+ * followed by its Chinese, and the two come from different engines. Both are therefore
+ * held resident. Reloading a graph between the halves of every pair would cost about a
+ * second of silence in the middle of each pair — far more noticeable than the memory
+ * the second engine occupies, which is the same order as the first.
+ *
  * ## How it speaks
  *
  * [speak] synthesises a whole utterance on [worker], then streams the samples to an
@@ -46,36 +59,43 @@ import java.util.concurrent.atomic.AtomicInteger
  * ## Where the files live
  *
  * The ONNX graph and the token table are read straight out of the APK by the native
- * library. The espeak-ng data is different: espeak-ng opens it with ordinary file
- * calls, so it must exist on disk, and [ensureEspeakData] copies it out of assets
- * once. The copy is shared by both voices and keyed by an asset fingerprint, so an
- * app upgrade refreshes it and nothing else touches it.
+ * library, and so is the Chinese voice's pinyin lexicon and its rule FSTs — every path
+ * the engine is given is relative to the asset root, because sherpa-onnx refuses to mix
+ * that mode with absolute paths. The espeak-ng data is the one exception: espeak-ng
+ * opens it with ordinary file calls, so [ensureEspeakData] copies it out of assets
+ * once, keyed by an asset fingerprint, and nothing else touches it.
  */
 class NeuralTts(private val context: Context) {
 
-    @Volatile
-    private var tts: OfflineTts? = null
-
-    /** The voice the loaded engine was built for, so a switch forces a reload. */
-    @Volatile
-    private var loadedVoiceId: String = ""
+    /**
+     * One loaded engine, with what it takes to speak through it.
+     *
+     * [voiceId] and [sid] are captured at load time rather than read from a shared
+     * field, so a later voice change cannot make a synthesis that is already running
+     * speak with the new voice's speaker index.
+     */
+    private class Engine(val tts: OfflineTts, val voiceId: String, val sid: Int)
 
     /**
-     * Speaker index the loaded engine speaks with.
+     * The voice English is read with, and the one Chinese is read with.
      *
-     * One model file can hold many speakers — the VCTK graph holds 109 — and the
-     * speaker is chosen per utterance rather than at load time, so switching between
-     * two speakers of the same model still reloads and the two voices never share an
-     * engine by accident.
+     * Both are held at once on purpose. The read-aloud alternates between them sentence
+     * by sentence, and reloading a 19 MB graph between every English sentence and its
+     * Chinese would put a second of silence in the middle of every pair — a far worse
+     * cost than the memory. So [readingEngine] is replaced when the reader picks a
+     * different accent, and [translationEngine] is loaded once and kept.
      */
     @Volatile
-    private var loadedSid: Int = 0
+    private var readingEngine: Engine? = null
+
+    @Volatile
+    private var translationEngine: Engine? = null
 
     /**
-     * Owns the native engine: loading, synthesis and release all run here.
+     * Owns the native engines: loading, synthesis and release all run here.
      *
-     * One thread is what keeps the engine safe — `generate` and `release` must never
-     * overlap, and sherpa's engine is not documented as reentrant.
+     * One thread is what keeps them safe — `generate` and `release` must never overlap,
+     * and sherpa's engine is not documented as reentrant.
      */
     private val engineWorker = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "neural-tts-engine").apply { priority = Thread.NORM_PRIORITY + 1 }
@@ -118,10 +138,13 @@ class NeuralTts(private val context: Context) {
      * One synthesised sentence.
      *
      * [generation] is the [engineGeneration] it was made under, so a clip recorded for
-     * a voice that has since been replaced is never played.
+     * a voice that has since been replaced is never played. [role] is in the match as
+     * well: the English sentence and its Chinese are different text, but a clip held
+     * for one must never be handed to the other's request.
      */
     private class Clip(
         val text: String,
+        val role: SpeechRole,
         val rate: Float,
         val sid: Int,
         val samples: FloatArray,
@@ -129,8 +152,9 @@ class NeuralTts(private val context: Context) {
         val generation: Int,
     ) {
         /** True when this clip is the audio for exactly this request. */
-        fun matches(text: String, rate: Float, sid: Int, engineGen: Int): Boolean =
-            this.text == text && this.rate == rate && this.sid == sid && generation == engineGen
+        fun matches(text: String, role: SpeechRole, rate: Float, sid: Int, engineGen: Int): Boolean =
+            this.text == text && this.role == role && this.rate == rate &&
+                this.sid == sid && generation == engineGen
     }
 
     /** The one-sentence look-ahead, or null. See [prefetch]. */
@@ -147,9 +171,6 @@ class NeuralTts(private val context: Context) {
     @Volatile
     private var track: AudioTrack? = null
 
-    /** Absolute path of the unpacked espeak data; blank until [prepare] succeeds. */
-    private var espeakDir: String = ""
-
     /**
      * Loads a voice, or returns the one already loaded.
      *
@@ -162,42 +183,46 @@ class NeuralTts(private val context: Context) {
      */
     fun prepare(localeTag: String, voiceId: String): Boolean {
         val voice = VoiceCatalog.resolve(localeTag, voiceId)
-        if (tts != null && loadedVoiceId == voice.id) return true
-        // Interrupt whatever is being spoken, then do the load on the worker.
-        // Releasing the engine from the caller's thread would free the native object
-        // while `generate` is executing inside it, and the worker would then crash the
-        // process rather than throw. Queueing behind the worker means the load cannot
-        // start until the previous utterance has left the engine alone.
-        stop()
+        if (readingEngine?.voiceId == voice.id) return true
+        return load(SpeechRole.Reading, voice)
+    }
+
+    /**
+     * Loads the Chinese voice, once.
+     *
+     * Separate from [prepare] because it is not a choice: the reader never picks this
+     * voice, and a failure to load it must leave the English read-aloud working rather
+     * than take the whole feature down. Callers treat false as "skip the Chinese".
+     */
+    fun prepareTranslation(): Boolean {
+        val voice = VoiceCatalog.translation
+        if (translationEngine?.voiceId == voice.id) return true
+        return load(SpeechRole.Translation, voice)
+    }
+
+    /**
+     * Loads one voice into its slot, replacing whatever was there.
+     *
+     * Interrupts playback only when the reading voice is being replaced — the Chinese
+     * one can arrive while an English sentence is being read, and silencing that
+     * sentence to load an engine it does not use would be heard as the read-aloud
+     * stuttering on the first pair. Releasing the engine from the caller's thread would
+     * free the native object while `generate` is executing inside it, and the worker
+     * would then crash the process rather than throw. Queueing behind the worker means
+     * the load cannot start until the previous utterance has left the engine alone.
+     */
+    private fun load(role: SpeechRole, voice: VoiceCatalog.BundledVoice): Boolean {
+        if (role == SpeechRole.Reading) stop()
         // Invalidates anything recorded for the voice being replaced. `stop` clears the
         // clip already held, but a prefetch queued before this call is still ahead of
         // the load on the worker, so it would otherwise finish and store a clip of the
         // old voice that a later `speak` would happily play.
         engineGeneration.incrementAndGet()
         val task = engineWorker.submit<Boolean> {
-            releaseLocked()
+            releaseLocked(role)
             runCatching {
-                espeakDir = ensureEspeakData()
-                val engine = OfflineTts(
-                    assetManager = context.assets,
-                    config = OfflineTtsConfig(
-                        model = OfflineTtsModelConfig(
-                            vits = OfflineTtsVitsModelConfig(
-                                model = VoiceCatalog.modelPath(voice),
-                                tokens = VoiceCatalog.tokensPath(voice),
-                                dataDir = espeakDir,
-                            ),
-                            numThreads = threadCount(),
-                            debug = false,
-                            provider = "cpu",
-                        ),
-                        maxNumSentences = 1,
-                        silenceScale = 0.2f,
-                    ),
-                )
-                tts = engine
-                loadedVoiceId = voice.id
-                loadedSid = voice.sid
+                val engine = build(role, voice)
+                setEngine(role, Engine(engine, voice.id, voice.sid))
                 true
             }.getOrElse { error ->
                 Log.w(TAG, "neural voice ${voice.id} unavailable", error)
@@ -207,11 +232,71 @@ class NeuralTts(private val context: Context) {
         return runCatching { task.get() }.getOrDefault(false)
     }
 
+    /**
+     * Builds one engine.
+     *
+     * The two roles use different front ends and they are mutually exclusive. The
+     * English voices are phonemised by espeak-ng, whose data has to be on disk. The
+     * Chinese voice is phonemised by a pinyin lexicon instead, plus three rule FSTs
+     * that turn written numbers and dates into something the lexicon can pronounce.
+     *
+     * Every path the Chinese engine is given is relative to the asset root, and the
+     * `AssetManager` is what resolves it. sherpa-onnx treats the two modes as
+     * exclusive — handed an absolute path while an asset manager is set, it logs
+     * "you are using an absolute path ... but assetManager is NOT set to null" and
+     * aborts the process — and the model graph cannot be moved out of the APK without
+     * unpacking 19 MB per install. So the lexicon and the FSTs are read from inside
+     * the APK too, which is also why none of them is copied to disk.
+     */
+    private fun build(role: SpeechRole, voice: VoiceCatalog.BundledVoice): OfflineTts {
+        val vits: OfflineTtsVitsModelConfig
+        var ruleFsts = ""
+        if (role == SpeechRole.Translation) {
+            ruleFsts = VoiceCatalog.ruleFstPaths(voice)
+            vits = OfflineTtsVitsModelConfig(
+                model = VoiceCatalog.modelPath(voice),
+                tokens = VoiceCatalog.tokensPath(voice),
+                lexicon = VoiceCatalog.lexiconPath(voice),
+            )
+        } else {
+            vits = OfflineTtsVitsModelConfig(
+                model = VoiceCatalog.modelPath(voice),
+                tokens = VoiceCatalog.tokensPath(voice),
+                dataDir = ensureEspeakData(),
+            )
+        }
+        return OfflineTts(
+            assetManager = context.assets,
+            config = OfflineTtsConfig(
+                model = OfflineTtsModelConfig(
+                    vits = vits,
+                    numThreads = threadCount(),
+                    debug = false,
+                    provider = "cpu",
+                ),
+                ruleFsts = ruleFsts,
+                maxNumSentences = 1,
+                silenceScale = 0.2f,
+            ),
+        )
+    }
+
+    private fun engineFor(role: SpeechRole): Engine? =
+        if (role == SpeechRole.Translation) translationEngine else readingEngine
+
+    /** Must run on [engineWorker]. */
+    private fun setEngine(role: SpeechRole, engine: Engine?) {
+        if (role == SpeechRole.Translation) translationEngine = engine else readingEngine = engine
+    }
+
     /** True once [prepare] has succeeded. */
-    val ready: Boolean get() = tts != null
+    val ready: Boolean get() = readingEngine != null
+
+    /** True once [prepareTranslation] has succeeded; false means "read English only". */
+    val translationReady: Boolean get() = translationEngine != null
 
     /**
-     * Speaks [text], reporting progress through the callbacks.
+     * Speaks [text] in [role], reporting progress through the callbacks.
      *
      * Returns immediately; synthesis runs on [engineWorker] and playback on
      * [playbackWorker]. [onDone] fires only after the audio has finished playing,
@@ -224,20 +309,21 @@ class NeuralTts(private val context: Context) {
      */
     fun speak(
         text: String,
+        role: SpeechRole,
         rate: Float,
         onStart: () -> Unit,
         onDone: () -> Unit,
         onError: () -> Unit,
     ) {
-        val engine = tts ?: run { onError(); return }
+        val engine = engineFor(role) ?: run { onError(); return }
         if (text.isBlank()) {
             onDone()
             return
         }
         val token = generation.incrementAndGet()
-        val sid = loadedSid
+        val sid = engine.sid
         val engineGen = engineGeneration.get()
-        takePrefetched(text, rate, sid, engineGen)?.let { clip ->
+        takePrefetched(text, role, rate, sid, engineGen)?.let { clip ->
             playbackWorker.execute { play(clip, token, onStart, onDone, onError) }
             return
         }
@@ -245,18 +331,18 @@ class NeuralTts(private val context: Context) {
             // A prefetch for this very sentence may have been queued ahead of this
             // task; the FIFO worker means it has finished by now, so look again
             // before paying for a second synthesis of the same text.
-            takePrefetched(text, rate, sid, engineGen)?.let { clip ->
+            takePrefetched(text, role, rate, sid, engineGen)?.let { clip ->
                 playbackWorker.execute { play(clip, token, onStart, onDone, onError) }
                 return@execute
             }
             // `release` runs on this same worker, so an engine that is no longer the
             // current one has already been freed and must not be touched.
-            if (tts !== engine) {
+            if (engineFor(role) !== engine) {
                 onError()
                 return@execute
             }
             val audio = try {
-                engine.generate(text = text, sid = sid, speed = rate)
+                engine.tts.generate(text = text, sid = sid, speed = rate)
             } catch (error: Throwable) {
                 Log.w(TAG, "synthesis failed", error)
                 onError()
@@ -267,7 +353,7 @@ class NeuralTts(private val context: Context) {
                 onError()
                 return@execute
             }
-            val clip = Clip(text, rate, sid, audio.samples, audio.sampleRate, engineGen)
+            val clip = Clip(text, role, rate, sid, audio.samples, audio.sampleRate, engineGen)
             playbackWorker.execute { play(clip, token, onStart, onDone, onError) }
         }
     }
@@ -285,24 +371,24 @@ class NeuralTts(private val context: Context) {
      * that arrives while the engine is busy with an earlier one is dropped rather
      * than queued: the next [speak] will synthesise it if it is still wanted.
      */
-    fun prefetch(text: String, rate: Float) {
-        val engine = tts ?: return
+    fun prefetch(text: String, role: SpeechRole, rate: Float) {
+        val engine = engineFor(role) ?: return
         if (text.isBlank()) return
-        val sid = loadedSid
+        val sid = engine.sid
         val engineGen = engineGeneration.get()
         synchronized(prefetchLock) {
-            if (prefetched?.matches(text, rate, sid, engineGen) == true) return
+            if (prefetched?.matches(text, role, rate, sid, engineGen) == true) return
             if (prefetchingText == text) return
             prefetchingText = text
         }
         engineWorker.execute {
             // The engine was replaced while this was queued; generating now would
             // either use a freed native handle or record a clip for the wrong voice.
-            if (engineGeneration.get() != engineGen || tts !== engine) {
+            if (engineGeneration.get() != engineGen || engineFor(role) !== engine) {
                 synchronized(prefetchLock) { if (prefetchingText == text) prefetchingText = null }
                 return@execute
             }
-            val audio = runCatching { engine.generate(text = text, sid = sid, speed = rate) }.getOrNull()
+            val audio = runCatching { engine.tts.generate(text = text, sid = sid, speed = rate) }.getOrNull()
             synchronized(prefetchLock) {
                 if (prefetchingText == text) prefetchingText = null
                 val samples = audio?.samples
@@ -311,20 +397,25 @@ class NeuralTts(private val context: Context) {
                 // Checking one would drop the clip in the normal case, because the
                 // next `speak` bumps the token while this generation is still running.
                 if (samples != null && samples.isNotEmpty() && engineGeneration.get() == engineGen) {
-                    prefetched = Clip(text, rate, sid, samples, audio.sampleRate, engineGen)
+                    prefetched = Clip(text, role, rate, sid, samples, audio.sampleRate, engineGen)
                 }
             }
         }
     }
 
     /** Removes and returns the held clip when it is the one asked for. */
-    private fun takePrefetched(text: String, rate: Float, sid: Int, engineGen: Int): Clip? =
-        synchronized(prefetchLock) {
-            val held = prefetched ?: return@synchronized null
-            if (!held.matches(text, rate, sid, engineGen)) return@synchronized null
-            prefetched = null
-            held
-        }
+    private fun takePrefetched(
+        text: String,
+        role: SpeechRole,
+        rate: Float,
+        sid: Int,
+        engineGen: Int,
+    ): Clip? = synchronized(prefetchLock) {
+        val held = prefetched ?: return@synchronized null
+        if (!held.matches(text, role, rate, sid, engineGen)) return@synchronized null
+        prefetched = null
+        held
+    }
 
     /**
      * Plays one synthesised clip to the end.
@@ -402,21 +493,30 @@ class NeuralTts(private val context: Context) {
     fun release() {
         stop()
         engineGeneration.incrementAndGet()
-        runCatching { engineWorker.submit { releaseLocked() }.get() }
+        runCatching {
+            engineWorker.submit {
+                releaseLocked(SpeechRole.Reading)
+                releaseLocked(SpeechRole.Translation)
+            }.get()
+        }
     }
 
-    /** Frees the engine. Must run on [engineWorker] only. */
-    private fun releaseLocked() {
-        runCatching { tts?.release() }
-        tts = null
-        loadedVoiceId = ""
-        loadedSid = 0
+    /** Frees one engine slot. Must run on [engineWorker] only. */
+    private fun releaseLocked(role: SpeechRole) {
+        val engine = engineFor(role) ?: return
+        runCatching { engine.tts.release() }
+        setEngine(role, null)
     }
 
     fun shutdown() {
         stop()
         engineGeneration.incrementAndGet()
-        runCatching { engineWorker.submit { releaseLocked() }.get() }
+        runCatching {
+            engineWorker.submit {
+                releaseLocked(SpeechRole.Reading)
+                releaseLocked(SpeechRole.Translation)
+            }.get()
+        }
         engineWorker.shutdown()
         playbackWorker.shutdown()
     }
@@ -504,7 +604,7 @@ class NeuralTts(private val context: Context) {
         val root = File(context.filesDir, "tts")
         val target = File(root, "espeak-ng-data")
         val stamp = File(root, "espeak.stamp")
-        val fingerprint = assetFingerprint()
+        val fingerprint = assetFingerprint(VoiceCatalog.ESPEAK_ASSET_DIR)
         if (target.isDirectory && stamp.takeIf { it.isFile }?.readText()?.trim() == fingerprint) {
             return target.absolutePath
         }
@@ -517,12 +617,12 @@ class NeuralTts(private val context: Context) {
     }
 
     /**
-     * Identifies the bundled espeak payload.
+     * Identifies one bundled payload.
      *
      * File count and total size are enough to notice a voice pack that changed
      * between app versions without hashing megabytes on every launch.
      */
-    private fun assetFingerprint(): String {
+    private fun assetFingerprint(root: String): String {
         var files = 0
         var bytes = 0L
         fun walk(path: String) {
@@ -534,7 +634,7 @@ class NeuralTts(private val context: Context) {
             }
             children.forEach { walk("$path/$it") }
         }
-        runCatching { walk(VoiceCatalog.ESPEAK_ASSET_DIR) }
+        runCatching { walk(root) }
         return "$files:$bytes"
     }
 

@@ -20,6 +20,7 @@
 | **个人生词率** | 按你的生词本算每篇"生词 N/M"与"轻松/合适/有挑战/偏难"判断，首页列表带 `生词 N 个` 角标；偏难时可先"预习生词"再读 |
 | **记忆曲线复习** | Leitner 盒子（10 分钟 → 1 天 → 3 天 → 7 天 → 21 天），答对升盒、答错回退并当轮重现；卡片附同词性易混释义 |
 | **朗读跟读** | 逐句朗读，正在朗读的句子高亮并始终留在屏幕上，点任意句子可跳转；语速与英/美口音可调，英式下另有纪录片解说音色。语音随安装包提供，不依赖手机自带的朗读引擎 |
+| **中英对照朗读** | 每句英文读完后接着用中文语音读出这句的中文，默认开启。读的是逐句对齐显示的那份译文，所以听到的和屏幕上看到的对得上；译文还没取回来、或这一段对不上时，这句只读英文。中文语音是第二个常驻引擎，中英交替不重新载入模型 |
 | **后台朗读** | 锁屏或切到别的应用时朗读继续，通知栏与锁屏有播放控制（暂停/继续/停止），回来接着读；暂停后按播放从刚才那句开始，不是从头 |
 | **长难句拆解** | 长按句子：先给"句子主干"，再按从句/非谓语/并列分句逐段拆解，标出主语谓语，并说明为什么这样理解 |
 | **理解自测** | 从文章自身生成填空题与指代题，选项同词性同语域，答案可回溯原文 |
@@ -33,6 +34,7 @@
 - **外刊全文**：各媒体公开发布的 RSS 与网页（卫报、BBC、纽约时报、经济学人），仅用于个人学习阅读。请求带 `If-None-Match` / `If-Modified-Since`，源站回 304 时直接用本机缓存，不重复下载正文；请求头声明 `Accept-Encoding: gzip`，响应按需解压
 - **句子译文**：Google 翻译的公开接口，失败时降级到 MyMemory；需要网络，译文保存在本机
 - **朗读语音**：[Piper](https://github.com/rhasspy/piper) 的 VITS 模型，用 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 推理。英式 `en_GB-alan-medium`（[mimic3-voices](https://github.com/MycroftAI/mimic3-voices) 的 apope 录音）、美式 `en_US-lessac-medium`（LibriTTS/Blizzard 系公开录音）、纪录片解说音色来自 [VCTK](https://datashare.ed.ac.uk/handle/10283/3443) 语料的 p274 说话人（CC BY 4.0）。音素化用 espeak-ng 的英语数据
+- **中文朗读语音**：Piper 的 `zh_CN-xiao_ya-medium`（小雅，22.05 kHz），取自 [sherpa-onnx 发布的 int8 量化包](https://github.com/k2-fsa/sherpa-onnx/releases/tag/tts-models)。它不走 espeak-ng，而是用同一个包里带的拼音词典与三条规则 FST（日期、数字、电话号码）做前端——书面数字得先转成拼音，词典才查得到。训练语料是 [BZNSYP](https://huggingface.co/openspeech/BZNSYP)（Data Baker 标准中文女声），该语料**仅限非商业用途**
 
 ## 导入书籍
 
@@ -112,6 +114,20 @@ python tools/voice/measure.py \
 
 **句子边界是朗读的最小单位，切错就等于在句子中间落了一个句号。** 朗读按句合成（见下文"句间停顿"），所以 `Sentences.split` 切在哪里，语音就在哪里走一遍句末语调并重新起头。原来的规则只在句点后面看下一个词是不是小写，收尾引号、叹号、问号、省略号一概不看：`“Do not you want to know who has taken it?” cried his wife, impatiently.` 被切成两句，第二句 `cried his wife, impatiently.` 单独合成，听感就是说到一半先落一个句号。现在句号以外的终止符、以及跟在收尾引号后面的情况，都按同一条规则处理——下一个词小写或数字就还在同一句里（`?” cried his wife`、`“How so? how can it affect them?”`），大写才是新句子（`He said “stop.” Then he left.`）。把 `tools/raw/pg1342.txt` 这类真实文本整段拼起来逐句切，改前有 4 句是被切出来的半句，改后为 0。
 
+### 中英对照朗读
+
+打开「英文后接着朗读中文」（默认开）后，每句英文读完会紧接着读这句的中文。读的不是另取的一份译文，而是**屏幕上逐句对照显示的那一份**——同一次 `SentenceAlignment.align` 的结果，所以听到的和看到的对得上；译文还没取回来、或这一段机器翻译改写得太厉害对不上时，这一句只读英文，不会停下来等。
+
+**两个模型同时驻留内存。** 中英是一句一交替的，如果每对之间都换一次模型，一对句子里就会插进约一秒的空白；而两个引擎各占约 19 MB 的图，换来的代价比这点内存更贵。所以英文一个引擎、中文一个引擎，各自 `@Volatile` 一个槽位，切句只是换槽位，不重新载入。中文引擎在打开文章时就后台开始载入，正好和"读者还在看文章"的时间重叠，而不是和第一句的朗读重叠。
+
+**中文不走 espeak-ng。** sherpa-onnx 的 Piper 通路把 espeak 的语音名硬编码成 `en-us`，`OfflineTtsVitsModelConfig` 也没有暴露语音名的字段——原生库里既搜不到 `cmn`，也没有设置语音名的入口——所以中文模型走 espeak 会被英语规则音素化。`zh_CN-xiao_ya-medium` 的解法是自带拼音词典：模型配置里 `phoneme_type` 是 `pinyin`，引擎按字查词典得到声母韵母和声调，再用三条规则 FST 把书面数字改写成拼音能读的形式（`1837` → `一八三七`），这正是英语那边 `SpokenText` 手工做的事的中文对应物。两条前端互斥，不能共用一个引擎。
+
+**所有路径都必须是 APK 内的相对路径。** sherpa-onnx 把这两种模式当成互斥的：设置了 `AssetManager` 却给了绝对路径，它只打印一句 `you are using an absolute path ... but assetManager is NOT set to null` 然后**直接结束进程**——不是异常，`runCatching` 接不住。第一版把拼音词典解包到 `filesDir` 再传绝对路径，点开文章就闪退。现在模型、tokens、词典、三个 FST 全部按相对路径从 APK 里读，一个字都不用解包（espeak-ng 的数据是唯一例外，它用 `fopen` 自己开文件，必须落盘）。
+
+**中文读失败不会中断朗读。** 英语语音是主体，中文是附加的，所以中文引擎缺失、载入失败或合成不出音频时，队列把这一句当作"已读完"直接进下一句英文；而英语那边失败仍然按原来的语义停止朗读——"语音没了"和"这句没译文"是两件事。
+
+代价是安装包每个 ABI 增加约 13.8 MB（中文模型 int8 后 18.6 MB，在 APK 里压到约 13.8 MB），朗读时多常驻一个约 19 MB 的引擎。相对于英语语音已有的约 60 MB，这是把功能做完整所必需的。
+
 ### 朗读前把书面语改写成人话
 
 内置语音是拿 espeak-ng 做音素化的，它读数字和符号用的是通用朗读规则，不是"有人在念小说"的规则。实测（用同一套内置语音合成、再用 faster-whisper 回听识别）发现四处一听就知道是机器在念的地方，朗读前统一改写：
@@ -153,7 +169,7 @@ python tools/build_translations.py  # 为内置选段补中文译文（写回同
 ./gradlew :app:testDebugUnitTest -Pengreader.bookFixtures=/path/to/books
 ```
 
-语音模型与 sherpa-onnx 引擎已随仓库提供，无需额外步骤：模型在 `app/src/main/assets/tts/`，引擎是 `app/libs/sherpa-onnx.aar`（sherpa-onnx 没有 Maven 产物，因此随仓库提供）。构建按 ABI 拆包，`arm64-v8a` 给真机、`x86_64` 给模拟器；`armeabi-v7a` 与 `x86` 被排除，因为语音模型 60 MB，32 位进程放不下。
+语音模型与 sherpa-onnx 引擎已随仓库提供，无需额外步骤：模型在 `app/src/main/assets/tts/`，引擎是 `app/libs/sherpa-onnx.aar`（sherpa-onnx 没有 Maven 产物，因此随仓库提供）。构建按 ABI 拆包，`arm64-v8a` 给真机、`x86_64` 给模拟器；`armeabi-v7a` 与 `x86` 被排除，因为语音模型共 77 MB，32 位进程放不下。
 
 `tools/build_dict.py` 与 `tools/build_seed.py` 需要把原始数据放在 `tools/raw/`（该目录已 git-ignore）：`ecdict.csv`、`lemma.en.txt` 来自 ECDICT 仓库，`pg*.txt` 来自 Project Gutenberg。
 `build_translations.py` 只处理内置选段（8 篇、约 70 段），需要网络；外刊译文由 App 在运行时按需获取。
@@ -224,14 +240,14 @@ app/src/main/java/com/engreader/app/
 │   ├── SentenceAlignment   把整段译文切回逐句；句数一致直接用，不一致按比例分配
 │   └── MiniJson            纯 JVM JSON 解析，供响应解析与单测
 ├── tts/            内置神经语音（模型随包 + 逐句队列 + 完成回调）
-│   ├── Speech.kt       语音目录：口音分组、音色、模型路径与说话人编号
-│   ├── NeuralTts.kt    sherpa-onnx 推理（合成线程）+ AudioTrack 播放（播放线程）+ 下一句预合成
-│   ├── Speaker.kt      后端路由：内置语音优先，系统 TTS 仅作降级
+│   ├── Speech.kt       语音目录：口音分组、音色、模型路径、拼音词典与规则 FST 路径
+│   ├── NeuralTts.kt    sherpa-onnx 推理（合成线程）+ AudioTrack 播放（播放线程）+ 下一句预合成；英文与中文各一个常驻引擎
+│   ├── Speaker.kt      后端路由：内置语音优先，系统 TTS 仅作降级；按角色分派中英文
 │   └── PlaybackService.kt  前台服务 + MediaSession：锁屏与通知栏的播放控制
 └── ui/             Compose 界面
 ```
 
-分析层（`nlp/`、`dict/`、`translate/`）不依赖 Android SDK，因此可以在 JVM 单元测试里直接跑——`app/src/test/` 覆盖了句子切分、语法拆解、出题逻辑与译文解析。`tts/Speech.kt` 同样不碰 Android，语音目录的解析规则也在单测里。
+分析层（`nlp/`、`dict/`、`translate/`）不依赖 Android SDK，因此可以在 JVM 单元测试里直接跑——`app/src/test/` 覆盖了句子切分、语法拆解、出题逻辑与译文解析。`tts/Speech.kt` 同样不碰 Android，语音目录的解析规则也在单测里；`ChineseVoiceAssetsTest` 另外盯着随包的中文前端（六个文件都在、词典是拼音的、路径全是相对路径）。
 
 逐句对齐另有真书语料：`app/src/test/resources/translate/alignment_corpus.tsv` 是《傲慢与偏见》七十个多句段落的英文与**在线接口实际返回的**中文，`AlignmentCorpusTest` 用它守住"至少九成段落能逐句对照"与"句内误切不超过 12 处"两条线。手写的用例可以被调参调到刚好通过，真书语料不行——换算法、改阈值，掉多少个百分点、多切错几处，这里看得见。语料上精确句数匹配只覆盖 62% 的段落，比例分配把可逐句对照的段落补到 100%。
 
@@ -263,7 +279,9 @@ app/src/main/java/com/engreader/app/
 
 ## 已知限制
 
-- **朗读不依赖系统 TTS**：语音模型随安装包提供（英式两个、美式一个，约 60 MB），任何设备上音色一致，模拟器上也能出声。代价是安装包变大，且按 ABI 拆包：`arm64-v8a` 约 96 MB、`x86_64` 约 99 MB，真机装前者。sherpa-onnx 的原生库每个架构约 24 MB，语音模型约 60 MB，两者都压不下去。只有在内置模型载入失败时才会退回系统朗读引擎，此时音色由设备决定
+- **朗读不依赖系统 TTS**：语音模型随安装包提供（英式两个、美式一个，加中文一个，共约 77 MB），任何设备上音色一致，模拟器上也能出声。代价是安装包变大，且按 ABI 拆包：`arm64-v8a` 约 107 MB、`x86_64` 约 110 MB，真机装前者。sherpa-onnx 的原生库每个架构约 24 MB，语音模型约 77 MB，两者都压不下去。只有在内置模型载入失败时才会退回系统朗读引擎，此时音色由设备决定
+- **中英对照朗读要多占一个引擎**：打开后中文语音与英文语音同时常驻内存（各约 19 MB 的图），换来的是中英交替时不重新载入模型。中文这一侧读失败只跳过这一句，不会中断朗读；关掉开关后中文引擎仍留在内存里直到朗读会话结束，重新打开不需要再等载入
+- **中文语音的语料仅限非商业使用**：`zh_CN-xiao_ya-medium` 训练自 BZNSYP（Data Baker 标准中文女声），该语料标注的授权是"仅限非商业用途"（见上文"内容来源"）。这个应用是个人学习用途，但若要商用，中文这一条需要换成许可更宽的语音
 - **句间停顿靠预合成压掉**：神经语音合成一句要 0.3–5 秒（视句长），早期版本把合成和播放放在同一个线程上，这段等待就变成了两句之间一段可听见的空白。现在合成与播放各占一个线程，开始朗读某句时同时把下一句送进合成，实测句间空档从秒级降到 20 毫秒以内；代价是朗读时多占一个 CPU 线程与一句音频的内存
 - **没有开源语音是真正的大卫·爱登堡**：见上文"朗读语音"，所谓"纪录片解说"是按基频、语速与停顿测出来的语域，不是某位解说员的克隆
 - **句子译文需要网络**：词库与内置选段是离线的，但任意外刊文章的译文要走在线翻译服务。译文按段落整篇发送、取回后存在本机，同一篇不会重复请求；没有网络时英文正文照常可读，只在顶部提示重试

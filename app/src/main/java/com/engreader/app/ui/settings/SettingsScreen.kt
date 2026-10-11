@@ -73,6 +73,7 @@ fun SettingsScreen(onBack: () -> Unit) {
     var speechVoice by remember { mutableStateOf(settings.speechVoice) }
     var theme by remember { mutableStateOf(settings.readingTheme) }
     var showTranslation by remember { mutableStateOf(settings.showTranslation) }
+    var speakTranslation by remember { mutableStateOf(settings.speakTranslation) }
     var backupMessage by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -292,6 +293,22 @@ fun SettingsScreen(onBack: () -> Unit) {
                     }
                 }
                 Spacer(Modifier.height(6.dp))
+            }
+
+            Spacer(Modifier.height(14.dp))
+            ToggleRow(
+                label = "英文后接着朗读中文",
+                detail = "每句英文读完后，接着用中文语音读出这句的中文；需要该文章的段落译文，" +
+                    "首次打开某篇文章时会联网获取",
+                checked = speakTranslation,
+            ) {
+                speakTranslation = it
+                settings.speakTranslation = it
+                // The Chinese voice is a second model held in memory beside the English
+                // one, so it is loaded the moment the switch goes on rather than at the
+                // first sentence — otherwise the first pair would be read with a pause
+                // in the middle while a 19 MB graph loads.
+                if (it) container.speaker.prepareTranslation()
             }
 
             Spacer(Modifier.height(22.dp))

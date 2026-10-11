@@ -60,8 +60,19 @@ class SettingsRepository(context: Context) {
 
     /** Show the Chinese translation panel under each paragraph. */
     var showTranslation: Boolean
-        get() = prefs.getBoolean(KEY_SHOW_TRANSLATION, false)
+        get() = prefs.getBoolean(KEY_SHOW_TRANSLATION, true)
         set(value) = prefs.edit().putBoolean(KEY_SHOW_TRANSLATION, value).apply()
+
+    /**
+     * Read each sentence's Chinese aloud after its English.
+     *
+     * On by default, and independent of [showTranslation]: the Chinese can be read out
+     * without the translation panel being on screen. Both read from the same stored
+     * translation, so turning this on costs nothing when the panel is already on.
+     */
+    var speakTranslation: Boolean
+        get() = prefs.getBoolean(KEY_SPEAK_TRANSLATION, true)
+        set(value) = prefs.edit().putBoolean(KEY_SPEAK_TRANSLATION, value).apply()
 
     /** Daily goal in minutes, used by the stats screen. */
     var dailyGoalMinutes: Int
@@ -83,6 +94,7 @@ class SettingsRepository(context: Context) {
         const val KEY_AUTO_SAVE = "auto_save"
         const val KEY_HIGHLIGHT = "highlight_saved"
         const val KEY_SHOW_TRANSLATION = "show_translation"
+        const val KEY_SPEAK_TRANSLATION = "speak_translation"
         const val KEY_DAILY_GOAL = "daily_goal"
         const val KEY_TTS_READY = "tts_ready"
     }

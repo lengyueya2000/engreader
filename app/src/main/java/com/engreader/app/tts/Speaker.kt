@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Which engine is actually producing the voice. */
 enum class SpeechBackend {
@@ -39,6 +40,12 @@ enum class SpeechBackend {
  * Everything above this class — the reading queue, the sentence highlight, the
  * preview button — is written in terms of [speak], [stop] and the [events] stream,
  * so which engine sits behind it makes no difference to them.
+ *
+ * There are two voices behind it, not one: the English voice the reader picks, and the
+ * Mandarin voice that reads the translation when the reader asks for it. They are
+ * addressed by [SpeechRole] rather than by the text, because the two run on different
+ * front ends and a Chinese line handed to the English voice would be spelled out letter
+ * by letter. Both are loaded at once, so alternating between them costs no reload.
  */
 class Speaker(private val context: Context) {
 
@@ -99,6 +106,15 @@ class Speaker(private val context: Context) {
      * a finished sentence, skipping the reader forward.
      */
     @Volatile private var oneShot = false
+
+    /**
+     * True while the Chinese voice is loading.
+     *
+     * An atomic rather than a plain flag because [prepareTranslation] is called from a
+     * composable, which can recompose many times while the 19 MB graph is being read;
+     * the compare-and-set is what keeps that to one load.
+     */
+    private val translationPreparing = AtomicBoolean(false)
 
     /**
      * Loads the voice, or reconfigures it when it is already up.
@@ -174,10 +190,32 @@ class Speaker(private val context: Context) {
      * seventh of real time, so without this the reader hears the whole synthesis as a
      * pause between sentences.
      */
-    fun prefetch(text: String) {
+    fun prefetch(text: String, role: SpeechRole = SpeechRole.Reading) {
         if (_state.value != SpeechState.Ready || oneShot) return
         if (_backend.value != SpeechBackend.Bundled) return
-        neural.prefetch(SpokenText.of(text), rate)
+        if (role == SpeechRole.Translation && !neural.translationReady) return
+        neural.prefetch(spoken(text, role), role, rate)
+    }
+
+    /**
+     * Loads the Chinese voice, once, off the main thread.
+     *
+     * Called when the reader turns on reading the translation aloud. It is a second
+     * resident engine rather than a swap: the read-aloud alternates English and Chinese
+     * sentence by sentence, and reloading a model between the two halves of every pair
+     * would put a second of silence in the middle of each. Until it lands, [speak] with
+     * [SpeechRole.Translation] reports the utterance as finished so the queue moves on
+     * to the next English sentence instead of stalling on a Chinese line that will
+     * never arrive.
+     */
+    fun prepareTranslation() {
+        if (closed || neural.translationReady) return
+        if (!translationPreparing.compareAndSet(false, true)) return
+        scope.launch(Dispatchers.Default) {
+            val loaded = neural.prepareTranslation()
+            translationPreparing.set(false)
+            if (!loaded) Log.w(TAG, "Chinese voice unavailable; reading English only")
+        }
     }
 
     /**
@@ -186,10 +224,14 @@ class Speaker(private val context: Context) {
      * [utteranceId] comes back on the matching [SpeechEvent], which is how the reader
      * learns which sentence finished and highlights the next one.
      *
-     * The text handed to the voice is [SpokenText.of] the sentence, not the sentence
-     * itself: years, roman numerals and markup are written for the eye, and the bundled
-     * voice reads them literally. The reader's own copy is untouched, so the highlight
-     * and the tap targets still refer to the original.
+     * [role] picks the voice. For [SpeechRole.Reading] the text handed to the voice is
+     * [SpokenText.of] the sentence, not the sentence itself: years, roman numerals and
+     * markup are written for the eye, and the bundled voice reads them literally. That
+     * rewrite is English-only — applying it to a Chinese line would spell `1837` as
+     * English words — so a [SpeechRole.Translation] line goes through untouched, with
+     * the rule FSTs in the Chinese engine doing the equivalent job. The reader's own
+     * copy is untouched either way, so the highlight and the tap targets still refer to
+     * the original.
      *
      * That rewrite can leave nothing behind, when the sentence is only an apparatus note
      * such as `[Illustration: ...]`. The queue is advanced here rather than by handing
@@ -197,11 +239,28 @@ class Speaker(private val context: Context) {
      * but the platform engine's callback for it is not something to rely on, and a
      * missing completion would strand the reader on the note forever.
      */
-    fun speak(text: String, utteranceId: String, flush: Boolean = true) {
+    fun speak(
+        text: String,
+        utteranceId: String,
+        role: SpeechRole = SpeechRole.Reading,
+        flush: Boolean = true,
+    ) {
         if (_state.value != SpeechState.Ready) return
         oneShot = false
         _speaking.value = true
-        val spoken = SpokenText.of(text)
+        // The Chinese half is an addition to the English read-aloud, never a
+        // replacement for it. When its voice is missing — not loaded yet, or the
+        // bundled engine failed and the platform one is in its place with an English
+        // locale set — reporting the utterance finished is what lets the next English
+        // sentence start. A failure here would be read as "the voice is gone" and stop
+        // the whole read-aloud.
+        if (role == SpeechRole.Translation &&
+            (_backend.value != SpeechBackend.Bundled || !neural.translationReady)
+        ) {
+            emit(SpeechEvent.Finished(utteranceId))
+            return
+        }
+        val spoken = spoken(text, role)
         if (spoken.isBlank()) {
             emit(SpeechEvent.Finished(utteranceId))
             return
@@ -209,16 +268,32 @@ class Speaker(private val context: Context) {
         if (_backend.value == SpeechBackend.Bundled) {
             neural.speak(
                 text = spoken,
+                role = role,
                 rate = rate,
                 onStart = { scope.launch { _speaking.value = true } },
                 onDone = { emit(SpeechEvent.Finished(utteranceId)) },
-                onError = { emit(SpeechEvent.Failed(utteranceId)) },
+                // A failure of the Chinese half is reported as finished, not failed.
+                // The reader treats `Failed` as "the voice is gone" and stops the whole
+                // read-aloud, which is right for the English voice and wrong for an
+                // addition to it: a Chinese engine that is missing or cannot pronounce
+                // this line should cost the reader that one line's translation and
+                // nothing more.
+                onError = {
+                    emit(
+                        if (role == SpeechRole.Translation) SpeechEvent.Finished(utteranceId)
+                        else SpeechEvent.Failed(utteranceId)
+                    )
+                },
             )
         } else {
             val tts = engine ?: run { emit(SpeechEvent.Failed(utteranceId)); return }
             tts.speak(spoken, if (flush) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD, null, utteranceId)
         }
     }
+
+    /** What the voice is handed: the spoken form for English, the line itself for Chinese. */
+    private fun spoken(text: String, role: SpeechRole): String =
+        if (role == SpeechRole.Translation) text else SpokenText.of(text)
 
     /**
      * Speaks a sample so the reader can hear a voice before committing to it.
@@ -233,6 +308,7 @@ class Speaker(private val context: Context) {
         if (_backend.value == SpeechBackend.Bundled) {
             neural.speak(
                 text = text,
+                role = SpeechRole.Reading,
                 rate = rate,
                 onStart = {},
                 onDone = { oneShot = false },
@@ -250,6 +326,7 @@ class Speaker(private val context: Context) {
         if (_backend.value == SpeechBackend.Bundled) {
             neural.speak(
                 text = word,
+                role = SpeechRole.Reading,
                 rate = rate,
                 onStart = {},
                 onDone = { oneShot = false },

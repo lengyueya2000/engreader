@@ -1,0 +1,20 @@
+# Bundled voice data is read byte-for-byte by the speech engine.
+#
+# The pinyin lexicon, the token tables and the espeak-ng data are text files, but
+# their readers were not written for Windows line endings: the lexicon is parsed as
+# `character pinyin tone _` per line, and a trailing carriage return turns the last
+# field into `_\r`, which the engine does not recognise. The models and the rule FSTs
+# are binary outright. Marking the tree binary keeps the bytes that were committed as
+# the bytes that are checked out, whatever `core.autocrlf` is set to on the machine
+# doing the cloning — a voice that reads differently on Windows than on Linux is not
+# something anyone can reason about.
+app/src/main/assets/tts/** binary
+
+# SQLite, read as bytes.
+app/src/main/assets/dict.db binary
+
+# The parser fixtures are real books, compressed and encrypted; git must not look
+# inside them at all.
+*.mobi binary
+*.epub binary
+*.azw3 binary

@@ -18,10 +18,13 @@ import com.engreader.app.nlp.Sentence
 import com.engreader.app.nlp.SentenceAnalysis
 import com.engreader.app.nlp.Sentences
 import com.engreader.app.nlp.VocabularyProfile
+import com.engreader.app.translate.SentenceAlignment
 import com.engreader.app.tts.PlaybackService
 import com.engreader.app.tts.SpeechBackend
 import com.engreader.app.tts.SpeechEvent
+import com.engreader.app.tts.SpeechRole
 import com.engreader.app.tts.SpeechState
+import com.engreader.app.tts.UtteranceId
 import com.engreader.app.tts.VoiceCatalog
 import com.engreader.app.ui.theme.ReadingTheme
 import kotlinx.coroutines.CancellationException
@@ -68,6 +71,14 @@ data class ReaderState(
     val speechLocale: String = "en-GB",
     /** Bundled voice the reader picked, or blank to use the accent's default. */
     val speechVoice: String = "",
+    /**
+     * Whether the read-aloud follows each English sentence with its Chinese.
+     *
+     * Independent of [showTranslation]: the Chinese can be read out without the
+     * paragraph translations being on screen, and both read from the same
+     * [translation] list.
+     */
+    val speakTranslation: Boolean = false,
     val speakingSentence: Int = -1,
     val listening: Boolean = false,
     /** Flattened sentence list used by listening mode and by next/prev navigation. */
@@ -188,6 +199,17 @@ class ReaderViewModel(
     private var lastSpokenIndex = -1
 
     /**
+     * Sentence-level Chinese for one paragraph, aligned once and kept.
+     *
+     * Aligning is a dynamic-programming fit over the paragraph and runs on the reading
+     * thread between two utterances, so it is done once per paragraph rather than once
+     * per sentence. The index is the cache key, and -1 means nothing is held; it is
+     * reset whenever the translation list is replaced.
+     */
+    private var alignedParagraph = -1
+    private var alignedSentences: List<String?> = emptyList()
+
+    /**
      * Where playback stopped when it was paused rather than ended.
      *
      * Kept so the lock-screen play button and the reader's own listen toggle both pick
@@ -268,10 +290,14 @@ class ReaderViewModel(
             speechRate = settings.speechRate,
             speechLocale = settings.speechLocale,
             speechVoice = settings.speechVoice,
+            speakTranslation = settings.speakTranslation,
             resumeParagraph = article.readParagraph.coerceIn(0, (paragraphs.size - 1).coerceAtLeast(0)),
         )
         readParagraph = state.resumeParagraph
         savedParagraph = readParagraph
+        // The article just replaced whatever the alignment was computed against, and a
+        // paragraph index means something else in the new one.
+        alignedParagraph = -1
         container.articles.markOpened(articleId)
         sessionStart = System.currentTimeMillis()
         // A chapter of a book also advances the book: this is what makes "continue
@@ -288,9 +314,17 @@ class ReaderViewModel(
             localeTag = settings.speechLocale,
             voiceId = settings.speechVoice,
         )
+        // The Chinese voice is a second 19 MB graph. Loading it here rather than at the
+        // first sentence means the wait overlaps with the reader opening the article,
+        // where nothing is being read aloud yet, instead of with the first pause
+        // between an English sentence and its Chinese.
+        if (settings.speakTranslation) container.speaker.prepareTranslation()
         // A previous session may have left the switch on with nothing behind it (an
-        // article read before translations existed, or one whose run failed).
-        if (settings.showTranslation && article.translation.isEmpty()) requestTranslation()
+        // article read before translations existed, or one whose run failed). Reading
+        // the Chinese aloud needs the translation just as much as showing it does.
+        if ((settings.showTranslation || settings.speakTranslation) && article.translation.isEmpty()) {
+            requestTranslation()
+        }
         assessVocabulary(article)
         // A jump asked for while the body was being split — a search hit in another
         // chapter — lands now that there are paragraphs to scroll to.
@@ -658,6 +692,24 @@ class ReaderViewModel(
     }
 
     /**
+     * Turns "read the Chinese after the English" on or off.
+     *
+     * Takes effect on the next utterance rather than restarting what is playing: the
+     * queue reads this flag when a sentence finishes, so switching it on mid-sentence
+     * adds the Chinese to the sentence already being read, and switching it off drops
+     * the Chinese from the pair in progress.
+     */
+    fun setSpeakTranslation(speak: Boolean) {
+        container.settings.speakTranslation = speak
+        state = state.copy(speakTranslation = speak)
+        if (!speak) return
+        container.speaker.prepareTranslation()
+        if (state.translation.isEmpty() && state.translationStatus != TranslationStatus.Loading) {
+            requestTranslation()
+        }
+    }
+
+    /**
      * Fetches the paragraph translations for the open article.
      *
      * Held here rather than in the reader screen so a translation survives the
@@ -675,6 +727,8 @@ class ReaderViewModel(
             try {
                 val translated = container.translator.translate(paragraphs, article.translation)
                 container.articles.setTranslation(article.id, translated)
+                // The alignment held for the old list no longer describes this one.
+                alignedParagraph = -1
                 state = state.copy(
                     translation = translated,
                     translationStatus = TranslationStatus.Ready,
@@ -802,12 +856,70 @@ class ReaderViewModel(
         }
         lastSpokenIndex = index
         state = state.copy(speakingSentence = index, listening = true)
-        container.speaker.speak(sentences[index].text, "sentence:$index")
-        // The next sentence is synthesised while this one plays. Synthesis takes a
-        // sizeable fraction of the sentence's own duration, and that time used to be
-        // heard as a pause between sentences; the engine generates on its own thread,
-        // so this overlaps with playback rather than delaying it.
-        sentences.getOrNull(index + 1)?.let { container.speaker.prefetch(it.text) }
+        // The Chinese voice is only needed once playback starts, and it is wanted on
+        // every path in — the reader's button, the lock screen, a tap on a sentence —
+        // so it is asked for here rather than at each entry point. Idempotent.
+        if (state.speakTranslation) container.speaker.prepareTranslation()
+        container.speaker.speak(sentences[index].text, UtteranceId.english(index))
+        prefetchAfterEnglish(index)
+    }
+
+    /**
+     * Reads the Chinese of sentence [index], which the queue plays after the English.
+     *
+     * The highlight deliberately stays on [index]: the Chinese is the second half of
+     * that sentence, not a move to another one, so the line under the reader's eye does
+     * not jump while its translation is being read.
+     */
+    private fun speakTranslationAt(index: Int, chinese: String) {
+        container.speaker.speak(chinese, UtteranceId.translation(index), SpeechRole.Translation)
+        // What comes after this is the next English sentence, never the Chinese of this
+        // one again — the two helpers differ in exactly that.
+        state.flatSentences.getOrNull(index + 1)?.let {
+            container.speaker.prefetch(it.text, SpeechRole.Reading)
+        }
+    }
+
+    /**
+     * Synthesises whatever will be played after sentence [index] finishes.
+     *
+     * The next thing to be heard is the Chinese of this sentence when it is going to be
+     * read, and otherwise the English of the next one. Synthesis takes a sizeable
+     * fraction of the sentence's own duration, and that time used to be heard as a
+     * pause; the engine generates on its own thread, so this overlaps with playback
+     * rather than delaying it.
+     */
+    private fun prefetchAfterEnglish(index: Int) {
+        if (state.speakTranslation) {
+            chineseFor(index)?.let { chinese ->
+                container.speaker.prefetch(chinese, SpeechRole.Translation)
+                return
+            }
+        }
+        state.flatSentences.getOrNull(index + 1)?.let {
+            container.speaker.prefetch(it.text, SpeechRole.Reading)
+        }
+    }
+
+    /**
+     * The Chinese of one flat sentence, or null when there is none to read.
+     *
+     * Null is the ordinary answer for a paragraph the translator re-broke rather than
+     * re-split — [SentenceAlignment] refuses to guess there — and for an article whose
+     * translation has not arrived yet. The caller reads English only in that case,
+     * which is what the reader would hear with the switch off.
+     */
+    private fun chineseFor(index: Int): String? {
+        val flat = state.flatSentences.getOrNull(index) ?: return null
+        val chinese = state.translation.getOrNull(flat.paragraphIndex)?.takeIf { it.isNotBlank() }
+            ?: return null
+        if (alignedParagraph != flat.paragraphIndex) {
+            val english = state.paragraphs.getOrNull(flat.paragraphIndex)
+                ?.sentences?.map { it.text }.orEmpty()
+            alignedSentences = SentenceAlignment.align(english, chinese).orEmpty()
+            alignedParagraph = flat.paragraphIndex
+        }
+        return alignedSentences.getOrNull(flat.sentenceIndex)?.takeIf { it.isNotBlank() }
     }
 
     private fun observeSpeech(scope: CoroutineScope) {
@@ -816,22 +928,35 @@ class ReaderViewModel(
             container.speaker.events.collect { event ->
                 if (!state.listening) return@collect
                 when (event) {
-                    is SpeechEvent.Finished -> {
-                        val id = event.utteranceId.removePrefix("sentence:")
-                        val index = id.toIntOrNull() ?: return@collect
-                        // Ignore a late callback from a sentence the user already skipped.
-                        if (index != lastSpokenIndex) return@collect
-                        val next = index + 1
-                        if (next < state.flatSentences.size) {
-                            speakAt(next)
-                        } else {
-                            stopListening()
-                        }
-                    }
+                    is SpeechEvent.Finished -> onUtteranceFinished(event.utteranceId)
                     is SpeechEvent.Failed -> stopListening()
                 }
             }
         }
+    }
+
+    /**
+     * Advances the queue by one utterance.
+     *
+     * The English of sentence N is followed by its Chinese when the reader asked for it,
+     * and by the English of N+1 otherwise; the Chinese of N is always followed by the
+     * English of N+1.
+     */
+    private fun onUtteranceFinished(utteranceId: String) {
+        val spoken = UtteranceId.parse(utteranceId) ?: return
+        // Ignore a late callback from a sentence the user already skipped.
+        if (spoken.index != lastSpokenIndex) return
+        val next = spoken.index + 1
+        if (spoken.role == SpeechRole.Translation) {
+            if (next < state.flatSentences.size) speakAt(next) else stopListening()
+            return
+        }
+        val chinese = if (state.speakTranslation) chineseFor(spoken.index) else null
+        if (chinese != null) {
+            speakTranslationAt(spoken.index, chinese)
+            return
+        }
+        if (next < state.flatSentences.size) speakAt(next) else stopListening()
     }
 
     /**

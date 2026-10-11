@@ -26,14 +26,15 @@ android {
         applicationId = "com.engreader.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 13
-        versionName = "1.4.1"
+        versionCode = 14
+        versionName = "1.5.0"
     }
 
     // One APK per ABI rather than one fat APK: the speech engine's native library is
     // ~25 MB per architecture, so a phone would otherwise download a copy it can
-    // never execute. armeabi-v7a and x86 are left out — the voice models alone are
-    // 37 MB, and a 32-bit process has no room for a 19 MB graph beside its runtime.
+    // never execute. armeabi-v7a and x86 are left out — the bundled voices are 77 MB
+    // of assets on their own, and a 32-bit process has no room for a 19 MB graph
+    // beside its runtime.
     splits {
         abi {
             isEnable = true
