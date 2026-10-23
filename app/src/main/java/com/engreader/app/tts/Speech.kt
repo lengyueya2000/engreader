@@ -78,6 +78,28 @@ object UtteranceId {
 object VoiceCatalog {
 
     /**
+     * Which front end a voice is loaded with.
+     *
+     * The two are not interchangeable: they take different files, phonemise text
+     * differently and produce different sample rates, so the choice travels with the
+     * voice rather than being inferred from the asset directory.
+     */
+    enum class VoiceEngine {
+        /**
+         * Piper VITS. The graph is the whole voice; espeak-ng turns text into the
+         * phonemes it was trained on.
+         */
+        Vits,
+
+        /**
+         * ZipVoice. The graph is a *speaker-independent* text-to-speech model, and the
+         * voice comes from a reference clip handed in with each request — which is why
+         * this one voice needs a [referencePath] beside its graph and the others do not.
+         */
+        ZipVoice,
+    }
+
+    /**
      * One bundled voice, with everything the picker needs to describe it.
      *
      * [assetDir] and [sid] exist because one model file can carry many speakers. The
@@ -102,24 +124,60 @@ object VoiceCatalog {
         val assetDir: String = id,
         /** Speaker index inside a multi-speaker model. */
         val sid: Int = 0,
+        /** Which front end reads this voice. */
+        val engine: VoiceEngine = VoiceEngine.Vits,
+        /** Sample rate the voice synthesises at, for the picker's second line. */
+        val sampleRateKhz: Int = 22,
     ) {
         /** What the picker shows: `英式 · 男声`. */
         val title: String get() = "$accent · $gender"
 
         /** The second line, naming the voice and what makes it worth choosing. */
-        val detail: String get() = "$name · $blurb · 22kHz 神经网络语音"
+        val detail: String get() = "$name · $blurb · ${sampleRateKhz}kHz 神经网络语音"
     }
+
+    /**
+     * The cloned broadcaster voice.
+     *
+     * Unlike every other entry in [all], this one is not a speaker inside a trained
+     * graph. It is ZipVoice — a speaker-independent model — given a clip of David
+     * Attenborough reading, and it copies the voice out of that clip at synthesis
+     * time. The graph and the clip ship together under `en_GB-attenborough`, and the
+     * prompt text lives beside the audio in `reference.txt`.
+     *
+     * Three things about it are deliberate and worth knowing before changing them:
+     *
+     * - **It is a real person.** The other voices are corpus speakers, which is why
+     *   the catalogue could say none of them was a broadcaster. This one is named
+     *   after the man it copies. The clip is a public broadcast recording, so the
+     *   voice is used here under the same personal-study assumption the rest of the
+     *   app's third-party content is; redistributing the APK commercially would need
+     *   his permission, and the README says so.
+     * - **It is much bigger.** The ZipVoice decoder and its vocoder are about 170 MB
+     *   against 19 MB for a Piper voice, and unlike the VCTK narrator it cannot share
+     *   a graph with anything.
+     * - **It is slower.** Roughly a third of real time on a desktop CPU, so a phone
+     *   is nearer real time. The per-sentence prefetch is what keeps that from being
+     *   heard as a gap; see [NeuralTts.prefetch].
+     */
+    val ATTENBOROUGH = BundledVoice(
+        id = "en_GB-attenborough",
+        localeTag = "en-GB",
+        accent = "英式",
+        gender = "男声",
+        name = "爱登堡",
+        blurb = "BBC 纪录片解说",
+        engine = VoiceEngine.ZipVoice,
+        sampleRateKhz = 24,
+    )
 
     /**
      * Every voice in the APK.
      *
-     * The British pair is deliberately two registers rather than two accents: one
-     * neutral reading voice and one documentary narrator, so a reader can match the
-     * voice to the text. Both come from the VCTK corpus or from single-speaker
-     * models trained on public recordings — none of them is a real broadcaster. No
-     * open model is trained on a living narrator's voice, so "documentary narrator"
-     * here describes the measured register — pitch, pace, pausing — and not a
-     * particular person.
+     * The British trio is deliberately three registers rather than three accents: a
+     * neutral reading voice, a measured documentary narrator, and a third that is a
+     * specific broadcaster's delivery — see [ATTENBOROUGH] for what that one is and
+     * what it costs.
      */
     val all: List<BundledVoice> = listOf(
         BundledVoice(
@@ -143,6 +201,7 @@ object VoiceCatalog {
             assetDir = "en_GB-vctk-medium",
             sid = 10,
         ),
+        ATTENBOROUGH,
         BundledVoice(
             id = "en_US-lessac-medium",
             localeTag = "en-US",
@@ -151,6 +210,30 @@ object VoiceCatalog {
             name = "Lessac",
         ),
     )
+
+    /**
+     * Diffusion steps for a cloning voice.
+     *
+     * ZipVoice is a flow-matching model, so this trades time for quality, and four is
+     * the cheapest setting that still passes the speaker-identity gate. Measured on the
+     * bundled prompt over twelve sentences, steps 2/4/6 cost 0.21/0.39/0.54 of real
+     * time, and an ECAPA-TDNN embedding of the synthesised speech was compared against
+     * recordings of the same man: 0.753 / 0.789 / 0.779 cosine similarity against a
+     * same-speaker floor of 0.768 — **two steps falls below it**, meaning the voice
+     * stops being his, while four steps keeps it. Word error agreed: 0.092 at two steps
+     * against 0.061 at four.
+     *
+     * Halving the cost is tempting — see [NeuralTts.prefetch] for how close a cloning
+     * voice runs to real time on a phone — but buying headroom by losing the identity
+     * the voice exists for is the wrong side of that trade.
+     *
+     * An earlier version of this comment justified four with an MFCC "timbre distance".
+     * That measurement is noise: repeated runs on identical input moved it by more than
+     * the differences it was being used to detect, and it is not monotonic in the step
+     * count. Speaker identity needs a model trained for it, which is why `tools/voice`
+     * measures it with ECAPA instead.
+     */
+    const val CLONE_STEPS = 4
 
     /** Accents offered in the picker, in display order. */
     val accents: List<Pair<String, String>> = listOf(
@@ -222,6 +305,36 @@ object VoiceCatalog {
 
     /** Relative asset path of a voice's pinyin lexicon, for the voices that carry one. */
     fun lexiconPath(voice: BundledVoice): String = "tts/${voice.assetDir}/lexicon.txt"
+
+    // ------------------------------------------------------------ cloning voices
+
+    /**
+     * The three graphs a ZipVoice voice is built from.
+     *
+     * Split where a Piper voice is one file: the text encoder turns the sentence into
+     * features, the flow-matching decoder turns those into a mel spectrogram, and the
+     * vocoder turns the mel back into samples. Only the vocoder is shared in
+     * principle — but it is *not* shared here, because a mismatched vocoder is
+     * accepted at load time and then produces noise, so each cloning voice keeps its
+     * own beside its graph rather than trusting a common one.
+     */
+    fun encoderPath(voice: BundledVoice): String = "tts/${voice.assetDir}/encoder.onnx"
+
+    fun decoderPath(voice: BundledVoice): String = "tts/${voice.assetDir}/decoder.onnx"
+
+    fun vocoderPath(voice: BundledVoice): String = "tts/${voice.assetDir}/vocoder.onnx"
+
+    /**
+     * The reference clip a cloning voice copies, and the words it says.
+     *
+     * The two are separate files on purpose: the audio is what the model listens to,
+     * and the text is what it aligns that audio against. Keeping the text in a plain
+     * `.txt` beside the `.wav` means the pair can be re-recorded by replacing two
+     * files, and a mismatch is visible in a diff rather than buried in code.
+     */
+    fun referencePath(voice: BundledVoice): String = "tts/${voice.assetDir}/reference.wav"
+
+    fun referenceTextPath(voice: BundledVoice): String = "tts/${voice.assetDir}/reference.txt"
 
     /**
      * The rule FSTs that belong beside a voice's lexicon, in the order sherpa-onnx

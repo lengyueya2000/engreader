@@ -12,6 +12,19 @@ tools/raw/
 
 .verify/
 
+# The Attenborough cloning voice's model files are 186 MB together, and decoder.onnx
+# alone (124.7 MB) is past the 100 MB ceiling a public git host will accept. They are an
+# asset on the GitHub Release instead, installed by tools/voice/fetch_attenborough.py,
+# which verifies every file against the hash of the model the voice was measured with.
+# The reference clip and its text stay in the repository: they are the editorial part of
+# this voice rather than a download.
+app/src/main/assets/tts/en_GB-attenborough/decoder.onnx
+app/src/main/assets/tts/en_GB-attenborough/encoder.onnx
+app/src/main/assets/tts/en_GB-attenborough/vocoder.onnx
+app/src/main/assets/tts/en_GB-attenborough/lexicon.txt
+app/src/main/assets/tts/en_GB-attenborough/tokens.txt
+app/src/main/assets/tts/en_GB-attenborough/.incoming-*/
+
 # Release APKs are published to GitHub Releases, not committed:
 # https://github.com/lengyueya2000/engreader/releases
 dist/

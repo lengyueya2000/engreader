@@ -203,14 +203,36 @@ class Speaker(private val context: Context) {
     }
 
     /**
+     * Drops the read-aloud's look-ahead because the reader jumped to another sentence.
+     *
+     * See [NeuralTts.discardLookAhead]: a banked clip for a sentence the reader has passed
+     * can never be played, and enough of them stop every later clip from being banked at
+     * all. Deliberately not called on an ordinary advance — the next sentence is exactly
+     * what the look-ahead is for. [stop] is not a substitute either: it keeps the work in
+     * flight, which is right for a pause and wrong for a jump.
+     */
+    fun discardLookAhead() {
+        if (closed) return
+        neural.discardLookAhead()
+    }
+
+    /**
      * Prepares [text] so the next [speak] for it starts without a wait.
      *
-     * Called for the sentence after the one being spoken. Synthesis runs at roughly a
-     * seventh of real time, so without this the reader hears the whole synthesis as a
-     * pause between sentences.
+     * Called for the sentences after the one being spoken. A Piper voice synthesises at
+     * roughly a seventh of real time, so one sentence of look-ahead is enough; a cloning
+     * voice is slower and [NeuralTts] keeps two — see [NeuralTts.prefetch].
+     *
+     * [oneShot] deliberately does not silence this. The flag marks an utterance whose
+     * *completion* the queue must ignore, which matters for a request that advances it —
+     * but skipping the look-ahead while a word was being read meant that after a
+     * look-up or a sentence jump the next sentence had nothing cached, and the reader
+     * heard a gap right where they had just tapped. [NeuralTts] now yields a queued
+     * look-ahead to any real request that overtakes it, so a prefetch arriving during a
+     * one-shot can no longer hold up the word.
      */
     fun prefetch(text: String, role: SpeechRole = SpeechRole.Reading) {
-        if (_state.value != SpeechState.Ready || oneShot) return
+        if (_state.value != SpeechState.Ready) return
         if (_backend.value != SpeechBackend.Bundled) return
         if (role == SpeechRole.Translation && !neural.translationReady) return
         neural.prefetch(spoken(text, role), role, rate)

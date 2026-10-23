@@ -87,7 +87,7 @@ class VoiceCatalogTest {
         // The point of the second voice: same accent, different delivery, so the
         // reader can match the voice to the text.
         val british = VoiceCatalog.forLocale("en-GB")
-        assertEquals(2, british.size)
+        assertEquals(3, british.size)
         assertEquals(british.size, british.map { it.blurb }.toSet().size)
         assertEquals(british.size, british.map { it.name }.toSet().size)
     }
@@ -149,6 +149,124 @@ class VoiceCatalogTest {
     @Test
     fun `an unknown id is reported as unknown`() {
         assertNull(VoiceCatalog.byId("en_XX-nobody-medium"))
+    }
+
+    // -------------------------------------------------------- the cloning voice
+
+    @Test
+    fun `the cloning voice is the only one that needs a reference clip`() {
+        // Every other voice is a speaker inside a trained graph and is complete with
+        // its model and tokens. A ZipVoice voice is speaker-independent: without the
+        // clip it would still synthesise, in a voice nobody chose, which is why the
+        // engine refuses it rather than falling back.
+        val cloning = VoiceCatalog.all.filter { it.engine == VoiceCatalog.VoiceEngine.ZipVoice }
+        assertEquals(1, cloning.size)
+        assertEquals(VoiceCatalog.ATTENBOROUGH, cloning.first())
+        assertTrue(VoiceCatalog.ATTENBOROUGH in VoiceCatalog.all)
+    }
+
+    @Test
+    fun `the cloning voice ships its own graph rather than sharing one`() {
+        // It cannot share: the VCTK narrator and the cloning voice are different
+        // architectures, and two voices sharing an asset directory are told apart by
+        // speaker index, which a cloning voice does not have.
+        val voice = VoiceCatalog.ATTENBOROUGH
+        assertEquals(voice.id, voice.assetDir)
+        assertTrue(VoiceCatalog.all.none { it !== voice && it.assetDir == voice.assetDir })
+    }
+
+    @Test
+    fun `the cloning voice points at all four files it needs`() {
+        // The three graphs plus the lexicon. A missing one is not caught at load
+        // time by the native library for every combination — the vocoder in
+        // particular is accepted and then produces noise — so the paths are pinned
+        // here instead.
+        val voice = VoiceCatalog.ATTENBOROUGH
+        val dir = "tts/${voice.assetDir}"
+        assertEquals("$dir/encoder.onnx", VoiceCatalog.encoderPath(voice))
+        assertEquals("$dir/decoder.onnx", VoiceCatalog.decoderPath(voice))
+        assertEquals("$dir/vocoder.onnx", VoiceCatalog.vocoderPath(voice))
+        assertEquals("$dir/lexicon.txt", VoiceCatalog.lexiconPath(voice))
+        assertEquals("$dir/tokens.txt", VoiceCatalog.tokensPath(voice))
+    }
+
+    @Test
+    fun `the cloning voice's reference clip and its text sit beside the graph`() {
+        // The pair has to be replaceable together, and the text has to be the words
+        // the audio actually says: the engine aligns one against the other, and a
+        // mismatch makes the voice drift rather than fail.
+        val voice = VoiceCatalog.ATTENBOROUGH
+        assertEquals("tts/${voice.assetDir}/reference.wav", VoiceCatalog.referencePath(voice))
+        assertEquals("tts/${voice.assetDir}/reference.txt", VoiceCatalog.referenceTextPath(voice))
+        assertEquals(
+            VoiceCatalog.referencePath(voice).substringBeforeLast('/'),
+            VoiceCatalog.referenceTextPath(voice).substringBeforeLast('/'),
+        )
+    }
+
+    @Test
+    fun `every path the cloning engine is given is relative to the asset root`() {
+        // Same reason as the Chinese voice: an absolute path with an asset manager set
+        // aborts the process inside the native library. The reference clip is the one
+        // exception in the other direction — it is read by this app, not by the
+        // engine — but it is still stored as a relative asset path.
+        val voice = VoiceCatalog.ATTENBOROUGH
+        val paths = listOf(
+            VoiceCatalog.tokensPath(voice),
+            VoiceCatalog.encoderPath(voice),
+            VoiceCatalog.decoderPath(voice),
+            VoiceCatalog.vocoderPath(voice),
+            VoiceCatalog.lexiconPath(voice),
+            VoiceCatalog.referencePath(voice),
+            VoiceCatalog.referenceTextPath(voice),
+        )
+        paths.forEach { path ->
+            assertTrue("$path is absolute", !path.startsWith("/"))
+            assertTrue(
+                "$path is not namespaced under the voice's asset directory",
+                path.startsWith("tts/${voice.assetDir}/"),
+            )
+        }
+    }
+
+    @Test
+    fun `a Piper voice is not given cloning paths`() {
+        // The picker lists both kinds side by side, and a Piper voice handed a
+        // reference clip would be a silent no-op rather than an error.
+        val piper = VoiceCatalog.byId("en_GB-alan-medium")!!
+        assertEquals(VoiceCatalog.VoiceEngine.Vits, piper.engine)
+        val cloning = VoiceCatalog.all.filter { it.engine == VoiceCatalog.VoiceEngine.Vits }
+        assertTrue(cloning.all { it.engine != VoiceCatalog.VoiceEngine.ZipVoice })
+    }
+
+    @Test
+    fun `the cloning voice reports the sample rate it actually synthesises at`() {
+        // 24 kHz, not the 22.05 kHz of the Piper voices, and the picker prints this
+        // number — a stale value would misdescribe the voice in the UI.
+        assertEquals(24, VoiceCatalog.ATTENBOROUGH.sampleRateKhz)
+        assertTrue(VoiceCatalog.ATTENBOROUGH.detail.contains("24kHz"))
+        VoiceCatalog.all.filter { it.engine == VoiceCatalog.VoiceEngine.Vits }.forEach { voice ->
+            assertEquals("${voice.id} should be a 22.05 kHz Piper voice", 22, voice.sampleRateKhz)
+        }
+    }
+
+    @Test
+    fun `the cloning voice is reachable and selectable like any other`() {
+        // It has to resolve through the same path a stored setting takes, or picking
+        // it would silently fall back to the accent default on the next launch.
+        val voice = VoiceCatalog.ATTENBOROUGH
+        assertEquals(voice, VoiceCatalog.byId(voice.id))
+        assertEquals(voice, VoiceCatalog.resolve("en-GB", voice.id))
+        assertTrue(voice in VoiceCatalog.forLocale("en-GB"))
+        assertTrue(voice !== VoiceCatalog.defaultFor("en-GB"))
+    }
+
+    @Test
+    fun `the cloning voice's diffusion step count is pinned`() {
+        // Four is the cheapest setting whose output still matches the speaker under an
+        // ECAPA embedding; two steps costs 46% less and falls below the same-speaker
+        // floor, i.e. it stops sounding like him. See VoiceCatalog.CLONE_STEPS.
+        assertEquals(4, VoiceCatalog.CLONE_STEPS)
     }
 
     @Test

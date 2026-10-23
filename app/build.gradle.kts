@@ -26,8 +26,8 @@ android {
         applicationId = "com.engreader.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 23
-        versionName = "1.7.4"
+        versionCode = 24
+        versionName = "1.8.0"
     }
 
     // One APK per ABI rather than one fat APK: the speech engine's native library is
@@ -35,6 +35,11 @@ android {
     // never execute. armeabi-v7a and x86 are left out — the bundled voices are 77 MB
     // of assets on their own, and a 32-bit process has no room for a 19 MB graph
     // beside its runtime.
+    //
+    // The Attenborough voice added in 1.8.0 is a ZipVoice model, which is a different
+    // shape of thing: ~170 MB rather than ~19 MB, because it carries a
+    // speaker-independent decoder and its own vocoder. That is what takes the arm64
+    // APK to roughly 285 MB; see the README's "已知限制".
     splits {
         abi {
             isEnable = true

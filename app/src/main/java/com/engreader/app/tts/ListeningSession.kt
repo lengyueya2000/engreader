@@ -1,5 +1,6 @@
 package com.engreader.app.tts
 
+import android.util.Log
 import com.engreader.app.data.AppContainer
 import com.engreader.app.nlp.Paragraphs
 import com.engreader.app.nlp.Sentences
@@ -147,6 +148,23 @@ class ListeningSession(private val container: AppContainer) {
 
     /** Set while the end of a piece is being handled, so a second event cannot repeat it. */
     private var ending = false
+
+    /**
+     * Guards against the queue stalling silently on one sentence.
+     *
+     * The queue only ever moves on a `Finished` or `Failed` report. If that report never
+     * arrives — an utterance handed to a voice that died mid-call, or one dropped by the
+     * [observeEvents] guard below — the listener is left with the play button reading
+     * 暂停 and nothing coming out of the speaker until they touch it. That is the most
+     * extreme form of "it stops for a long time", and it is unrecoverable on its own.
+     *
+     * One job is armed per utterance. When it fires, the queue is nudged forward from the
+     * sentence it is actually on, which is also what a listener's own tap would do.
+     */
+    private var watchdogJob: Job? = null
+
+    /** Watchdog re-tries since the last clean utterance; see [armWatchdog]. */
+    private var watchdogRetries = 0
 
     /**
      * True between asking for a piece and its first sentence actually being handed over.
@@ -454,6 +472,12 @@ class ListeningSession(private val container: AppContainer) {
         // sentence the pause had left off on instead of the one now playing.
         pausedIndex = -1
         val wasPlaying = _state.value.playing
+        // A jump — next, previous, a tap on another sentence — leaves the look-ahead aimed
+        // at the sentences that were skipped, where its clips can never be played and
+        // eventually stop the look-ahead from banking anything at all; see
+        // [Speaker.discardLookAhead]. The sequential advance and a watchdog retry of the
+        // same sentence are both untouched, because neither has passed anything.
+        if (index != lastIndex && index != lastIndex + 1) container.speaker.discardLookAhead()
         lastIndex = index
         val spoken = queue[index]
         _state.update {
@@ -473,6 +497,7 @@ class ListeningSession(private val container: AppContainer) {
         // so it is asked for here rather than at each entry point. Idempotent.
         if (container.settings.speakTranslation) container.speaker.prepareTranslation()
         container.speaker.speak(queue[index].text, UtteranceId.english(index))
+        armWatchdog()
         prefetchAfter(index)
         // The notification's middle button and the lock screen both read `playing`, and
         // a skip or a seek from a paused state starts audio without going through
@@ -484,6 +509,7 @@ class ListeningSession(private val container: AppContainer) {
 
     private fun speakTranslationAt(index: Int, chinese: String) {
         container.speaker.speak(chinese, UtteranceId.translation(index), SpeechRole.Translation)
+        armWatchdog()
         // What follows this Chinese line is the next sentence's English, so that is what
         // is worth synthesising now. Prefetching the next *Chinese* line here asked the
         // Mandarin engine for a sentence that would not be wanted for another two
@@ -493,21 +519,78 @@ class ListeningSession(private val container: AppContainer) {
     }
 
     /**
-     * Synthesises whatever will be played after sentence [index] finishes.
+     * Synthesises what will be played after sentence [index] finishes.
      *
-     * The next thing heard is this sentence's Chinese when it is going to be read, and
-     * the English of the next one otherwise. Synthesis takes a sizeable fraction of the
-     * sentence's own duration, and the engine generates on its own thread, so this
-     * overlaps with playback instead of delaying it.
+     * With the translation switched on the next two utterances are this sentence's
+     * Chinese and then the English of the next one — a different engine for each, and
+     * [NeuralTts] keeps a look-ahead per role — so both are asked for here. The queue
+     * then has work in flight for the whole of sentence N's playback, which is what a
+     * cloning voice needs: its per-call cost has a large fixed part, so a short English
+     * sentence takes *less* time to play than the next one takes to build, and a
+     * look-ahead of one sentence alone leaves the surplus audible as a gap.
+     *
+     * Reading English only, the request reaches four sentences ahead. That is not
+     * speculation for its own sake: the Mandarin half is what keeps the engine fed when
+     * the translation is on, and with it off the same measurements show the engine
+     * worker sitting idle for about 60 s of a 223 s run while the reader waited 56.6 s
+     * of silence. Asking for two sentences when four are affordable leaves the worker
+     * with nothing to do through the long sentence that follows a short one — the
+     * device log shows the next synthesis beginning the instant the previous one ended,
+     * and then nothing queued at all for ten to twenty seconds. [NeuralTts] refuses the
+     * surplus when its own queue or RAM caps are reached, so the requests are free when
+     * the depth is not there.
      */
     private fun prefetchAfter(index: Int) {
         if (container.settings.speakTranslation) {
             queue.getOrNull(index)?.chinese?.let { chinese ->
                 container.speaker.prefetch(chinese, SpeechRole.Translation)
+                queue.getOrNull(index + 1)?.let { container.speaker.prefetch(it.text, SpeechRole.Reading) }
                 return
             }
         }
-        queue.getOrNull(index + 1)?.let { container.speaker.prefetch(it.text, SpeechRole.Reading) }
+        for (ahead in 1..LOOK_AHEAD_SENTENCES) {
+            queue.getOrNull(index + ahead)
+                ?.let { container.speaker.prefetch(it.text, SpeechRole.Reading) }
+        }
+    }
+
+    /**
+     * (Re)arms the stall watchdog for the utterance about to be heard.
+     *
+     * The deadline is deliberately slack: it has to survive a long sentence on a slow
+     * phone where the look-ahead missed, which is normal — what it watches for is the
+     * case where no report is ever coming, and a false alarm here would cut a sentence
+     * short and replay it, worse than the pause it is guessing at.
+     */
+    private fun armWatchdog() {
+        watchdogJob?.cancel()
+        watchdogJob = null
+        val index = lastIndex
+        val spoken = queue.getOrNull(index) ?: return
+        val playback = container.speaker.estimateMillis(spoken.text) +
+            if (container.settings.speakTranslation) {
+                spoken.chinese?.let { container.speaker.estimateMillis(it) } ?: 0L
+            } else {
+                0L
+            }
+        val deadline = playback * WATCHDOG_MULTIPLIER + WATCHDOG_BASE_MS
+        watchdogJob = container.appScope.launch {
+            delay(deadline)
+            // A newer sentence, a pause or a new piece moved the queue along while this
+            // was counting down: that report arrived, and the watchdog was guessing.
+            if (!_state.value.playing || lastIndex != index) return@launch
+            Log.w(TAG, "watchdog: silence >${deadline / 1000}s on sentence $index")
+            container.speaker.stop()
+            if (watchdogRetries < WATCHDOG_RETRIES) {
+                watchdogRetries++
+                speakAt(index)
+            } else {
+                watchdogRetries = 0
+                // The voice did not answer twice: stop rather than keep the listener
+                // sitting on a play button with nothing coming out of the speaker.
+                stop()
+            }
+        }
     }
 
     private suspend fun observeEvents(subscribed: CompletableDeferred<Unit>) {
@@ -544,6 +627,10 @@ class ListeningSession(private val container: AppContainer) {
         val spoken = UtteranceId.parse(utteranceId) ?: return
         // Ignore a late callback from a sentence the listener already skipped.
         if (spoken.index != lastIndex) return
+        // The voice answered, so any earlier silence was the look-ahead catching up
+        // rather than a dead utterance; a re-try budget spent on pauses would give up
+        // on a read-aloud that is in fact still going.
+        watchdogRetries = 0
         val next = spoken.index + 1
         if (spoken.role == SpeechRole.Translation) {
             if (next < queue.size) speakAt(next) else endOfPiece()
@@ -646,6 +733,8 @@ class ListeningSession(private val container: AppContainer) {
         timerJob = null
         loadJob?.cancel()
         loadJob = null
+        watchdogJob?.cancel()
+        watchdogJob = null
         advanceJob?.cancel()
         advanceJob = null
     }
@@ -687,7 +776,24 @@ class ListeningSession(private val container: AppContainer) {
         }
     }
 
-    private companion object {
+    /**
+     * Visible to the tests on purpose: [PrefetchLedgerTest] asserts the shipped look-ahead
+     * caps against this window, so the two cannot drift apart the way they did before.
+     */
+    internal companion object {
+        const val TAG = "ListeningSession"
+
+        /**
+         * How many sentences ahead the English-only read-aloud asks for.
+         *
+         * Matched to [NeuralTts]'s queue cap, which counts held plus in-flight per role:
+         * asking for more than that is refused and costs nothing, asking for less leaves
+         * the worker idle — measured, 60 s of a 223 s run. The translation path asks for
+         * one English sentence because the Mandarin half in between already fills the
+         * engine's time; see [prefetchAfter].
+         */
+        const val LOOK_AHEAD_SENTENCES = 4
+
         /**
          * How long [awaitVoice] waits for the bundled model before giving up.
          *
@@ -706,5 +812,27 @@ class ListeningSession(private val container: AppContainer) {
          * before its first sentence.
          */
         const val SUBSCRIBE_WAIT_MS = 2_000L
+
+        /**
+         * Extra multiples of the estimated utterance length the watchdog waits for.
+         *
+         * Four, plus [WATCHDOG_BASE_MS]: the estimate is already rough (`estimateMillis`
+         * is a word count times a rate), and a cloning voice genuinely does stall for a
+         * second or two per sentence when the look-ahead missed. A watchdog that fired
+         * during normal playback would cut a sentence short, so it waits long enough
+         * that only a stall no report can explain reaches the deadline.
+         */
+        const val WATCHDOG_MULTIPLIER = 4L
+
+        /** Floor on the watchdog deadline, for a piece with almost nothing to say. */
+        const val WATCHDOG_BASE_MS = 60_000L
+
+        /**
+         * How many times the watchdog re-reads one sentence before giving up.
+         *
+         * Two, so a single hiccup is covered and a voice that is genuinely stuck ends
+         * the session instead of looping silently on the same line forever.
+         */
+        const val WATCHDOG_RETRIES = 2
     }
 }
