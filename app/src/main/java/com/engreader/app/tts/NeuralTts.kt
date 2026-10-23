@@ -888,6 +888,33 @@ class NeuralTts(private val context: Context) {
         if (!queued) onError()
     }
 
+    /**
+     * The samples to play for [clip], with the cloning voice's noise floor gated out.
+     *
+     * Only the cloning voice. Its floor was measured against the speaker's own room floor
+     * and found 6.76 dB (p05) too high — a stationary wideband hiss, which is what
+     * [NoiseGate] is a gain curve for. The Piper voices' floors were never measured and
+     * they share neither model nor vocoder with the cloning voice, so they are left
+     * alone: a change made on faith is still a change.
+     *
+     * Runs on the playback worker over a few hundred thousand floats, against the
+     * seconds the engine has just spent producing them.
+     */
+    private fun toPlay(clip: Clip): FloatArray {
+        if (VoiceCatalog.byId(clip.voiceId)?.engine != VoiceCatalog.VoiceEngine.ZipVoice) {
+            return clip.samples
+        }
+        val gated = NoiseGate.apply(clip.samples, clip.sampleRate)
+        if (gated.maxAttenuationDb < 0.0) {
+            Log.d(
+                TAG,
+                "gate voice=${clip.voiceId} " +
+                    "maxAttenuation=${"%.1f".format(gated.maxAttenuationDb)}dB",
+            )
+        }
+        return gated.samples
+    }
+
     /** Removes and returns the held clip when it is the one asked for. */
     private fun takePrefetched(
         text: String,
@@ -926,7 +953,7 @@ class NeuralTts(private val context: Context) {
             track = output
             output.play()
             onStart()
-            writeInChunks(output, clip.samples, token)
+            writeInChunks(output, toPlay(clip), token)
             if (!stale(token)) waitForDrain(output)
             // Reported as finished either way. A superseded utterance is not a
             // failure — the reader's `Finished` handler already ignores an id it has
