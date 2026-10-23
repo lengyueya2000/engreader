@@ -26,8 +26,8 @@ android {
         applicationId = "com.engreader.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 24
-        versionName = "1.8.0"
+        versionCode = 25
+        versionName = "1.8.1"
     }
 
     // One APK per ABI rather than one fat APK: the speech engine's native library is
@@ -39,7 +39,7 @@ android {
     // The Attenborough voice added in 1.8.0 is a ZipVoice model, which is a different
     // shape of thing: ~170 MB rather than ~19 MB, because it carries a
     // speaker-independent decoder and its own vocoder. That is what takes the arm64
-    // APK to roughly 285 MB; see the README's "已知限制".
+    // APK past 250 MB; see the README's "已知限制" for the measured sizes.
     splits {
         abi {
             isEnable = true
