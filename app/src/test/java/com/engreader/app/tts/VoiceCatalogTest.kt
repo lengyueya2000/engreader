@@ -43,6 +43,41 @@ class VoiceCatalogTest {
         assertEquals("tts/${voice.assetDir}/tokens.txt", VoiceCatalog.tokensPath(voice))
     }
 
+    /**
+     * The bug this pins down: one readiness window sized for a 19 MB Piper graph was
+     * applied to a 186 MB cloning voice, so pressing listen while that voice loaded was
+     * already past the deadline. The timeout reported the voice unavailable, which stops
+     * the read-aloud, and wrote nothing to the log — the reader saw a play button that
+     * did nothing and had no error to show anyone.
+     */
+    @Test
+    fun `the cloning voice is given a readiness budget that fits its own load`() {
+        val cloning = VoiceCatalog.ATTENBOROUGH.loadWaitMs
+        val piper = VoiceCatalog.resolve("en-GB", "en_GB-alan-medium").loadWaitMs
+        assertTrue(
+            "the cloning voice waits no longer than a Piper voice (${cloning}ms)",
+            cloning > piper,
+        )
+        assertTrue(
+            "budget too short for a cold 186 MB load on a phone: ${cloning}ms, measured " +
+                "at 40 s cold on the emulator",
+            cloning >= 60_000L,
+        )
+    }
+
+    @Test
+    fun `every VITS voice keeps the short readiness budget`() {
+        VoiceCatalog.all
+            .filter { it.engine == VoiceCatalog.VoiceEngine.Vits }
+            .forEach { voice ->
+                assertEquals(
+                    "${voice.id} should not pay the cloning voice's wait",
+                    VoiceCatalog.VITS_LOAD_WAIT_MS,
+                    voice.loadWaitMs,
+                )
+            }
+    }
+
     @Test
     fun `a voice with no separate asset directory uses its own id`() {
         val voice = VoiceCatalog.byId("en_GB-alan-medium")!!

@@ -30,6 +30,23 @@ internal fun gateFor(state: SpeechState): VoiceGate = when (state) {
     else -> VoiceGate.Unavailable
 }
 
+/**
+ * How long a request may wait for [voiceId] to load.
+ *
+ * A function rather than a constant, and here rather than in [Speaker], because the
+ * answer has to come from the voice — see [VoiceCatalog.BundledVoice.loadWaitMs] — and
+ * the wiring that reads it is the part that was wrong: one window, sized in its comment
+ * for the 19 MB Piper graph, was applied to a cloning voice that reads 186 MB out of the
+ * APK. On a device where that load ran past the window, pressing listen was answered
+ * "this voice is unavailable" and the read-aloud stopped, with nothing in the log to say
+ * so. Pure, so the choice itself can be tested without a device.
+ *
+ * @param voiceId the voice being waited on; blank means the accent's default, which
+ *   [VoiceCatalog.resolve] turns into a real voice.
+ */
+internal fun waitBudgetMs(localeTag: String, voiceId: String?): Long =
+    VoiceCatalog.resolve(localeTag, voiceId.orEmpty()).loadWaitMs
+
 /** How a request that had to wait for the voice ended. */
 internal enum class VoiceOutcome {
     /** The voice is up; the caller may speak. */

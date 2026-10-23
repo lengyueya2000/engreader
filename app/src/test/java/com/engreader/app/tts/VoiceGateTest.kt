@@ -7,6 +7,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -97,5 +98,43 @@ class VoiceGateTest {
         // the speak that follows it must still go through.
         state.value = SpeechState.Ready
         assertEquals(VoiceOutcome.Ready, await(stops = AtomicInteger(7)))
+    }
+
+    /**
+     * The wiring, not the policy: which window a given voice gets.
+     *
+     * `Speaker` used to pass one constant for every voice, and that constant's own
+     * comment said it was sized for the 19 MB Piper model. The cloning voice reads 186 MB
+     * out of the APK — 40 s cold on the emulator — so a press inside its load was past
+     * the deadline, and the deadline's answer is what stops the read-aloud.
+     */
+    @Test
+    fun `the cloning voice is waited for on its own budget, not a Piper voice's`() {
+        val cloning = waitBudgetMs("en-GB", VoiceCatalog.ATTENBOROUGH.id)
+        val piper = waitBudgetMs("en-GB", "en_GB-alan-medium")
+        assertEquals(VoiceCatalog.CLONING_LOAD_WAIT_MS, cloning)
+        assertEquals(VoiceCatalog.VITS_LOAD_WAIT_MS, piper)
+        assertTrue(
+            "a 186 MB load cannot be answered by a ${piper / 1000}s window",
+            cloning >= piper * 4,
+        )
+    }
+
+    @Test
+    fun `a blank voice id takes the accent default's budget`() {
+        val default = VoiceCatalog.resolve("en-GB", "")
+        assertEquals(default.loadWaitMs, waitBudgetMs("en-GB", ""))
+        assertEquals(default.loadWaitMs, waitBudgetMs("en-GB", null))
+    }
+
+    @Test
+    fun `a request that lands inside a long budget is spoken`() {
+        // The cloning voice's window is the one this pins: the same load that reports
+        // `Unavailable` against 15 s has to end in a spoken sentence against 90 s.
+        state.value = SpeechState.Preparing
+        assertEquals(
+            VoiceOutcome.Ready,
+            awaitWhileSettlingTo(SpeechState.Ready, afterMs = 120, timeoutMs = VoiceCatalog.CLONING_LOAD_WAIT_MS),
+        )
     }
 }

@@ -475,17 +475,32 @@ class Speaker(private val context: Context) {
             VoiceGate.Wait -> Unit
         }
         val generation = stopGeneration
+        // The budget belongs to the voice being waited on, not to whoever is waiting:
+        // [BundledVoice.loadWaitMs] is where the two kinds of voice differ. `loadingVoiceId`
+        // is the voice `prepare` is actually reading — `voiceId` alone would name the
+        // previously loaded one while a switch is in flight.
+        val awaited = loadingVoiceId ?: voiceId
+        val budget = waitBudgetMs(localeTag, awaited)
+        Log.i(TAG, "waiting up to ${budget / 1000}s for voice ${awaited.ifBlank { "(default)" }}")
         return scope.launch {
-            when (awaitVoiceThen(state, READY_WAIT_MS, generation, { stopGeneration })) {
+            when (awaitVoiceThen(state, budget, generation, { stopGeneration })) {
                 VoiceOutcome.Ready -> onReady()
-                VoiceOutcome.Unavailable -> onUnavailable()
-                // Dropped without a word: the queue reads `Failed` as "the voice is
-                // gone" and tears the session down, so reporting a pause would kill a
-                // session that had already moved on to a newer sentence. Nothing is left
-                // waiting either — `stop` is only reached from the queue's own pause,
-                // stop and piece-change, all of which issue a fresh speak or are done
-                // with the queue.
-                VoiceOutcome.Dropped -> Unit
+                VoiceOutcome.Unavailable -> {
+                    // Said out loud, because this used to be the one outcome that left no
+                    // trace anywhere: the read-aloud stopped by itself and the log read
+                    // like a session nobody had asked to speak.
+                    Log.w(
+                        TAG,
+                        "voice ${awaited.ifBlank { "(default)" }} did not arrive within " +
+                            "${budget / 1000}s; reported unavailable",
+                    )
+                    onUnavailable()
+                }
+                VoiceOutcome.Dropped -> Log.i(
+                    TAG,
+                    "voice ${awaited.ifBlank { "(default)" }} landed after the reader asked " +
+                        "for quiet; the request was dropped",
+                )
             }
         }
     }
@@ -642,14 +657,6 @@ class Speaker(private val context: Context) {
     private companion object {
         const val TAG = "Speaker"
         const val PREVIEW_ID = "preview"
-
-        /**
-         * How long a request waits for a voice that is still loading.
-         *
-         * Long enough for the 19 MB model on a slow device, short enough that a voice
-         * which never arrives ends in a report instead of a request that hangs.
-         */
-        const val READY_WAIT_MS = 15_000L
 
         /** A headword on its own is easier to catch a shade slower than running prose. */
         const val WORD_RATE = 0.8f

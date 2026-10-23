@@ -676,8 +676,43 @@ class NeuralTts(private val context: Context) {
             "speak voice=${clip.voiceId} role=$role chars=${text.length} " +
                 "audioS=${"%.2f".format(audioS)} " +
                 (if (hit) "prefetch=hit" else "prefetch=MISS") +
-                " queuedMs=$queuedMs$timing",
+                " queuedMs=$queuedMs$timing ${level(clip.samples)}",
         )
+    }
+
+    /**
+     * What a clip actually contains, as peak and RMS in dBFS, for the utterance log.
+     *
+     * `audioS` alone cannot tell a sentence that was heard from one that was not: a clip
+     * of digital silence and a clip of speech have the same length, the same sample rate
+     * and the same effect on the clock — the reader advances on `waitForDrain` either
+     * way, so "it reads but nothing comes out" leaves no trace at all in the log that
+     * existed before this. One pass over samples the engine has just spent seconds
+     * producing costs nothing by comparison, and it is the only measurement that
+     * separates a voice that went quiet from a device that did not play what it was
+     * handed. `nan` counts the samples that are neither: a non-finite sample is dropped
+     * by `AudioTrack`, so a clip full of them is silent for a reason the peak alone
+     * would hide.
+     */
+    private fun level(samples: FloatArray): String {
+        if (samples.isEmpty()) return "peak=-inf rms=-inf"
+        var peak = 0f
+        var sum = 0.0
+        var nan = 0
+        for (sample in samples) {
+            if (sample.isNaN()) {
+                nan++
+                continue
+            }
+            val magnitude = if (sample < 0f) -sample else sample
+            if (magnitude > peak) peak = magnitude
+            sum += sample.toDouble() * sample
+        }
+        val rms = kotlin.math.sqrt(sum / samples.size)
+        fun db(value: Double): String =
+            if (value <= 0.0) "-inf" else "%.1f".format(20.0 * kotlin.math.log10(value))
+        val bad = if (nan > 0) " nan=$nan" else ""
+        return "peak=${db(peak.toDouble())}dB rms=${db(rms)}dB$bad"
     }
 
     /**
@@ -803,6 +838,9 @@ class NeuralTts(private val context: Context) {
                 text, role, rate, sid, samples, audio.sampleRate, engineGen,
                 engine.voiceId,
             )
+            // Measured outside the lock: a pass over a long sentence's samples is real
+            // work, and the ledger lock is held by `speak` for lookups.
+            val levels = level(samples)
             synchronized(prefetchLock) {
                 prefetchLedger.complete(key, clip)
                 // Both roles, like `logUtterance`: which half of a pair stalled is the
@@ -819,7 +857,7 @@ class NeuralTts(private val context: Context) {
                     "prefetch voice=${engine.voiceId} role=$role chars=${text.length} " +
                         "audioS=${"%.2f".format(audioS)} synthMs=$synthMs " +
                         "rtf=${"%.2f".format(rtf)} queuedMs=${started - askedAt} " +
-                        "deferred=$deferrals held=$held",
+                        "deferred=$deferrals held=$held $levels",
                 )
             }
         }

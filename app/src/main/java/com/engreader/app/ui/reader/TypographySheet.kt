@@ -300,8 +300,18 @@ private fun VoiceList(
     Spacer(Modifier.height(8.dp))
 
     if (!speechReady) {
+        // Honest about which voice is loading: the cloning voice reads 186 MB out of the
+        // APK where a Piper voice reads 19 MB, and "几秒钟" described the wrong one of
+        // those — a reader who waited twenty seconds for the cloning voice had been told
+        // to expect a few.
+        val cloning = voices.firstOrNull { it.id == speechVoice }?.engine ==
+            VoiceCatalog.VoiceEngine.ZipVoice
         Text(
-            text = "正在载入语音模型，首次使用需要几秒钟。",
+            text = if (cloning) {
+                "正在载入这个音色：它的模型有 186 MB，第一次使用要十几秒。"
+            } else {
+                "正在载入语音模型，首次使用需要几秒钟。"
+            },
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

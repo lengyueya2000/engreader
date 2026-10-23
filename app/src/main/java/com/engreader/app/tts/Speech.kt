@@ -128,6 +128,20 @@ object VoiceCatalog {
         val engine: VoiceEngine = VoiceEngine.Vits,
         /** Sample rate the voice synthesises at, for the picker's second line. */
         val sampleRateKhz: Int = 22,
+        /**
+         * How long a speak request waits for this voice to finish loading before it is
+         * reported as unavailable.
+         *
+         * It belongs to the voice because one number cannot serve both kinds of voice.
+         * A Piper voice is a 19 MB graph that lands in seconds; the cloning voice reads
+         * 186 MB out of the APK and builds three of them. The single window this
+         * replaces was sized for the first — its own comment said so — and applied to
+         * the second, so pressing listen while the cloning voice was still loading was
+         * past the deadline on any device slower than the one it was measured on. What
+         * the reader got was a read-aloud that stopped by itself, and a log with nothing
+         * in it: the timeout path reported `Unavailable` without writing a line.
+         */
+        val loadWaitMs: Long = VITS_LOAD_WAIT_MS,
     ) {
         /** What the picker shows: `英式 · 男声`. */
         val title: String get() = "$accent · $gender"
@@ -169,6 +183,7 @@ object VoiceCatalog {
         blurb = "BBC 纪录片解说",
         engine = VoiceEngine.ZipVoice,
         sampleRateKhz = 24,
+        loadWaitMs = CLONING_LOAD_WAIT_MS,
     )
 
     /**
@@ -234,6 +249,25 @@ object VoiceCatalog {
      * measures it with ECAPA instead.
      */
     const val CLONE_STEPS = 4
+
+    /**
+     * How long a request waits for a Piper voice, the 19 MB case the old single budget
+     * was written for.
+     */
+    const val VITS_LOAD_WAIT_MS = 15_000L
+
+    /**
+     * The same wait for the cloning voice.
+     *
+     * Its model is 186 MB against 19 MB, and the load has been measured at 40 s on a cold
+     * page cache on the emulator — ten seconds of it is inflating assets that Android
+     * stores deflated, the rest is building three ONNX graphs. Ninety seconds leaves room
+     * for a phone an order of magnitude slower than the machine that measured it while
+     * still being bounded: this is the window after which a voice is declared dead
+     * ([Speaker.whenVoiceReady]), and a voice that needs longer than this is broken
+     * rather than slow.
+     */
+    const val CLONING_LOAD_WAIT_MS = 90_000L
 
     /** Accents offered in the picker, in display order. */
     val accents: List<Pair<String, String>> = listOf(
