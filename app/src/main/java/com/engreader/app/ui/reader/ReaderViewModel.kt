@@ -1,5 +1,6 @@
 package com.engreader.app.ui.reader
 
+import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -443,10 +444,11 @@ class ReaderViewModel(
     fun flushProgress() {
         savePosition()
         val count = lookups
-        val seconds = if (sessionStart == 0L) {
+        val startedAt = sessionStart
+        val seconds = if (startedAt == 0L) {
             0
         } else {
-            ((System.currentTimeMillis() - sessionStart) / 1000).toInt()
+            ((System.currentTimeMillis() - startedAt) / 1000).toInt()
         }
         if (seconds <= 0 && count <= 0) return
         if (seconds > 0) sessionStart = System.currentTimeMillis()
@@ -454,7 +456,19 @@ class ReaderViewModel(
         val bookId = state.article?.bookId ?: 0
         lookups = 0
         container.appScope.launch {
-            container.wordbook.recordSession(articleId, seconds, words, count)
+            // `insert` reports a failed write by returning -1 instead of throwing, and the
+            // clock and the look-up count above have already been reset. A write that did
+            // not land would therefore take this stretch of reading out of the statistics
+            // with nothing to show for it, so the counters are put back and the next flush
+            // tries again. Time is re-measured from the original start rather than from
+            // now, so the retry does not lose the seconds that just passed.
+            val written = container.wordbook.recordSession(articleId, seconds, words, count)
+            if (!written) {
+                if (seconds > 0) sessionStart = startedAt
+                lookups += count
+                Log.w(TAG, "session write failed; reading time kept for the next flush")
+                return@launch
+            }
             if (seconds > 0) {
                 container.articles.addReadSeconds(articleId, seconds)
                 // Time on a chapter is time on the book: without this the shelf would show
@@ -1018,6 +1032,8 @@ class ReaderViewModel(
     }
 
     private companion object {
+        const val TAG = "ReaderViewModel"
+
         /** Shorter queries match nearly every paragraph and say nothing. */
         const val MIN_SEARCH_CHARS = 2
 

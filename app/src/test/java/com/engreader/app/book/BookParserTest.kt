@@ -234,10 +234,19 @@ class BookParserTest {
         try {
             MobiParser.parse(cut)
             fail("a truncated file must not parse")
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             // Any of the format exceptions is fine; what matters is that it does not
             // return a book, and that it does not take the process down.
-            assertFalse(e is OutOfMemoryError)
+            //
+            // This used to be `assertFalse(e is OutOfMemoryError)` inside a
+            // `catch (e: Exception)`, which can never fail: an OutOfMemoryError is an
+            // Error and never reaches an Exception catch, so the case proved nothing
+            // beyond "no book came back". Caught as Throwable now, and asserting the
+            // shape of what is thrown.
+            assertTrue(
+                "expected a format exception, got ${e::class.java.name}: ${e.message}",
+                e is BookFormat.Companion.Unsupported || e is BookFormat.Companion.Encrypted,
+            )
         }
     }
 
@@ -418,6 +427,23 @@ class BookParserTest {
         val body = book.chapters.joinToString(" ") { it.text }
         assertTrue(body.contains("Real prose begins here."))
         assertFalse(body.contains("PG search facility"))
+    }
+
+    @Test
+    fun `an end marker before the start marker does not keep the licence`() {
+        // A file whose markers are out of order — a quoted licence header above the start,
+        // or a mis-ordered copy — used to make `end < from`, which took the else branch and
+        // kept everything to the end of the file: the trailing licence arrived as prose.
+        val text = "*** END OF THE PROJECT GUTENBERG EBOOK X ***\n\n" +
+            "Quoted licence preamble that is not the book.\n\n" +
+            "*** START OF THE PROJECT GUTENBERG EBOOK X ***\n\n" +
+            paragraph("Real prose begins here.") + "\n\n" +
+            "*** END OF THE PROJECT GUTENBERG EBOOK X ***\n" +
+            "Most people start at our website which has the main PG search facility."
+        val book = TextParser.parsePlain(text.toByteArray(Charsets.UTF_8))
+        val body = book.chapters.joinToString(" ") { it.text }
+        assertTrue(body.contains("Real prose begins here."))
+        assertFalse("the trailing licence must not be prose", body.contains("PG search facility"))
     }
 
     @Test

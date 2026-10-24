@@ -81,6 +81,65 @@ class NoiseGateTest {
     }
 
     @Test
+    fun `the start of speech after a pause is not pulled down`() {
+        // The case the suite was blind to. Every other test builds speech first and the
+        // pause after it, which puts the onset at sample 0 — where the smoothing is seeded
+        // with the gain already open. A real clip is the other way round: the pause comes
+        // first, so the gate is closed when the first consonant arrives.
+        //
+        // With one time constant for both directions the opening took 80 ms, and measured
+        // on twenty real clips the first 60 ms lost up to 5.67 dB and kept as little as
+        // 49% of its peak. Consonant bursts are what makes speech clear.
+        val pause = hiss(rate / 2, -54.0)
+        val speech = tone(rate / 2, -16.0)
+        val signal = pause + speech
+
+        val gated = NoiseGate.apply(signal, rate)
+        assertTrue("the gate must still engage on this clip", gated.maxAttenuationDb < 0.0)
+
+        val onset = rate * 60 / 1000
+        val offset = pause.size
+        val before = NoiseGate.levelDb(signal.copyOfRange(offset, offset + onset))
+        val after = NoiseGate.levelDb(gated.samples.copyOfRange(offset, offset + onset))
+        assertTrue(
+            "the first 60 ms of speech lost ${before - after} dB",
+            after >= before - 1.0,
+        )
+
+        // The peak matters as much as the level: a burst is a transient, and an average
+        // over 60 ms hides one that has been shaved.
+        val peakBefore = signal.copyOfRange(offset, offset + onset).maxOf { kotlin.math.abs(it) }
+        val peakAfter = gated.samples.copyOfRange(offset, offset + onset).maxOf { kotlin.math.abs(it) }
+        assertTrue(
+            "the first 60 ms kept only ${100 * peakAfter / peakBefore}% of its peak",
+            peakAfter >= peakBefore * 0.9f,
+        )
+    }
+
+    @Test
+    fun `the pause before speech still comes down`() {
+        // The onset fix must not have given up the reason the gate exists.
+        val pause = hiss(rate / 2, -54.0)
+        val speech = tone(rate / 2, -16.0)
+        val signal = pause + speech
+
+        val gated = NoiseGate.apply(signal, rate)
+        val before = NoiseGate.levelDb(pause)
+        val after = NoiseGate.levelDb(gated.samples.copyOfRange(0, pause.size))
+        assertTrue("the pause floor only moved ${before - after} dB", after <= before - 5.0)
+    }
+
+    @Test
+    fun `opening is faster than closing`() {
+        // The property behind the fix, stated directly: a gate's attack is not its
+        // release. Pinned as constants so the two cannot drift back together.
+        assertTrue(
+            "attack ${NoiseGate.ATTACK_MS} ms must be much faster than release ${NoiseGate.RELEASE_MS} ms",
+            NoiseGate.ATTACK_MS * 4 <= NoiseGate.RELEASE_MS,
+        )
+    }
+
+    @Test
     fun `the deepest attenuation is bounded`() {
         // 80 dB under full scale: without the cap a slope of 1 would ask for -35 dB.
         val quiet = hiss(rate, -80.0)

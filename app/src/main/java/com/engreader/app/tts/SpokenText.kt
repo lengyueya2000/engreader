@@ -324,6 +324,17 @@ object SpokenText {
 
     private val ROMAN = Regex("(?<![\\p{L}])([IVXLCDM]{1,9})(?![\\p{L}])")
 
+    /**
+     * The single letters that are a numeral in a division word, and no other.
+     *
+     * `Appendix C` is appendix *C the letter*, not appendix *one hundred*: a lettered
+     * appendix is named by a letter and a numbered one by a numeral, and `C`/`D`/`M`
+     * read as hundreds are never what an appendix is called. Reading them as numerals
+     * is also what made this path crash before the hundreds existed. A lone `L` is
+     * excluded for the same reason (`Appendix L` is a letter).
+     */
+    private val SINGLE_LETTER_NUMERALS = setOf("I", "V", "X")
+
     private fun spellRomanNumerals(text: String): String {
         if (!text.contains(Regex("[IVXLCDM]"))) return text
         return ROMAN.replace(text) { match ->
@@ -350,7 +361,13 @@ object SpokenText {
             val shout = frame.length > 1 && frame.all { it.isUpperCase() }
             fun say(word: String) = if (shout) word.uppercase() else word
             when (frame.lowercase()) {
-                in DIVISIONS -> say(cardinal(value))
+                in DIVISIONS -> {
+                    // A lone C/D/M/L after a division word is a letter, not a numeral.
+                    if (token.length == 1 && token !in SINGLE_LETTER_NUMERALS) {
+                        return@replace token
+                    }
+                    say(cardinal(value))
+                }
                 in REGNAL -> "the ${ordinal(value)}"
                 else -> token
             }
@@ -439,11 +456,47 @@ object SpokenText {
         "", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
     )
 
-    /** 1–99 as words, hyphenated the way a year is written: `thirty-seven`. */
-    private fun cardinal(value: Int): String = when {
-        value < 20 -> ONES[value]
-        value % 10 == 0 -> TENS[value / 10]
-        else -> "${TENS[value / 10]}-${ONES[value % 10]}"
+    /**
+     * A number as words, hyphenated the way a year is written: `thirty-seven`.
+     *
+     * Above 99 this used to index `TENS` out of bounds: the arrays hold tens only, so
+     * `Appendix C` (100), `Section D` (500) and `Chapter M` (1000) threw
+     * `ArrayIndexOutOfBoundsException` from the synthesis path, i.e. a crash on a page
+     * that merely numbers its appendices. Roman numerals legitimately reach 3999
+     * (`MMMCMXCIX` is the largest that round-trips), so the hundreds and thousands
+     * are spoken here rather than left to the caller.
+     */
+    private fun cardinal(value: Int): String {
+        if (value < 0) return ""
+        return when {
+            value < 20 -> ONES[value]
+            value < 100 -> if (value % 10 == 0) {
+                TENS[value / 10]
+            } else {
+                "${TENS[value / 10]}-${ONES[value % 10]}"
+            }
+            value < 1_000 -> {
+                val hundreds = value / 100
+                val rest = value % 100
+                if (rest == 0) {
+                    "${ONES[hundreds]} hundred"
+                } else {
+                    "${ONES[hundreds]} hundred ${cardinal(rest)}"
+                }
+            }
+            value < 1_000_000 -> {
+                val thousands = value / 1_000
+                val rest = value % 1_000
+                if (rest == 0) {
+                    "${cardinal(thousands)} thousand"
+                } else {
+                    "${cardinal(thousands)} thousand ${cardinal(rest)}"
+                }
+            }
+            // Past every numeral this reader recognises; the digits are still a better
+            // answer than an exception.
+            else -> value.toString()
+        }
     }
 
     private val ORDINAL_ONES = arrayOf(
@@ -457,9 +510,34 @@ object SpokenText {
         "seventieth", "eightieth", "ninetieth",
     )
 
-    private fun ordinal(value: Int): String = when {
-        value < 20 -> ORDINAL_ONES[value]
-        value % 10 == 0 -> ORDINAL_TENS[value / 10]
-        else -> "${TENS[value / 10]}-${ORDINAL_ONES[value % 10]}"
+    private fun ordinal(value: Int): String {
+        if (value < 0) return ""
+        return when {
+            value < 20 -> ORDINAL_ONES[value]
+            value < 100 -> if (value % 10 == 0) {
+                ORDINAL_TENS[value / 10]
+            } else {
+                "${TENS[value / 10]}-${ORDINAL_ONES[value % 10]}"
+            }
+            value < 1_000 -> {
+                val hundreds = value / 100
+                val rest = value % 100
+                if (rest == 0) {
+                    "${ONES[hundreds]} hundredth"
+                } else {
+                    "${ONES[hundreds]} hundred ${ordinal(rest)}"
+                }
+            }
+            value < 1_000_000 -> {
+                val thousands = value / 1_000
+                val rest = value % 1_000
+                if (rest == 0) {
+                    "${cardinal(thousands)} thousandth"
+                } else {
+                    "${cardinal(thousands)} thousand ${ordinal(rest)}"
+                }
+            }
+            else -> "${cardinal(value)}th"
+        }
     }
 }

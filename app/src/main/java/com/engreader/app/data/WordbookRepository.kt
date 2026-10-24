@@ -366,11 +366,16 @@ class WordbookRepository(
      * sitting and the reading-speed figure takes the maximum per article. Storing the
      * increment instead would need the position at the previous flush, which is not known
      * once the reader has left and come back.
+     *
+     * Returns false when the row could not be written. `insert` reports failure by
+     * returning -1 rather than throwing, and the caller has already reset the clock it
+     * measures reading time with — so a silent failure is reading time the reader can
+     * never get back. The caller uses this to put that time back.
      */
-    suspend fun recordSession(articleId: Long, seconds: Int, wordsRead: Int, lookups: Int) =
+    suspend fun recordSession(articleId: Long, seconds: Int, wordsRead: Int, lookups: Int): Boolean =
         withContext(Dispatchers.IO) {
-            if (seconds <= 0 && lookups <= 0) return@withContext
-            db.writableDatabase.insert(
+            if (seconds <= 0 && lookups <= 0) return@withContext true
+            val row = db.writableDatabase.insert(
                 "session", null,
                 ContentValues().apply {
                     put("articleId", articleId)
@@ -381,7 +386,7 @@ class WordbookRepository(
                     put("finishedAt", System.currentTimeMillis())
                 },
             )
-            Unit
+            row != -1L
         }
 
     suspend fun recordQuiz(articleId: Long, correct: Int, total: Int) = withContext(Dispatchers.IO) {

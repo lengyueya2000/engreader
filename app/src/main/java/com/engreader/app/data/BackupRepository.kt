@@ -69,13 +69,26 @@ class BackupRepository(private val db: UserDb) {
                 val word = wordArray.optJSONObject(i) ?: continue
                 val lemma = word.optString("lemma").trim()
                 if (lemma.isEmpty()) continue
-                val knownBox = existing[lemma.lowercase()]
-                if (knownBox == null) {
-                    insertWord(database, word, lemma)
-                    added++
-                } else if (word.optInt("box", 0) > knownBox) {
-                    updateWord(database, word, lemma)
-                    updated++
+                val key = lemma.lowercase()
+                when (decide(existing[key], word.optInt("box", 0))) {
+                    Merge.Insert -> {
+                        insertWord(database, word, lemma)
+                        // Written back before the next row is read. `word.lemma` is a
+                        // NOCASE primary key, so a file carrying the same lemma twice —
+                        // which two devices' exports merged by hand do, and which differs
+                        // only by case counts as the same key — would otherwise insert it
+                        // twice, fail the constraint, and roll back the *whole* restore:
+                        // the reader is told the import failed and gets none of it, from a
+                        // file that is fine.
+                        existing[key] = word.optInt("box", 0)
+                        added++
+                    }
+                    Merge.Update -> {
+                        updateWord(database, word, lemma)
+                        existing[key] = word.optInt("box", 0)
+                        updated++
+                    }
+                    Merge.Skip -> Unit
                 }
             }
 
@@ -226,5 +239,25 @@ class BackupRepository(private val db: UserDb) {
 
         /** What the file picker offers to save as. */
         const val FILE_NAME = "engreader-backup.json"
+
+        /**
+         * What to do with one word from a backup, given the box the wordbook already has.
+         *
+         * Pure so the merge rules can be tested without a database — and so the rule that
+         * matters most is written down once: a word already present is only overwritten
+         * when the file's box is *further along*, because the point of a merge is that a
+         * reader who imports an old file onto a phone they have been using keeps what they
+         * have done since.
+         *
+         * [knownBox] is null when the wordbook has never seen the word.
+         */
+        internal fun decide(knownBox: Int?, fileBox: Int): Merge = when {
+            knownBox == null -> Merge.Insert
+            fileBox > knownBox -> Merge.Update
+            else -> Merge.Skip
+        }
     }
+
+    /** The three outcomes of merging one word; see [decide]. */
+    internal enum class Merge { Insert, Update, Skip }
 }

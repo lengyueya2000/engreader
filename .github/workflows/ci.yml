@@ -1,0 +1,59 @@
+name: CI
+
+# Two things were true of this repository before this workflow existed: the unit tests
+# were only ever run by hand, and `lintDebug` failed on an error-severity rule that
+# nothing was checking. Both are cheap to run on every push and both are the kind of
+# thing that is invisible until someone looks.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # The Attenborough cloning voice's model files are 186 MB and are git-ignored, so
+      # they are absent here. Everything that touches them is written to skip when they
+      # are missing (VoiceReferenceAssetsTest names the files it needs), which keeps this
+      # job from needing a 186 MB download on every push.
+      - name: Unit tests
+        run: ./gradlew :app:testDebugUnitTest --console=plain
+
+      - name: Lint
+        run: ./gradlew :app:lintDebug --console=plain
+
+      - name: Upload test report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: app/build/reports/tests/testDebugUnitTest/
+          retention-days: 7
+
+      - name: Upload lint report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-results
+          path: app/build/reports/lint-results-debug.html
+          retention-days: 7

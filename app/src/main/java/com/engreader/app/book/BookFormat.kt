@@ -115,9 +115,14 @@ enum class BookFormat(val label: String) {
             // is always at offset 30 for the first entry; the payload starts right
             // after it because `mimetype` must be stored uncompressed.
             if (b.size < 30 + marker.size + epub.size) return false
-            val nameAt = indexOf(b, marker)
+            // Searched in a bounded prefix rather than in the whole array. The marker is
+            // required to sit within the first 64 bytes anyway, and the payload directly
+            // after it, so scanning further was wasted work: a 100 MB archive that is not
+            // an EPUB was walked twice, byte by byte, before being rejected.
+            val prefix = b.copyOf(minOf(b.size, 128))
+            val nameAt = indexOf(prefix, marker)
             if (nameAt !in 0..64) return false
-            return indexOf(b, epub) >= 0
+            return indexOf(prefix, epub) >= 0
         }
 
         private fun isPalmDatabase(b: ByteArray): Boolean =
@@ -138,16 +143,29 @@ enum class BookFormat(val label: String) {
         }
 
         private fun firstRecordOffset(b: ByteArray): Int? {
-            if (b.size < 80) return null
+            // 82, not 80: the offset is a four-byte value at 78, so reading it needs bytes
+            // 78..81. An 80- or 81-byte file carrying "BOOK" at 60 reached the read and
+            // threw ArrayIndexOutOfBoundsException, which reached the user as an English
+            // JVM message for what is simply a truncated book.
+            if (b.size < 82) return null
             val offset = readInt(b, 78)
             return offset.takeIf { it in 78 until b.size }
         }
 
-        private fun readInt(b: ByteArray, at: Int): Int =
-            ((b[at].toInt() and 0xFF) shl 24) or
+        /**
+         * A big-endian 32-bit read that cannot fail.
+         *
+         * Every caller derives the offset from the file's own header, so an out-of-range
+         * read is data the file claims and does not have. Returning 0 lets the caller's
+         * range check reject it; throwing would report a corrupt book as a crash.
+         */
+        private fun readInt(b: ByteArray, at: Int): Int {
+            if (at < 0 || at + 4 > b.size) return 0
+            return ((b[at].toInt() and 0xFF) shl 24) or
                 ((b[at + 1].toInt() and 0xFF) shl 16) or
                 ((b[at + 2].toInt() and 0xFF) shl 8) or
                 (b[at + 3].toInt() and 0xFF)
+        }
 
         private fun indexOf(haystack: ByteArray, needle: ByteArray): Int {
             if (needle.isEmpty() || haystack.size < needle.size) return -1

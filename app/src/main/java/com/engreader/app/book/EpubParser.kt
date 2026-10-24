@@ -115,12 +115,31 @@ object EpubParser {
             while (true) {
                 val entry = zip.nextEntry ?: break
                 if (entry.isDirectory) continue
-                val name = entry.name.replace('\\', '/')
-                // Read through the cap rather than with `readBytes()`: the whole point
-                // is to stop before the allocation happens, and a single entry is
-                // enough to exhaust the heap on its own.
-                val content = zip.readCapped(MAX_UNPACKED_BYTES - total)
-                    ?: throw BookFormat.Companion.Unsupported("这个 EPUB 解压后过大，可能不是电子书")
+                // A non-standard archive can name an entry `/OEBPS/c1.xhtml`; the resolver
+                // produces names without the leading slash, so keeping it would make the
+                // chapter silently unfindable.
+                val name = entry.name.replace('\\', '/').removePrefix("/")
+                // Read through the caps rather than with `readBytes()`: the whole point is
+                // to stop before the allocation happens, and a single entry is enough to
+                // exhaust the heap on its own.
+                val remaining = MAX_UNPACKED_BYTES - total
+                if (remaining <= 0) {
+                    throw BookFormat.Companion.Unsupported("这个 EPUB 解压后过大，可能不是电子书")
+                }
+                val content = zip.readCapped(minOf(remaining, MAX_ENTRY_BYTES))
+                if (content == null) {
+                    // Over the single-entry cap. Skipping is only ever right for an image:
+                    // a book with an enormous illustration is still a book, but a book
+                    // whose *text* is that large is not one this reader can hold, and
+                    // dropping it would produce a "book" with no chapters and a message
+                    // about empty content rather than about size.
+                    val looksLikeImage = name.substringAfterLast('.', "").lowercase() in
+                        IMAGE_EXTENSIONS
+                    if (looksLikeImage && remaining > MAX_ENTRY_BYTES) continue
+                    throw BookFormat.Companion.Unsupported(
+                        "这个 EPUB 解压后过大，可能不是电子书",
+                    )
+                }
                 total += content.size
                 out[name] = content
             }
@@ -284,19 +303,25 @@ object EpubParser {
      * "Part One" that contained "Chapter 1" and "Chapter 2" yielded the part and the
      * second chapter, and the first chapter disappeared from the book. A stack of
      * open tags gives every point, each with its own label.
+     *
+     * The three patterns are compiled once, at file scope. They used to be built inside
+     * the loop — on every navPoint — and the body was taken with `substring`, which copies
+     * it: a crafted NCX with thousands of nested points did quadratic work. The rest of
+     * this parser already avoids that shape (`dropElements`, `tocNavBody`), so this was
+     * the one place it was missed.
      */
     private fun parseNcx(xml: String, ncxPath: String): List<NavPoint> {
         val dir = ncxPath.substringBeforeLast('/', "")
         val out = mutableListOf<NavPoint>()
         val open = ArrayDeque<Int>()
-        for (tag in Regex("(?is)</?navPoint\\b[^>]*>").findAll(xml)) {
+        for (tag in NAV_POINT_TAG.findAll(xml)) {
             if (tag.value.startsWith("</")) {
                 val start = open.removeLastOrNull() ?: continue
                 val body = xml.substring(start, tag.range.first)
-                val label = Regex("(?is)<navLabel\\b.*?</navLabel>").find(body)?.value
+                val label = NAV_LABEL.find(body)?.value
                     ?.let { elementText(it, "text") }
                     ?: continue
-                val src = Regex("(?is)<content\\b[^>]*>").find(body)
+                val src = CONTENT_TAG.find(body)
                     ?.let { attr(it.value, "src") }
                     ?: continue
                 out += toNavPoint(src, label, dir)
@@ -572,11 +597,34 @@ object EpubParser {
     /**
      * Cap on everything the archive expands to.
      *
-     * A real book is a few megabytes. This is high enough that no genuine EPUB is
-     * refused and low enough that a zip bomb is reported as an unsupported file
-     * instead of exhausting the heap.
+     * A real book is a few megabytes. The previous value here was 256 MB, which was not a
+     * defence at all: `readCapped` grows a `ByteArrayOutputStream` and then copies it, so
+     * the peak is roughly twice the cap, and every entry stays in the map afterwards. A
+     * 0.7 MB archive expanding to 200 MB exhausted a 512 MB heap — measured — which is the
+     * heap a mid-range phone gives the app. 64 MB leaves room for the doubled peak and for
+     * the illustrations, and no real EPUB comes near it.
      */
-    private const val MAX_UNPACKED_BYTES = 256 * 1024 * 1024
+    private const val MAX_UNPACKED_BYTES = 64 * 1024 * 1024
+
+    /**
+     * Cap on one entry, independent of the total.
+     *
+     * Without this a single entry could use the whole allowance, and the only entries that
+     * are ever large are images — of which the parser keeps exactly one, the cover. An
+     * entry past this is skipped rather than failing the import, because a book with an
+     * enormous illustration is still a book.
+     */
+    private const val MAX_ENTRY_BYTES = 8 * 1024 * 1024
+
+    /**
+     * The NCX patterns, compiled once.
+     *
+     * Built inside the per-navPoint loop before, which made a document with thousands of
+     * nested points pay for a compile each time round.
+     */
+    private val NAV_POINT_TAG = Regex("(?is)</?navPoint\\b[^>]*>")
+    private val NAV_LABEL = Regex("(?is)<navLabel\\b.*?</navLabel>")
+    private val CONTENT_TAG = Regex("(?is)<content\\b[^>]*>")
 
     /**
      * Fewest words a chapter needs to be worth listing.

@@ -132,8 +132,16 @@ object MobiParser {
             val trimmed = trimTrailingEntries(raw, extraFlags)
             val expanded = when {
                 huffman != null -> huffman.decode(trimmed, remaining)
-                compression == COMPRESSION_PALMDOC -> palmDoc(trimmed)
-                compression == COMPRESSION_NONE -> trimmed
+                compression == COMPRESSION_PALMDOC -> palmDoc(trimmed, remaining)
+                compression == COMPRESSION_NONE -> {
+                    // Uncompressed records are the one path where the ceiling is easy to
+                    // forget: the record is copied through whole, so a file can be over the
+                    // limit before this loop ever runs twice.
+                    if (trimmed.size > remaining) {
+                        throw BookFormat.Companion.Unsupported("MOBI 的正文过大")
+                    }
+                    trimmed
+                }
                 else -> throw BookFormat.Companion.Unsupported("不支持的压缩方式（$compression）")
             }
             text.write(expanded)
@@ -222,8 +230,15 @@ object MobiParser {
     private fun readExth(header: ByteArray, mobiHeaderLength: Int): Map<Int, ByteArray> {
         val flags = readInt(header, MOBI_EXTH_FLAGS)
         if (flags and 0x40 == 0) return emptyMap()
+        // `mobiHeaderLength` is a 32-bit value read straight out of the file, and the
+        // header it describes cannot be longer than the record holding it. A value such
+        // as 0x7FFFFFF0 makes `16 + length` wrap to Int.MIN_VALUE, which is *not* greater
+        // than `header.size`, so the bound check below passes and `String(header, at, …)`
+        // throws StringIndexOutOfBoundsException. `fullName` documents this same hazard
+        // and guards against it with a 64-bit sum; the guard belongs here as well.
+        if (mobiHeaderLength < 0 || mobiHeaderLength > header.size) return emptyMap()
         var at = PALMDOC_HEADER_LENGTH + mobiHeaderLength
-        if (at + 12 > header.size) return emptyMap()
+        if (at < 0 || at + 12 > header.size) return emptyMap()
         if (String(header, at, 4, Charsets.US_ASCII) != EXTH_MAGIC) return emptyMap()
         val length = readInt(header, at + 4)
         val count = readInt(header, at + 8)
@@ -289,25 +304,49 @@ object MobiParser {
      * 16-bit value holding an 11-bit distance and a 3-bit length minus three, and it
      * may overlap the output cursor, so it has to be copied one byte at a time.
      */
-    private fun palmDoc(data: ByteArray): ByteArray {
+    /**
+     * Decompresses one PalmDOC record, refusing to grow past [budget] bytes.
+     *
+     * The budget is not optional. `MAX_TEXT_LENGTH` is this parser's only defence against
+     * a file whose records expand without end, and it used to be checked once per record
+     * in the caller — where `palmDoc` could not see it. A back-reference emits up to ten
+     * bytes from two, so a single record of 15 MB expanded to 76 MB and the ceiling of
+     * 64 MB was passed without a word: the guard has to be inside the loop that does the
+     * expanding, not around it.
+     *
+     * Throws [BookFormat.Companion.Unsupported] rather than returning a short buffer, so a
+     * file that overruns is reported instead of being silently truncated into a book whose
+     * last chapters are missing.
+     */
+    private fun palmDoc(data: ByteArray, budget: Int): ByteArray {
         // A plain growable array rather than a stream: back-references are resolved by
         // index, and reading an element back out of a stream would mean copying the
         // whole buffer on every byte of every match.
-        var out = ByteArray((data.size * 3).coerceAtLeast(64))
+        var out = ByteArray((data.size * 3).coerceAtLeast(64).coerceAtMost(maxOf(budget, 64)))
         var length = 0
         var p = 0
+        fun roomFor(extra: Int) {
+            if (length + extra > budget) {
+                throw BookFormat.Companion.Unsupported("MOBI 的正文过大")
+            }
+            if (length + extra > out.size) {
+                out = out.copyOf(
+                    (out.size * 2).coerceAtLeast(length + extra).coerceAtMost(maxOf(budget, length + extra)),
+                )
+            }
+        }
         while (p < data.size) {
             val c = data[p++].toInt() and 0xFF
             when {
                 c in 1..8 -> {
                     val end = (p + c).coerceAtMost(data.size)
-                    if (length + (end - p) > out.size) out = out.copyOf((out.size * 2).coerceAtLeast(length + end - p))
+                    roomFor(end - p)
                     System.arraycopy(data, p, out, length, end - p)
                     length += end - p
                     p = end
                 }
                 c < 0x80 -> {
-                    if (length + 1 > out.size) out = out.copyOf(out.size * 2)
+                    roomFor(1)
                     out[length++] = c.toByte()
                 }
                 c < 0xC0 -> {
@@ -316,7 +355,7 @@ object MobiParser {
                     val distance = (pair shr 3) and 0x07FF
                     val run = (pair and 0x07) + 3
                     if (distance <= 0 || distance > length) break
-                    if (length + run > out.size) out = out.copyOf((out.size * 2).coerceAtLeast(length + run))
+                    roomFor(run)
                     // Byte at a time: a match may overlap the output cursor, so the
                     // bytes being copied can include ones this loop just wrote.
                     repeat(run) {
@@ -325,7 +364,7 @@ object MobiParser {
                     }
                 }
                 else -> {
-                    if (length + 2 > out.size) out = out.copyOf(out.size * 2)
+                    roomFor(2)
                     out[length++] = ' '.code.toByte()
                     out[length++] = (c xor 0x80).toByte()
                 }
@@ -408,7 +447,10 @@ object MobiParser {
             // entry carries its own offset into the same record, so a crafted table can
             // point a hundred thousand entries at the same 32 KB phrase and multiply the
             // heap by the entry count. A real CDIC table is a few hundred kilobytes.
-            if (total > MAX_PHRASES || phrases.size >= MAX_PHRASES) {
+            // A negative `total` used to slip past the ceiling check below (a negative is
+            // not greater than MAX_PHRASES), make `wanted` negative, skip the loop and
+            // report "the CDIC table is empty" — a misleading message for a corrupt table.
+            if (total !in 1..MAX_PHRASES || phrases.size >= MAX_PHRASES) {
                 throw BookFormat.Companion.Unsupported("MOBI 的压缩词表过大")
             }
             val wanted = minOf(1 shl bits, total - phrases.size, MAX_PHRASES - phrases.size)
@@ -516,7 +558,11 @@ object MobiParser {
         val fdst = records[index]
         if (fdst.size < 20 || String(fdst, 0, 4, Charsets.US_ASCII) != "FDST") return text
         val pieces = readInt(fdst, 8)
-        if (pieces <= 1 || fdst.size < 12 + pieces * 8) return text
+        // In Long: `pieces * 8` overflows to a small positive number for a crafted count
+        // (`0x20000000` makes the sum 12), which would pass the length check and then be
+        // used as a bound. The later `end > text.size` check is the only thing that
+        // currently saves it.
+        if (pieces <= 1 || fdst.size.toLong() < 12L + pieces.toLong() * 8L) return text
         val start = readInt(fdst, 12)
         val end = readInt(fdst, 16)
         if (start < 0 || end <= start || end > text.size) return text
@@ -682,7 +728,7 @@ object MobiParser {
     }
 
     /** A record count above this is a corrupt directory, not a book. */
-    private const val MAX_RECORDS = 100_000
+    private const val MAX_RECORDS = 4096
 
     /** How deep a compressed phrase may nest before the table is treated as broken. */
     private const val MAX_PHRASE_DEPTH = 20

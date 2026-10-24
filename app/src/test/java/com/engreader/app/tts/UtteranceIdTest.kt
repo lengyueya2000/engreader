@@ -1,6 +1,7 @@
 package com.engreader.app.tts
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
 
@@ -62,5 +63,45 @@ class UtteranceIdTest {
         assertEquals(12, UtteranceId.parse("sentence:12")?.index)
         assertEquals(120, UtteranceId.parse("sentence:120")?.index)
         assertEquals(120, UtteranceId.parse("sentence:120:zh")?.index)
+    }
+
+    @Test
+    fun `a request number is stripped before the sentence is read`() {
+        // The queue only cares which sentence was heard; the request number exists so two
+        // outstanding requests for the same sentence can be told apart, not so the
+        // sentence index changes.
+        assertEquals(SpokenUtterance(7, SpeechRole.Reading), UtteranceId.parse(UtteranceId.english(7, 3)))
+        assertEquals(
+            SpokenUtterance(7, SpeechRole.Translation),
+            UtteranceId.parse(UtteranceId.translation(7, 3)),
+        )
+        // `120` must still not be read as `12`, with a request number present or not.
+        assertEquals(120, UtteranceId.parse(UtteranceId.english(120, 9))?.index)
+    }
+
+    @Test
+    fun `the request number round-trips and tells two requests apart`() {
+        // This is what stops an abandoned request from being reported as the sentence
+        // having been heard: the two ids differ, so the queue can reject the old one.
+        val first = UtteranceId.english(7, 1)
+        val second = UtteranceId.english(7, 2)
+        assertNotEquals(first, second)
+        assertEquals(1L, UtteranceId.request(first))
+        assertEquals(2L, UtteranceId.request(second))
+        assertEquals(1L, UtteranceId.request(UtteranceId.translation(7, 1)))
+    }
+
+    @Test
+    fun `an id without a request number carries none`() {
+        // Ids built by callers that do not need the distinction keep working unchanged.
+        assertNull(UtteranceId.request(UtteranceId.english(7)))
+        assertNull(UtteranceId.request(UtteranceId.translation(7)))
+        assertNull(UtteranceId.request("sentence:abc"))
+    }
+
+    @Test
+    fun `a request number does not make a foreign id parse`() {
+        listOf("preview@1", "word:hello@2", "sentence:@1", "sentence:abc@1")
+            .forEach { assertNull("$it should not parse", UtteranceId.parse(it)) }
     }
 }

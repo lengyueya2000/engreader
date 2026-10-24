@@ -110,6 +110,49 @@ class SpokenTextTest {
     }
 
     @Test
+    fun `a division numeral of a hundred or more is spoken, not thrown on`() {
+        // Every one of these used to throw ArrayIndexOutOfBoundsException out of the
+        // synthesis path: TENS holds tens only, so 100 indexed element 10. Roman
+        // numerals legitimately reach 3999, and a book that numbers its chapters past
+        // ninety-nine is ordinary input, which made this a crash on ordinary input.
+        assertEquals("Chapter one hundred fourteen", SpokenText.of("Chapter CXIV"))
+        assertEquals("Appendix eight hundred", SpokenText.of("Appendix DCCC"))
+        assertEquals("Section one hundred one", SpokenText.of("Section CI"))
+        assertEquals("Chapter nine hundred", SpokenText.of("Chapter CM"))
+        assertEquals("Part four hundred", SpokenText.of("Part CD"))
+        assertEquals("Book three thousand", SpokenText.of("Book MMM"))
+        assertEquals("CHAPTER ONE HUNDRED FOURTEEN", SpokenText.of("CHAPTER CXIV"))
+    }
+
+    @Test
+    fun `a single letter after a division word stays a letter`() {
+        // A lettered appendix is named by a letter: `Appendix C` is not appendix one
+        // hundred, and `Appendix L` is not appendix fifty. Only I/V/X are numerals on
+        // their own, and the ones that really are numerals are still spoken. This is
+        // also what stops the old crash on the single-letter case: those never reach
+        // the hundreds at all.
+        assertEquals("Appendix C", SpokenText.of("Appendix C"))
+        assertEquals("Section D", SpokenText.of("Section D"))
+        assertEquals("Chapter M", SpokenText.of("Chapter M"))
+        assertEquals("Figure C", SpokenText.of("Figure C"))
+        assertEquals("Part C", SpokenText.of("Part C"))
+        assertEquals("APPENDIX C", SpokenText.of("APPENDIX C"))
+        assertEquals("Appendix L", SpokenText.of("Appendix L"))
+        assertEquals("Table D", SpokenText.of("Table D"))
+        assertEquals("Figure M", SpokenText.of("Figure M"))
+        assertEquals("Appendix five", SpokenText.of("Appendix V"))
+        assertEquals("Chapter ten", SpokenText.of("Chapter X"))
+    }
+
+    @Test
+    fun `a regnal numeral past ninety-nine is an ordinal`() {
+        // Popes and monarchs reach these numbers, and ORDINAL_TENS had the same gap.
+        assertEquals("Pope the one hundred fifth", SpokenText.of("Pope CV"))
+        assertEquals("Pope the two hundredth", SpokenText.of("Pope CC"))
+        assertEquals("Pope the nine hundredth", SpokenText.of("Pope CM"))
+    }
+
+    @Test
     fun `a dotted meridiem with a space is spelled as letters`() {
         assertEquals(
             "Left Munich at 8:35 p m, on the first of May.",

@@ -210,7 +210,21 @@ object TextParser {
         val start = paragraphs.indexOfFirst { START_MARKER.matches(it.trim()) }
         val end = paragraphs.indexOfFirst { END_MARKER.matches(it.trim()) }
         val from = if (start >= 0) start + 1 else 0
-        val to = if (end >= from) end else paragraphs.size
+        // An END marker before the START one belongs to something else — a quoted licence
+        // header, or a mis-ordered copy — and treating it as the end of the book kept every
+        // paragraph of the trailing licence as prose. When it is out of order, the marker
+        // *after* the start is the one that ends the body. Searching must begin after
+        // `start`, or it finds the same early marker again.
+        val to = when {
+            end >= from -> end
+            start >= 0 -> {
+                val after = (start + 1 until paragraphs.size).firstOrNull {
+                    END_MARKER.matches(paragraphs[it].trim())
+                }
+                after ?: paragraphs.size
+            }
+            else -> paragraphs.size
+        }
         return paragraphs.subList(from, to)
     }
 
@@ -362,7 +376,10 @@ object TextParser {
         val utf8 = com.engreader.app.source.PageCharset.decode(bytes, null)
         if (hasByteOrderMark(bytes)) return utf8
         val broken = utf8.count { it == '\uFFFD' }
-        if (broken == 0 || broken * 100 <= utf8.length) return utf8
+        // Compared in Long: `broken * 100` overflows to a negative number once the text is
+        // past about 21 million characters, and a negative is always <= the length, so the
+        // fallback was skipped for exactly the large files that need it most.
+        if (broken == 0 || broken.toLong() * 100L <= utf8.length.toLong()) return utf8
         val legacy = runCatching { String(bytes, Charset.forName("GB18030")) }.getOrNull() ?: return utf8
         return if (legacy.count { it == '\uFFFD' } < broken) legacy else utf8
     }

@@ -31,6 +31,15 @@ data class SpokenUtterance(val index: Int, val role: SpeechRole)
  * keeps the two ends in agreement: if the suffix a producer writes is not the suffix a
  * consumer strips, the queue stops at the end of the first pair and the reader hears
  * nothing after it, which is a silent failure rather than a visible one.
+ *
+ * An id can also carry a *request* number: `sentence:N@3`. The sentence index alone is not
+ * unique, because the same sentence is legitimately asked for twice — a watchdog retry does
+ * it, and so does a reader tapping play twice — and the voice reports every request that it
+ * abandons as finished. Without the request number the queue cannot tell "sentence 7 has
+ * been heard" from "the first of two requests for sentence 7 was dropped", and it advanced
+ * on the dropped one: the reader lost a sentence and then sat through a pause while the
+ * second request was still being synthesised. The request number is ignored by [parse],
+ * which is what keeps the sentence semantics unchanged for callers that do not need it.
  */
 object UtteranceId {
 
@@ -39,9 +48,23 @@ object UtteranceId {
     /** Marks the utterance that reads a sentence's Chinese, after its English. */
     const val TRANSLATION_SUFFIX = ":zh"
 
+    /** Separates the sentence index from the request number, when one is carried. */
+    private const val REQUEST_SEPARATOR = "@"
+
     fun english(index: Int): String = "$PREFIX$index"
 
     fun translation(index: Int): String = "$PREFIX$index$TRANSLATION_SUFFIX"
+
+    /**
+     * The id of a *particular request* for a sentence.
+     *
+     * [request] must increase with every call the caller makes for the same sentence, so
+     * that two outstanding requests cannot share an id. See the note on this object.
+     */
+    fun english(index: Int, request: Long): String = "$PREFIX$index$REQUEST_SEPARATOR$request"
+
+    fun translation(index: Int, request: Long): String =
+        "$PREFIX$index$TRANSLATION_SUFFIX$REQUEST_SEPARATOR$request"
 
     /**
      * The sentence and role an id names, or null when it is not one of ours.
@@ -49,10 +72,13 @@ object UtteranceId {
      * The Chinese has to be recognised before the English: `5:zh` does not parse as a
      * number, so a reader that checked for the bare form first would drop every Chinese
      * utterance and stop the queue.
+     *
+     * Any request number is stripped first, so an id carrying one parses exactly like the
+     * plain form: the queue cares which sentence was heard, not which request delivered it.
      */
     fun parse(id: String): SpokenUtterance? {
         if (!id.startsWith(PREFIX)) return null
-        val body = id.removePrefix(PREFIX)
+        val body = id.removePrefix(PREFIX).substringBefore(REQUEST_SEPARATOR)
         if (body.endsWith(TRANSLATION_SUFFIX)) {
             val index = body.removeSuffix(TRANSLATION_SUFFIX).toIntOrNull() ?: return null
             return SpokenUtterance(index, SpeechRole.Translation)
@@ -60,6 +86,15 @@ object UtteranceId {
         val index = body.toIntOrNull() ?: return null
         return SpokenUtterance(index, SpeechRole.Reading)
     }
+
+    /**
+     * The request number carried by [id], or null when it carries none.
+     *
+     * This is what lets the queue drop the report for a request it has already replaced
+     * while still accepting the one for the request it is actually waiting on.
+     */
+    fun request(id: String): Long? =
+        id.substringAfter(REQUEST_SEPARATOR, "").toLongOrNull()
 }
 
 /**

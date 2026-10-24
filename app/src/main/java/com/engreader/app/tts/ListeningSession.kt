@@ -119,11 +119,55 @@ class ListeningSession(private val container: AppContainer) {
     val state: StateFlow<State> = _state.asStateFlow()
 
     private var queue: List<Spoken> = emptyList()
+
+    /**
+     * Guards [queue].
+     *
+     * The queue is written by `open`/`stop` and read by everything else, and the two do not
+     * run on the same thread: the load runs on `container.appScope`, which is
+     * `Dispatchers.Default`, while `pause`/`resume`/`next`/`seek` arrive from the UI. Every
+     * access is under this lock, so a check and the read that follows it cannot be
+     * interleaved with a replacement — the shape that used to be able to throw
+     * `IndexOutOfBoundsException` out of `speakAt`.
+     */
+    private val queueLock = Any()
+
+    /** The current queue. Read under the lock; the list itself is never mutated in place. */
+    private fun snapshot(): List<Spoken> = synchronized(queueLock) { queue }
+
+    /** Replaces the queue. */
+    private fun setQueue(next: List<Spoken>) = synchronized(queueLock) { queue = next }
+
+    /** The sentence at [index], or null when the queue is shorter than that. */
+    private fun sentenceAt(index: Int): Spoken? = synchronized(queueLock) { queue.getOrNull(index) }
     private var collectJob: Job? = null
     private var timerJob: Job? = null
     private var loadJob: Job? = null
     private var advanceJob: Job? = null
     private var lastIndex = -1
+
+    /**
+     * The request number of the utterance the queue is waiting on, and the counter behind it.
+     *
+     * The same sentence is legitimately requested more than once — a watchdog retry does it,
+     * and so does a reader tapping play twice — and the voice reports *every* request it
+     * abandons as finished. A report that only carries the sentence index therefore cannot
+     * be told apart from the one that means "this sentence has been heard", and the queue
+     * advanced on the abandoned request: one sentence was skipped and the listener then sat
+     * through a pause while the live request was still being synthesised.
+     *
+     * The counter is bumped for every request, so two outstanding requests never share an
+     * id; [awaitingRequest] is the one whose completion the queue is actually waiting for.
+     */
+    private var requestCounter = 0L
+    private var awaitingRequest = -1L
+
+    /** The id of the next request for a sentence, and the bookkeeping that makes it current. */
+    private fun nextRequest(): Long {
+        requestCounter++
+        awaitingRequest = requestCounter
+        return requestCounter
+    }
 
     /**
      * Bumped by every [open] and [stop].
@@ -256,7 +300,7 @@ class ListeningSession(private val container: AppContainer) {
         if (!current.active) return
         // Nothing to resume: the piece has not started yet and is already on its way.
         if (starting) return
-        if (queue.isEmpty()) {
+        if (snapshot().isEmpty()) {
             // Active but with nothing to say: the piece's body never arrived, or a
             // previous load left the session holding an empty queue. Doing nothing here
             // is what a dead play button looks like, so the piece is fetched again.
@@ -278,10 +322,13 @@ class ListeningSession(private val container: AppContainer) {
         cancelJobs()
         container.speaker.stop()
         lastIndex = -1
+        // No request is outstanding once the voice has been stopped: every in-flight
+        // callback belongs to the session that just ended.
+        awaitingRequest = -1L
         pausedIndex = -1
         ending = false
         writeProgress(current)
-        queue = emptyList()
+        setQueue(emptyList())
         _state.value = State()
         PlaybackService.stop(container.appContext)
     }
@@ -299,8 +346,8 @@ class ListeningSession(private val container: AppContainer) {
 
     /** Jumps playback to a sentence — a tap on the text, or the queue's own advance. */
     fun seek(index: Int) {
-        if (!_state.value.active || queue.isEmpty()) return
-        speakAt(index.coerceIn(0, queue.size - 1))
+        if (!_state.value.active || snapshot().isEmpty()) return
+        speakAt(index.coerceIn(0, snapshot().size - 1))
     }
 
     fun setSleep(option: SleepOption) {
@@ -337,7 +384,7 @@ class ListeningSession(private val container: AppContainer) {
         pausedIndex = -1
         ending = false
         startedAt = 0L
-        queue = emptyList()
+        setQueue(emptyList())
         val generation = ++sessionGeneration
         starting = true
         startIndex = fromIndex
@@ -394,7 +441,7 @@ class ListeningSession(private val container: AppContainer) {
             withTimeoutOrNull(SUBSCRIBE_WAIT_MS) { subscribed.await() }
             if (generation != sessionGeneration) return@launch
             startSleepTimer()
-            speakAt(fromIndex.coerceIn(0, (queue.size - 1).coerceAtLeast(0)))
+            speakAt(fromIndex.coerceIn(0, (snapshot().size - 1).coerceAtLeast(0)))
         }
     }
 
@@ -436,7 +483,7 @@ class ListeningSession(private val container: AppContainer) {
             }
         }
         if (generation != sessionGeneration) return false
-        queue = spoken
+        setQueue(spoken)
         startedAt = System.currentTimeMillis()
         _state.update {
             it.copy(
@@ -462,7 +509,13 @@ class ListeningSession(private val container: AppContainer) {
 
     private fun speakAt(index: Int) {
         starting = false
-        if (index !in queue.indices) {
+        // Bounds check and element read are one step under the lock. They were two, and
+        // `queue` is replaced wholesale by `open`/`stop` on another thread — the load runs
+        // on `appScope`, which is `Dispatchers.Default` — so a queue that shrank between
+        // the check and the read made this throw IndexOutOfBoundsException. Rare, but it
+        // is a crash rather than a glitch, and the lock costs nothing here.
+        val spoken = sentenceAt(index)
+        if (spoken == null) {
             endOfPiece()
             return
         }
@@ -479,7 +532,6 @@ class ListeningSession(private val container: AppContainer) {
         // same sentence are both untouched, because neither has passed anything.
         if (index != lastIndex && index != lastIndex + 1) container.speaker.discardLookAhead()
         lastIndex = index
-        val spoken = queue[index]
         _state.update {
             it.copy(
                 index = index,
@@ -496,7 +548,7 @@ class ListeningSession(private val container: AppContainer) {
         // every path in — the reader's button, the lock screen, the listening screen —
         // so it is asked for here rather than at each entry point. Idempotent.
         if (container.settings.speakTranslation) container.speaker.prepareTranslation()
-        container.speaker.speak(queue[index].text, UtteranceId.english(index))
+        speakEnglish(index, spoken)
         armWatchdog()
         prefetchAfter(index)
         // The notification's middle button and the lock screen both read `playing`, and
@@ -508,14 +560,29 @@ class ListeningSession(private val container: AppContainer) {
     }
 
     private fun speakTranslationAt(index: Int, chinese: String) {
-        container.speaker.speak(chinese, UtteranceId.translation(index), SpeechRole.Translation)
+        container.speaker.speak(chinese, UtteranceId.translation(index, nextRequest()), SpeechRole.Translation)
         armWatchdog()
         // What follows this Chinese line is the next sentence's English, so that is what
         // is worth synthesising now. Prefetching the next *Chinese* line here asked the
         // Mandarin engine for a sentence that would not be wanted for another two
         // utterances, and left the English one — the one actually about to play —
         // to be synthesised from scratch after the Chinese finished.
-        queue.getOrNull(index + 1)?.let { container.speaker.prefetch(it.text, SpeechRole.Reading) }
+        sentenceAt(index + 1)?.let { container.speaker.prefetch(it.text, SpeechRole.Reading) }
+    }
+
+    /**
+     * Speaks [spoken] as a fresh request for sentence [index].
+     *
+     * The sentence is passed in rather than looked up again: `speakAt` has already checked
+     * it is there, and a second lookup could find a different queue if one was loaded in
+     * between — the exact window the lock in `speakAt` exists to close.
+     */
+    private fun speakEnglish(index: Int, spoken: Spoken) {
+        container.speaker.speak(
+            spoken.text,
+            UtteranceId.english(index, nextRequest()),
+            SpeechRole.Reading,
+        )
     }
 
     /**
@@ -542,14 +609,14 @@ class ListeningSession(private val container: AppContainer) {
      */
     private fun prefetchAfter(index: Int) {
         if (container.settings.speakTranslation) {
-            queue.getOrNull(index)?.chinese?.let { chinese ->
+            sentenceAt(index)?.chinese?.let { chinese ->
                 container.speaker.prefetch(chinese, SpeechRole.Translation)
-                queue.getOrNull(index + 1)?.let { container.speaker.prefetch(it.text, SpeechRole.Reading) }
+                sentenceAt(index + 1)?.let { container.speaker.prefetch(it.text, SpeechRole.Reading) }
                 return
             }
         }
         for (ahead in 1..LOOK_AHEAD_SENTENCES) {
-            queue.getOrNull(index + ahead)
+            sentenceAt(index + ahead)
                 ?.let { container.speaker.prefetch(it.text, SpeechRole.Reading) }
         }
     }
@@ -566,7 +633,7 @@ class ListeningSession(private val container: AppContainer) {
         watchdogJob?.cancel()
         watchdogJob = null
         val index = lastIndex
-        val spoken = queue.getOrNull(index) ?: return
+        val spoken = sentenceAt(index) ?: return
         val playback = container.speaker.estimateMillis(spoken.text) +
             if (container.settings.speakTranslation) {
                 spoken.chinese?.let { container.speaker.estimateMillis(it) } ?: 0L
@@ -627,17 +694,27 @@ class ListeningSession(private val container: AppContainer) {
         val spoken = UtteranceId.parse(utteranceId) ?: return
         // Ignore a late callback from a sentence the listener already skipped.
         if (spoken.index != lastIndex) return
+        // Ignore a report for a request that has been superseded by a newer one for the
+        // same sentence. The voice reports an abandoned request as finished, and a retry
+        // or a second tap on play makes exactly that shape: without this check the queue
+        // advanced on the abandoned request, so the sentence was skipped and the listener
+        // then waited through a pause while the live request was still being built.
+        val request = UtteranceId.request(utteranceId)
+        if (request != null && request != awaitingRequest) {
+            Log.d(TAG, "ignoring finish of superseded request $request (waiting on $awaitingRequest)")
+            return
+        }
         // The voice answered, so any earlier silence was the look-ahead catching up
         // rather than a dead utterance; a re-try budget spent on pauses would give up
         // on a read-aloud that is in fact still going.
         watchdogRetries = 0
         val next = spoken.index + 1
         if (spoken.role == SpeechRole.Translation) {
-            if (next < queue.size) speakAt(next) else endOfPiece()
+            if (next < snapshot().size) speakAt(next) else endOfPiece()
             return
         }
         val chinese = if (container.settings.speakTranslation) {
-            queue.getOrNull(spoken.index)?.chinese
+            sentenceAt(spoken.index)?.chinese
         } else {
             null
         }
@@ -645,7 +722,7 @@ class ListeningSession(private val container: AppContainer) {
             speakTranslationAt(spoken.index, chinese)
             return
         }
-        if (next < queue.size) speakAt(next) else endOfPiece()
+        if (next < snapshot().size) speakAt(next) else endOfPiece()
     }
 
     /**
@@ -750,7 +827,7 @@ class ListeningSession(private val container: AppContainer) {
     private fun writeProgress(current: State) {
         val articleId = current.articleId
         if (articleId <= 0L || !current.active) return
-        val spoken = queue.getOrNull(current.index)
+        val spoken = sentenceAt(current.index)
         val paragraph = spoken?.paragraph
         // `stop()` reaches here on a piece that never finished loading, when there is no
         // start time to measure from — the difference would be the whole epoch.

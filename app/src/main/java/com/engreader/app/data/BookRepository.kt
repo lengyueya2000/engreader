@@ -52,7 +52,7 @@ class BookRepository(
      * transaction claimed could not happen.
      */
     suspend fun import(uri: Uri, displayName: String): Book = withContext(Dispatchers.IO) {
-        val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+        val bytes = context.contentResolver.openInputStream(uri)?.use { it.readCapped() }
             ?: throw BookFormat.Companion.Unsupported("读不到这个文件")
         if (bytes.isEmpty()) throw BookFormat.Companion.Unsupported("这个文件是空的")
 
@@ -348,8 +348,45 @@ class BookRepository(
         val coverExtension: String,
     )
 
+    /**
+     * Reads the picked file, refusing one larger than [MAX_IMPORT_BYTES].
+     *
+     * The parsers all cap what they expand *into*, but nothing capped what came off the
+     * content provider first: `readBytes()` would hold the whole file before a single
+     * check ran, and `OutOfMemoryError` is an `Error`, so the import path's
+     * `catch (Throwable)` turned a 400 MB mistake into a killed process rather than a
+     * message. The size is refused rather than truncated, because a truncated book parses
+     * into a book whose ending is missing and nothing downstream can tell.
+     */
+    private fun java.io.InputStream.readCapped(): ByteArray {
+        val buffer = java.io.ByteArrayOutputStream()
+        val chunk = ByteArray(64 * 1024)
+        var total = 0
+        while (true) {
+            val read = read(chunk)
+            if (read < 0) break
+            total += read
+            if (total > MAX_IMPORT_BYTES) {
+                throw BookFormat.Companion.Unsupported(
+                    "这个文件超过 ${MAX_IMPORT_BYTES / (1024 * 1024)} MB，太大，无法作为电子书导入",
+                )
+            }
+            buffer.write(chunk, 0, read)
+        }
+        return buffer.toByteArray()
+    }
+
     private companion object {
         const val TAG = "BookRepository"
+
+        /**
+         * Largest file the importer will read.
+         *
+         * A 25 MB AZW3 with hundreds of illustrations is the largest real book measured
+         * here, and the parsers hold the file plus their own copies of the text, so this
+         * leaves generous room while still bounding the worst case.
+         */
+        const val MAX_IMPORT_BYTES = 128 * 1024 * 1024
 
         /** `sourceId` for a book chapter, so `Catalog.displayName` can label it. */
         const val BOOK_SOURCE = "book"

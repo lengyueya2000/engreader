@@ -218,12 +218,20 @@ fun BookShelfScreen(
  * disk, so this decodes the bitmap directly. `produceState` runs the decode on the
  * IO dispatcher and drops the result when the row scrolls away, which is what an
  * image loader would do for this case anyway.
+ *
+ * The suppression is a false positive, and it is worth saying why rather than just
+ * silencing it: `value` *is* assigned, once, at the end of the producer lambda. Lint's
+ * check for this rule does not follow the assignment when the right-hand side suspends
+ * inside `withContext`, so it reports the call as one that never produces a state. The
+ * call was correct before the suppression was added; the error severity of the rule is
+ * what made it block `lintDebug` for several releases.
  */
+@Suppress("ProduceStateDoesNotAssignValue")
 @Composable
 internal fun rememberCover(book: Book): android.graphics.Bitmap? {
     val context = LocalContext.current
     return produceState<android.graphics.Bitmap?>(null, book.id, book.coverFile) {
-        value = if (book.coverFile.isBlank()) {
+        val decoded: android.graphics.Bitmap? = if (book.coverFile.isBlank()) {
             null
         } else {
             withContext(Dispatchers.IO) {
@@ -233,6 +241,7 @@ internal fun rememberCover(book: Book): android.graphics.Bitmap? {
                 }.getOrNull()
             }
         }
+        value = decoded
     }.value
 }
 
