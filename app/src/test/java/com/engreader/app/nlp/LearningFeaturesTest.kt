@@ -53,6 +53,24 @@ class ClozeTest {
         assertEquals(sentence, Cloze.blank(sentence, "derived"))
     }
 
+    /**
+     * The boundary class used to be ASCII-only, so an accented letter did not count as
+     * part of the word and `cole` matched inside `École` — the "cuts a longer word in
+     * half" failure this object's KDoc forbids.
+     */
+    @Test
+    fun `an accented letter blocks the match`() {
+        val accented = "École normale supérieure was founded in 1794."
+        assertEquals(accented, Cloze.blank(accented, "cole"))
+        assertEquals("Zürich is a city.", Cloze.blank("Zürich is a city.", "rich"))
+        assertEquals("naïve question.", Cloze.blank("naïve question.", "ve"))
+    }
+
+    @Test
+    fun `an accented word is still blanked as a whole`() {
+        assertEquals("______ is a city.", Cloze.blank("Zürich is a city.", "Zürich"))
+    }
+
     @Test
     fun `an inflected form in the sentence is found by its own spelling`() {
         // Review cards store the surface form, because the dictionary resolves
@@ -397,6 +415,17 @@ class VocabularyProfileTest {
         assertEquals("procrastination", word.lemma)
         assertEquals("拖延", word.gloss)
         assertEquals(DifficultyBand.B2, word.band)
+    }
+
+    /**
+     * `Unknown` is the last enum constant, so ordering by `band.ordinal` put a word the
+     * corpus cannot place above a C2 one — but it means "no frequency data", not "rare",
+     * the distinction [VocabularyGrader] relies on.
+     */
+    @Test
+    fun `an ungraded word sorts below a graded one`() {
+        val result = profile.assess(listOf("quixotic", "government"), known = emptySet())
+        assertEquals(listOf("government", "quixotic"), result.asNewWords(lexicon).map { it.lemma })
     }
 
     @Test

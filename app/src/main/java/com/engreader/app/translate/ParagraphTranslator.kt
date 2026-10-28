@@ -11,8 +11,13 @@ import kotlinx.coroutines.withContext
  * here means "no key, no setup for the user" — the request goes out over the
  * network to a public endpoint.
  *
- * Only the paragraphs that actually changed are sent. Editing a body later, or a
- * partial earlier run, therefore costs nothing to bring up to date.
+ * A cache entry is reused by *position*: the stored translation is a parallel list with
+ * no copy of the text it came from, so this class cannot tell a slot that still matches
+ * its paragraph from one whose paragraph was edited in place. The guard for that sits
+ * one layer up — `ArticleRepository.persist` blanks the stored translation whenever the
+ * body changes — and a writer that bypasses it would re-display the old Chinese for an
+ * edited paragraph of the same length. The KDoc here used to claim the content
+ * correspondence was checked here, which it never was.
  */
 class ParagraphTranslator(private val engines: List<TranslateEngine> = DEFAULT_ENGINES) {
 
@@ -30,9 +35,11 @@ class ParagraphTranslator(private val engines: List<TranslateEngine> = DEFAULT_E
     /**
      * Returns translations aligned with [paragraphs]; blank paragraphs stay blank.
      *
-     * [cached] is the previous result, normally loaded from the article row: entries
-     * that are already present and correspond to an unchanged paragraph are reused
-     * as-is, so a re-run after a body edit only pays for the edited paragraphs.
+     * [cached] is the previous result, normally loaded from the article row. Entries are
+     * reused by position, and only when the cached list is the same length as
+     * [paragraphs]; a cache produced from the same paragraph list — which is what
+     * `ArticleRepository` guarantees by clearing it when the body changes — costs
+     * nothing to reuse, so a re-run after an edit only pays for the empty slots.
      */
     suspend fun translate(
         paragraphs: List<String>,
@@ -63,12 +70,14 @@ class ParagraphTranslator(private val engines: List<TranslateEngine> = DEFAULT_E
     }
 
     /**
-     * Matches cached translations to the current paragraphs.
+     * Matches cached translations to the current paragraphs, by position.
      *
-     * Cache and body are stored as parallel lists, so an entry is only reusable when
-     * the two still line up. If the paragraph count has changed the body was
-     * re-split upstream and position means nothing, so the cache is discarded rather
-     * than shown against the wrong paragraph.
+     * Cache and body are stored as parallel lists and the cache carries no copy of the
+     * text it was produced from, so the only check available here is the length: if the
+     * paragraph count has changed the body was re-split upstream and position means
+     * nothing, so the cache is discarded rather than shown against the wrong paragraph.
+     * A same-length body edit cannot be detected here at all — `ArticleRepository.persist`
+     * blanks the cache when the text changes, and that is the guarantee this relies on.
      */
     private fun align(paragraphs: List<String>, cached: List<String>): Array<String?> {
         val out = arrayOfNulls<String>(paragraphs.size)

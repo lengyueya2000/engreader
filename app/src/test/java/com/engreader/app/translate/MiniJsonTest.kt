@@ -67,6 +67,33 @@ class MiniJsonTest {
     fun `rejects a bare word`() {
         MiniJson.parse("error")
     }
+
+    /**
+     * The reader promises to catch a mangled endpoint body, but it returned the value and
+     * ignored whatever followed: `parse("1abc")` gave 1.0 and `parse("""["x"] junk""")`
+     * gave the array.
+     */
+    @Test(expected = MiniJson.JsonException::class)
+    fun `rejects trailing content after the value`() {
+        MiniJson.parse("""["x"] junk""")
+    }
+
+    @Test(expected = MiniJson.JsonException::class)
+    fun `rejects a number with letters glued to it`() {
+        MiniJson.parse("1abc")
+    }
+
+    /** Recursion per `[`/`{` was unbounded: 20,000 open brackets raised StackOverflowError. */
+    @Test(expected = MiniJson.JsonException::class)
+    fun `rejects nesting past the depth limit`() {
+        MiniJson.parse("[".repeat(200) + "]".repeat(200))
+    }
+
+    /** `toIntOrNull(16)` accepts a sign, so `\u-123` produced a code point instead of failing. */
+    @Test(expected = MiniJson.JsonException::class)
+    fun `rejects a signed unicode escape`() {
+        MiniJson.parse("""["\u-123"]""")
+    }
 }
 
 class SplitForLimitTest {
@@ -98,6 +125,19 @@ class SplitForLimitTest {
     fun `never returns an empty piece`() {
         val pieces = splitForLimit("Sentence one. Sentence two. ", 12)
         assertTrue(pieces.all { it.isNotBlank() })
+    }
+
+    /**
+     * `maxChars = 0` appended an empty piece without shrinking the text — the loop never
+     * terminated and grew its output without bound — and `-1` threw a
+     * StringIndexOutOfBoundsException out of `substring` instead of saying what was wrong.
+     */
+    @Test
+    fun `a non-positive cap is refused instead of looping forever`() {
+        for (cap in listOf(0, -1)) {
+            val error = runCatching { splitForLimit("aaaa", cap) }.exceptionOrNull()
+            assertTrue("cap $cap gave $error", error is IllegalArgumentException)
+        }
     }
 }
 

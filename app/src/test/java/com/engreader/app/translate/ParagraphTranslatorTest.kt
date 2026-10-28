@@ -72,6 +72,22 @@ class ParagraphTranslatorTest {
         assertEquals(listOf("one", "two"), engine.lastInput)
     }
 
+    /**
+     * The limit of the reuse rule, pinned rather than left implicit: the cache is a
+     * parallel list with no copy of the text it was produced from, so a body edit that
+     * keeps the paragraph count is re-displayed from the cache. The guard for that is
+     * upstream — `ArticleRepository.persist` blanks the stored translation whenever the
+     * body changes — and the class KDoc now says so instead of claiming it checks content.
+     */
+    @Test
+    fun `a same-length cache is reused by position, whatever the text now says`() = runBlocking {
+        val engine = FakeEngine("fake") { error("should not be called") }
+        val out = ParagraphTranslator(listOf(engine))
+            .translate(listOf("one EDITED", "two"), cached = listOf("旧:one", "旧:two"))
+        assertEquals(listOf("旧:one", "旧:two"), out)
+        assertEquals(0, engine.calls)
+    }
+
     @Test
     fun `keeps blank paragraphs blank and does not send them`() = runBlocking {
         val engine = FakeEngine("fake") { it.map { p -> "译:$p" } }

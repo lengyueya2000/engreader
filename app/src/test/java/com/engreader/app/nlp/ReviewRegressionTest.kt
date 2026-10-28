@@ -168,6 +168,57 @@ class VocabularyGraderRegressionTest {
         assertEquals(1, result.grade)
     }
 
+    /**
+     * Nine distinct lemmas that all band as advanced: `collins = 2` is B2, the same
+     * fixture shape the other tests use.
+     */
+    private val advanced = object : Lexicon {
+        private val lemmas = setOf(
+            "abacus", "bellwether", "cognizant", "deference", "effigy",
+            "filibuster", "garrulous", "hedonism", "iconoclast",
+        )
+
+        override fun lookup(raw: String): WordEntry? {
+            val key = raw.lowercase()
+            if (key !in lemmas) return null
+            return WordEntry(
+                lemma = key, queried = raw, translation = "n x", phonetic = "",
+                definition = "", collins = 2, oxford = false, frq = 9000, bnc = 0, tag = "",
+            )
+        }
+
+        override fun suggest(prefix: String, limit: Int) = emptyList<Pair<String, String>>()
+        override fun glosses(translation: String) = emptyList<Pair<PartOfSpeech, String>>()
+        override fun distractors(entry: WordEntry, pos: PartOfSpeech, count: Int) = emptyList<String>()
+        override fun englishDistractors(entry: WordEntry, pos: PartOfSpeech, count: Int) = emptyList<String>()
+        override fun firstGloss(translation: String) = "x"
+        override fun definitions(headword: String) = emptyList<Pair<PartOfSpeech, String>>()
+    }
+
+    /**
+     * The `graded < 10` early return published `advancedRatio = 0f` — "0% of these words
+     * are B2 or above" for a text that was 9/9 advanced — and a caller could not tell
+     * that wrong measurement from "no reliable sample", since `gradedWords` was the only
+     * tell. The grade still stays 3: nine lemmas cannot set a level.
+     */
+    @Test
+    fun `a short text still reports the ratio it measured`() {
+        val text = "abacus bellwether cognizant deference effigy filibuster garrulous hedonism iconoclast"
+        val result = VocabularyGrader(advanced).grade(text)
+        assertEquals(9, result.gradedWords)
+        assertEquals(1f, result.advancedRatio, 0.0001f)
+        assertEquals(3, result.grade)
+    }
+
+    @Test
+    fun `a text the dictionary cannot grade reports nothing measured`() {
+        val result = VocabularyGrader(advanced).grade("zorblat")
+        assertEquals(0, result.gradedWords)
+        assertEquals(0f, result.advancedRatio, 0.0001f)
+        // Still the neutral grade: no coverage is not evidence of an easy text.
+        assertEquals(3, result.grade)
+    }
+
     @Test
     fun `the unknown band really does compare above B2`() {
         // The guard is needed because of this ordering, not in spite of it.

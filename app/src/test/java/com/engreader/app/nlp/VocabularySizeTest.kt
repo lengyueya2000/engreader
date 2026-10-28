@@ -63,6 +63,29 @@ class VocabularySizeTest {
         assertTrue(VocabularySize.offsets(seed = 7L, band = firstBand, available = 0).isEmpty())
     }
 
+    /**
+     * Nine words for eight probes: `available / take` is 1, so there is no room for a
+     * jitter inside a window and every seed produced offsets 0..7 — the ninth word could
+     * never be asked, and two tests of that band asked exactly the same words.
+     */
+    @Test
+    fun `a band one word wider than the sample can still ask its last word`() {
+        val scheduled = (0L..40L).map {
+            VocabularySize.offsets(seed = it, band = firstBand, available = 9)
+        }
+        scheduled.forEach { offsets ->
+            assertEquals(VocabularySize.PER_BAND, offsets.size)
+            assertEquals(offsets.size, offsets.toSet().size)
+            assertTrue("offset out of range: $offsets", offsets.all { it in 0 until 9 })
+            assertEquals(offsets, offsets.sorted())
+        }
+        assertTrue(
+            "the ninth word was never asked: ${scheduled.map { it.last() }.distinct()}",
+            scheduled.any { 8 in it },
+        )
+        assertTrue("offsets did not vary with the seed", scheduled.toSet().size > 1)
+    }
+
     @Test
     fun `everything known estimates the whole population`() {
         val n = VocabularySize.BANDS.map { VocabularySize.PER_BAND }

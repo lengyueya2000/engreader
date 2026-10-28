@@ -67,6 +67,27 @@ class SentencesTest {
     fun `blank input yields nothing`() {
         assertTrue(Sentences.split("   ").isEmpty())
     }
+
+    /**
+     * A one-letter capital that opens its sentence is an initial or a list label, and
+     * its dot must not end anything. The paragraph-initial case was handled but the same
+     * label after another sentence's full stop was not, so `A. That is it. B. This too.`
+     * came back as three sentences with `B.` alone while `A.` stayed joined to its text.
+     */
+    @Test
+    fun `a list label after a full stop is treated like a paragraph-initial one`() {
+        val out = Sentences.split("A. That is it. B. This too.")
+        assertEquals(2, out.size)
+        assertEquals("A. That is it.", out[0].text)
+        assertEquals("B. This too.", out[1].text)
+
+        // The cases the boundary rule exists for are unchanged: a one-letter word that
+        // really ends its sentence still ends it, and an initial still does not.
+        val grade = Sentences.split("The grade is A. She was pleased.")
+        assertEquals(2, grade.size)
+        assertEquals("The grade is A.", grade[0].text)
+        assertEquals(1, Sentences.split("J. R. R. Tolkien wrote the books.").size)
+    }
 }
 
 class ParagraphsTest {
@@ -209,6 +230,23 @@ class TokenizerTest {
         assertEquals("government", Tokenizer.normalize("government,"))
         assertEquals("minister", Tokenizer.normalize("\"Minister's"))
         assertEquals("don't", Tokenizer.normalize("Don't"))
+    }
+
+    /**
+     * `removeSuffix("'s")` ran unconditionally, so a contraction lost its verb and every
+     * lookup keyed on the result — the dictionary, the quiz's POS pass, the grader —
+     * asked about `it`/`he`/`that` instead of the word on screen.
+     */
+    @Test
+    fun `a contraction is not stripped to its stem`() {
+        assertEquals("it's", Tokenizer.normalize("It's"))
+        assertEquals("it\u2019s", Tokenizer.normalize("It\u2019s"))
+        assertEquals("he's", Tokenizer.normalize("he's"))
+        assertEquals("that's", Tokenizer.normalize("that's"))
+        assertEquals("let's", Tokenizer.normalize("let's"))
+        // A real possessive still reduces to its noun, which is what the stripping is for.
+        assertEquals("minister", Tokenizer.normalize("Minister's"))
+        assertEquals("john", Tokenizer.normalize("John\u2019s"))
     }
 
     @Test

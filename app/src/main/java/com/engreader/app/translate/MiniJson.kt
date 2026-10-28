@@ -10,16 +10,36 @@ package com.engreader.app.translate
  */
 internal object MiniJson {
 
+    /**
+     * Deepest container nesting accepted.
+     *
+     * The reader recurses once per `[`/`{`, and a body of twenty thousand open brackets
+     * raised `StackOverflowError` — an `Error`, which only the network path's
+     * `runCatching { }` happens to swallow. A response this reader exists to validate
+     * should be refused, not survive on a lucky catch upstream.
+     */
+    private const val MAX_DEPTH = 64
+
     fun parse(text: String): Any? {
         val reader = Reader(text)
         reader.skipWhitespace()
         val value = reader.readValue()
         reader.skipWhitespace()
+        // A document with content after its value is not the response this reader claims
+        // to validate: `parse("1abc")` returned 1.0, `parse("truex")` returned true and
+        // `parse("""["x"] junk""")` returned the array, so a mangled endpoint body passed
+        // as a valid one.
+        if (!reader.atEnd()) throw JsonException("Trailing content at ${reader.offset}")
         return value
     }
 
     private class Reader(private val text: String) {
         private var at = 0
+        private var depth = 0
+
+        fun atEnd(): Boolean = at >= text.length
+
+        val offset: Int get() = at
 
         fun skipWhitespace() {
             while (at < text.length && text[at].isWhitespace()) at++
@@ -29,13 +49,24 @@ internal object MiniJson {
             skipWhitespace()
             if (at >= text.length) throw JsonException("Unexpected end of input")
             return when (val c = text[at]) {
-                '[' -> readArray()
-                '{' -> readObject()
+                '[' -> nested { readArray() }
+                '{' -> nested { readObject() }
                 '"' -> readString()
                 't' -> readLiteral("true", true)
                 'f' -> readLiteral("false", false)
                 'n' -> readLiteral("null", null)
                 else -> if (c == '-' || c.isDigit()) readNumber() else throw JsonException("Unexpected '$c' at $at")
+            }
+        }
+
+        /** One container level deeper, refusing [MAX_DEPTH] nesting. */
+        private inline fun <T> nested(block: () -> T): T {
+            if (depth >= MAX_DEPTH) throw JsonException("Nesting deeper than $MAX_DEPTH at $at")
+            depth++
+            try {
+                return block()
+            } finally {
+                depth--
             }
         }
 
@@ -124,6 +155,12 @@ internal object MiniJson {
         private fun readUnicode(): String {
             if (at + 4 > text.length) throw JsonException("Truncated \\u escape")
             val hex = text.substring(at, at + 4)
+            // `toIntOrNull(16)` also accepts a sign and surrounding whitespace, so
+            // `"\u-123"` parsed to a negative code point and produced U+FEDD instead of
+            // failing; four hex digits exactly, or the escape is malformed.
+            if (hex.any { it !in '0'..'9' && it !in 'a'..'f' && it !in 'A'..'F' }) {
+                throw JsonException("Bad \\u escape '$hex'")
+            }
             at += 4
             val code = hex.toIntOrNull(16) ?: throw JsonException("Bad \\u escape '$hex'")
             return code.toChar().toString()

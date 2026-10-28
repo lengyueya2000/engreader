@@ -148,6 +148,32 @@ class ConnectedSpeechTest {
     }
 
     @Test
+    fun `a word spelled re links with the r in front of its silent e`() {
+        // `more apples` is the textbook linking-r case. Testing the last *character*
+        // rejected the word at the vowel guard, so `endsWith("re")` was unreachable and
+        // this produced nothing at all.
+        val sentence = "More apples today."
+        val feature = explain(sentence).single { it.kind == Kind.Linking }
+        assertEquals("More apples", feature.written)
+        assertEquals("More apples", sentence.substring(feature.start, feature.end))
+        assertTrue(feature.tip, feature.tip.contains("r"))
+    }
+
+    @Test
+    fun `there is links the same way`() {
+        assertTrue(explain("There is a book.").any { it.kind == Kind.Linking })
+    }
+
+    @Test
+    fun `a vowel-final word still does not link`() {
+        // The rule is about a consonant coda; `go on` is a vowel-to-vowel boundary and
+        // must not be reported as a consonant link.
+        assertTrue(explain("Please go on.").none { it.kind == Kind.Linking })
+        // A bare `r` is unchanged by this fix.
+        assertTrue(explain("They drove far away.").any { it.kind == Kind.Linking })
+    }
+
+    @Test
     fun `a sentence of plain content words yields nothing`() {
         assertTrue(explain("Cats sleep").isEmpty())
     }

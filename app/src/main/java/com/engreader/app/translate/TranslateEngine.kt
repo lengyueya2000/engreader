@@ -182,16 +182,7 @@ class GoogleTranslateEngine : TranslateEngine {
             "https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=zh-CN&dt=t",
             "q=" + TranslateHttp.encode(text),
         )
-        val parsed = runCatching { MiniJson.parse(body) }.getOrElse {
-            throw TranslationException("翻译服务返回了无法解析的内容", it)
-        }
-        val segments = (parsed as? List<*>)?.firstOrNull() as? List<*>
-            ?: throw TranslationException("翻译服务返回了意外的格式")
-        val joined = segments.mapNotNull { segment ->
-            (segment as? List<*>)?.firstOrNull() as? String
-        }.joinToString("")
-        if (joined.isBlank()) throw TranslationException("翻译服务没有返回译文")
-        return joined
+        return joinSegments(body)
     }
 
     private companion object {
@@ -202,6 +193,35 @@ class GoogleTranslateEngine : TranslateEngine {
 }
 
 /**
+ * Turns the per-segment response into the paragraph's translation.
+ *
+ * Split out of `GoogleTranslateEngine.single` so the shape that matters — what a
+ * malformed or truncated segment does — can be exercised without an HTTP call.
+ */
+internal fun joinSegments(body: String): String {
+    val parsed = runCatching { MiniJson.parse(body) }.getOrElse {
+        throw TranslationException("翻译服务返回了无法解析的内容", it)
+    }
+    val segments = (parsed as? List<*>)?.firstOrNull() as? List<*>
+        ?: throw TranslationException("翻译服务返回了意外的格式")
+    val joined = segments.joinToString("") { segment ->
+        when (val piece = (segment as? List<*>)?.firstOrNull()) {
+            is String -> piece
+            // A slot the service left empty contributes nothing; that is a normal shape
+            // in this response, not a malformed one.
+            null -> ""
+            // Anything else is a malformed segment. `mapNotNull` used to skip it, so a
+            // three-sentence paragraph that came back as one sentence was reported as a
+            // success — the interface promises a throw rather than a partial result, so
+            // the caller can move on to the next engine.
+            else -> throw TranslationException("翻译服务返回了意外的分段：$piece")
+        }
+    }
+    if (joined.isBlank()) throw TranslationException("翻译服务没有返回译文")
+    return joined
+}
+
+/**
  * Splits text into pieces no longer than [maxChars], preferring sentence ends.
  *
  * Needed by any engine with a per-request character cap: the pieces are translated
@@ -209,6 +229,11 @@ class GoogleTranslateEngine : TranslateEngine {
  * pause rather than mid-phrase.
  */
 internal fun splitForLimit(text: String, maxChars: Int): List<String> {
+    // `maxChars <= 0` has no cut to make: `lastIndexOf(' ', 0)` is -1, `cut` fell back to
+    // `maxChars` and the loop appended an empty piece without shrinking `rest` — it never
+    // terminated and grew `out` without bound. (`-1` threw from `substring` instead.) The
+    // only production caller passes 450, so this is API robustness.
+    if (maxChars <= 0) throw IllegalArgumentException("maxChars must be positive, was $maxChars")
     if (text.length <= maxChars) return listOf(text)
     val out = mutableListOf<String>()
     var buffer = StringBuilder()
