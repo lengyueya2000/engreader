@@ -664,13 +664,22 @@ class NeuralTts(private val context: Context) {
         val frames = output.bufferSizeInFrames
         if (frames <= 0) return
         // One buffer of silence goes in after the speech; once the playback head has
-        // crossed it, everything before it has been heard.
-        val target = output.playbackHeadPosition + frames
-        runCatching {
-            synchronized(trackLock) {
-                output.write(FloatArray(frames), 0, frames, AudioTrack.WRITE_BLOCKING)
-            }
+        // crossed it, everything before it has been heard. Written in chunks under
+        // [trackLock], so a stop arriving here waits for one chunk rather than for the
+        // whole buffer before it can silence the track.
+        val silence = FloatArray(frames)
+        var written = 0
+        while (written < frames) {
+            val count = minOf(CHUNK_SAMPLES, frames - written)
+            val accepted = runCatching {
+                synchronized(trackLock) {
+                    output.write(silence, written, count, AudioTrack.WRITE_BLOCKING)
+                }
+            }.getOrDefault(0)
+            if (accepted <= 0) break
+            written += accepted
         }
+        val target = output.playbackHeadPosition + frames
         val deadline = System.currentTimeMillis() + DRAIN_TIMEOUT_MS
         while (System.currentTimeMillis() < deadline) {
             if (output.playbackHeadPosition >= target) return

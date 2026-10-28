@@ -92,7 +92,11 @@ object UtteranceId {
         val mark = body.indexOf(SERIAL_MARK)
         val digits = if (mark >= 0) body.substring(0, mark) else body
         val index = digits.toIntOrNull() ?: return null
-        val serial = if (mark < 0) null else body.substring(mark + 1).toIntOrNull() ?: return null
+        val serial: Int? = if (mark < 0) {
+            null
+        } else {
+            body.substring(mark + 1).toIntOrNull() ?: return null
+        }
         val role = if (translation) SpeechRole.Translation else SpeechRole.Reading
         return SpokenUtterance(index, role, serial)
     }
