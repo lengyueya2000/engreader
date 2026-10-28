@@ -1,4 +1,4 @@
-plugins {
+﻿plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
@@ -10,8 +10,8 @@ import java.util.Properties
  * Release signing, read from `keystore.properties`.
  *
  * The file is git-ignored, so a fresh clone has none. Asking for a *release* artifact
- * without it used to exit 0 and leave `app-release-unsigned.apk` behind — an APK that
- * cannot be installed — which a release script would then publish. That is an error
+ * without it used to exit 0 and leave `app-release-unsigned.apk` behind 鈥?an APK that
+ * cannot be installed 鈥?which a release script would then publish. That is an error
  * now; `-Pengreader.allowUnsignedRelease=true` restores the old behaviour for the rare
  * case of wanting to inspect an unsigned release build.
  */
@@ -48,13 +48,13 @@ android {
         applicationId = "com.engreader.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 23
-        versionName = "1.7.4"
+        versionCode = 24
+        versionName = "2.0.0"
     }
 
     // One APK per ABI rather than one fat APK: the speech engine's native library is
     // ~25 MB per architecture, so a phone would otherwise download a copy it can
-    // never execute. armeabi-v7a and x86 are left out — the bundled voices are 77 MB
+    // never execute. armeabi-v7a and x86 are left out 鈥?the bundled voices are 77 MB
     // of assets on their own, and a 32-bit process has no room for a 19 MB graph
     // beside its runtime.
     splits {
@@ -82,7 +82,7 @@ android {
             // Shrinking stays off: turning it on changes every release APK, and the
             // bundled speech engine is reached through JNI by name. The keep rules it
             // would need are in proguard-rules.pro, written up front so that enabling
-            // this is a one-line change instead of a debugging session — the vendored
+            // this is a one-line change instead of a debugging session 鈥?the vendored
             // sherpa-onnx AAR carries an empty proguard.txt, so nothing else keeps them.
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
@@ -156,3 +156,4 @@ tasks.withType<Test>().configureEach {
         systemProperty("engreader.bookFixtures", it)
     }
 }
+
