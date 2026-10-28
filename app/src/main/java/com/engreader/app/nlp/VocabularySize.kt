@@ -91,23 +91,29 @@ object VocabularySize {
      * and the seeded jitter stops two tests with the same band size from asking the
      * same words — the seed is the test's start time, so a retest does not measure
      * memory of the previous one.
+     *
+     * A band barely wider than the sample (stride 1) has leftover words after the
+     * windows, and they used to be unreachable: with a stride of one there is no room
+     * for a jitter inside a window, so every seed produced the same offsets from the
+     * front and the tail of the band could never be asked. The leftover shifts every
+     * window instead, which slides the sample across the band.
      */
     fun offsets(seed: Long, band: VocabBand, available: Int, count: Int = PER_BAND): List<Int> {
         if (available <= 0 || count <= 0) return emptyList()
         val take = minOf(count, available)
         val rng = Random(seed * 1_000_003L + band.index)
         val stride = available / take
-        val out = LinkedHashSet<Int>()
-        for (i in 0 until take) {
-            val base = i * stride
+        val slack = available - take * stride
+        val shift = if (slack > 0) rng.nextInt(slack + 1) else 0
+        // The windows are disjoint and ordered by construction — window `i` ends at
+        // `(i + 1) * stride + shift - 1`, one before window `i + 1` starts — so the
+        // offsets are distinct and already sorted and the fill loop that used to sit
+        // here could not run.
+        return List(take) { i ->
+            val base = i * stride + shift
             val jitter = if (stride > 1) rng.nextInt(stride) else 0
-            out += (base + jitter).coerceIn(0, available - 1)
+            (base + jitter).coerceIn(0, available - 1)
         }
-        // Distinct can collapse a couple of offsets in a band barely wider than the
-        // sample; the missing ones are filled from the front rather than dropped.
-        var fill = 0
-        while (out.size < take) out += fill++
-        return out.sorted()
     }
 
     /**
@@ -139,10 +145,18 @@ object VocabularySize {
             // one, which is what the point estimate already assumes.
             val adjusted = (k + 2.0) / (n + 4.0)
             variance += band.width.toDouble() * band.width * adjusted * (1 - adjusted) / (n + 4.0)
-            // A band the reader aced is evidence they know most of it, so the interval
-            // never starts below what those bands alone account for — otherwise a reader
-            // who answered yes to all eight of the top 1,000 could be told they might
-            // know nothing at all.
+            // A band the reader aced sets a floor under the interval: without one, the
+            // uncertainty of the bands they failed could drag the whole lower bound to
+            // zero for a reader who plainly knows the top of the list.
+            //
+            // The floor is the *shrunk* share (`adjusted`: 0.833 for 8/8), deliberately
+            // below the 1,000 that an aced top band contributes to the estimate. Using
+            // the aced fraction instead would drive the lower bound up to the point
+            // estimate — `low = high = 50,000` for a reader who said yes to all 64 probes
+            // — and eight answers cannot make a band certain, which is the same reason
+            // the variance above uses pseudo-observations. (The review read this as the
+            // floor understating an aced band; the floor is a floor, not the band's own
+            // contribution, and this comment now says so.)
             if (k == n) certain += adjusted * band.width
         }
         val estimate = total.roundToInt()

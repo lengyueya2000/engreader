@@ -100,14 +100,12 @@ class VocabularyProfile(private val dictionary: Lexicon) {
      * The rate is a share of the passage's *content* lemmas, not of every word in
      * it — function words are excluded before the count — so the wording says
      * "生词" rather than claiming a share of the whole text.
+     *
+     * The bands live in [verdictFor], which [AdaptiveReader.fit] derives its own badge
+     * from, so the badge and this recommendation cannot disagree about one rate.
      */
-    fun verdict(rate: Float, unknownCount: Int): Verdict = when {
-        unknownCount == 0 -> Verdict.Comfortable
-        rate <= 0.02f -> Verdict.Comfortable
-        rate <= 0.05f -> Verdict.Suitable
-        rate <= 0.10f -> Verdict.Stretch
-        else -> Verdict.TooHard
-    }
+    fun verdict(rate: Float, unknownCount: Int): Verdict =
+        if (unknownCount == 0) Verdict.Comfortable else verdictFor(rate)
 
     enum class Verdict(val label: String, val detail: String) {
         Comfortable("轻松", "要学的词基本都认识，适合直接读，不用频繁查词。"),
@@ -142,10 +140,42 @@ class VocabularyProfile(private val dictionary: Lexicon) {
                     band = entry?.band ?: DifficultyBand.Unknown,
                 )
             }
-            .sortedWith(compareByDescending<NewWord> { it.band.ordinal }.thenByDescending { it.lemma.length })
+            .sortedWith(
+                compareByDescending<NewWord> {
+                    // `Unknown` means "no frequency data", not "rare", and it is the last
+                    // enum constant, so a word the corpus cannot place was listed above a
+                    // C2 one — the opposite of what this ordering is for. It sorts last.
+                    if (it.band == DifficultyBand.Unknown) -1 else it.band.ordinal
+                }.thenByDescending { it.lemma.length },
+            )
     }
 
     companion object {
+        /**
+         * The unknown-rate boundaries behind [Verdict], shared with the badge.
+         *
+         * They follow the extensive-reading convention rather than a statistical one:
+         * below roughly 2% new words a text can be read for flow without a dictionary,
+         * and past about 10% the reader spends more time looking words up than reading.
+         */
+        const val COMFORT_RATE_MAX = 0.02f
+        const val SUITABLE_RATE_MAX = 0.05f
+        const val STRETCH_RATE_MAX = 0.10f
+
+        /**
+         * The verdict for a measured unknown rate, with no special cases.
+         *
+         * Separate from [verdict] so [AdaptiveReader.fit] — which has no dictionary and
+         * no counts, only the rate — can derive its badge from one table. The two used
+         * to carry different boundaries (2–8% for the badge, 2/5/10% here), so a 6%
+         * article wore `i+1 · 刚好` while this said 生词偏多，建议先预习生词再读.
+         */
+        fun verdictFor(rate: Float): Verdict = when {
+            rate <= COMFORT_RATE_MAX -> Verdict.Comfortable
+            rate <= SUITABLE_RATE_MAX -> Verdict.Suitable
+            rate <= STRETCH_RATE_MAX -> Verdict.Stretch
+            else -> Verdict.TooHard
+        }
         /**
          * Fewest study-worthy lemmas a passage needs before its rate means anything.
          *

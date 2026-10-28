@@ -251,11 +251,19 @@ object ConnectedSpeech {
         for (i in 0 until tokens.size - 1) {
             val word = lower[i]
             val last = word.lastOrNull() ?: continue
-            if (last in VOWELS || last !in 'a'..'z') continue
+            // A word spelled `…re` ends in a silent `e`: the sound that can run into the
+            // next word is the `r` in front of it — `more apples`, `there is` — which is
+            // the linking-r case this rule exists for. Reading the last *character*
+            // treated that `e` as the coda and rejected the word before `r` was ever
+            // considered, so the r tip below was only ever produced for a spelling that
+            // ends in a bare `r` (`far away`), and the `word.endsWith("re")` half of the
+            // test was unreachable.
+            val coda = if (word.endsWith("re")) 'r' else last
+            if (coda in VOWELS || coda !in 'a'..'z') continue
             if (SILENT_FINALS.any { word.endsWith(it) }) continue
             val nextFirst = lower[i + 1].firstOrNull() ?: continue
             if (nextFirst !in VOWELS) continue
-            val isR = last == 'r' || word.endsWith("re")
+            val isR = coda == 'r'
             out += SpeechFeature(
                 kind = Kind.Linking,
                 written = sentence(tokens, i, 2),

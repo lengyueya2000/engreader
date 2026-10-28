@@ -39,7 +39,14 @@ class QuizBuilder(private val dictionary: Lexicon) {
         "two", "new", "said", "says", "like", "just", "now", "over", "after",
     )
 
+    /** Relative pronouns, hoisted so the per-token search below does not rebuild a set. */
+    private val RELATIVE_MARKERS = setOf("which", "who", "whom", "whose")
+
     fun build(articleText: String, maxQuestions: Int = 5): List<QuizQuestion> {
+        // A negative count is a caller bug, not a request for "as many as you have":
+        // `take(-1)` threw `IllegalArgumentException: Requested element count -1 is less
+        // than zero` out of a UI action. Nothing asked for is nothing to answer.
+        if (maxQuestions <= 0) return emptyList()
         val sentences = Sentences.split(articleText.replace("\n", " "))
         if (sentences.isEmpty()) return emptyList()
 
@@ -175,13 +182,20 @@ class QuizBuilder(private val dictionary: Lexicon) {
             .filter { it != answer.lowercase() }
             .take(12)
 
-        val pool = fromArticle.toMutableList()
-        if (pool.size < 3) {
+        val collected = LinkedHashSet<String>(fromArticle)
+        if (collected.size < 3) {
             val entry = dictionary.lookup(answer) ?: return null
             // English words, not glosses: the blank sits in an English sentence, so a
             // Chinese option is not a wrong answer but a giveaway.
-            pool += dictionary.englishDistractors(entry, pos, count = 3 - pool.size)
+            collected += dictionary.englishDistractors(entry, pos, count = 3 - collected.size)
         }
+        // Cleaned before the size test, not after: the dictionary list arrives without
+        // the answer filter and without de-duplication, while `picked` below is
+        // de-duplicated — a pool of three entries that were really one word could not
+        // reach three picks and the loop never terminated, which hung the quiz sheet.
+        val pool = collected
+            .filter { !it.equals(answer, ignoreCase = true) }
+            .distinctBy { it.lowercase() }
         if (pool.size < 3) return null
 
         // Deterministic pick and rotation: the same article always yields the same
@@ -253,7 +267,7 @@ class QuizBuilder(private val dictionary: Lexicon) {
             if (out.size >= limit) break
             val words = Tokenizer.words(sentence.text)
             val lower = words.map { it.lowercase() }
-            val markerIndex = lower.indexOfFirst { it in setOf("which", "who", "whom", "whose") }
+            val markerIndex = lower.indexOfFirst { it in RELATIVE_MARKERS }
             if (markerIndex <= 1) continue
 
             val antecedent = words.take(markerIndex)

@@ -40,9 +40,15 @@ class VocabularyGrader(private val dictionary: Lexicon) {
         }
         // Ungraded tokens are proper nouns and coinages; ignoring them avoids
         // inflating the ratio on a text full of names.
-        if (graded < 10) return Result(3, 0f, graded)
+        //
+        // The ratio is the one that was measured even below the grade floor: the old
+        // `0f` here reported "0% of these words are B2 or above" for a text that was
+        // 9/9 advanced, and a caller could not tell that wrong measurement from "no
+        // reliable sample" — `gradedWords` was the only tell. The grade still stays at
+        // 3, because nine lemmas cannot set a level.
+        val ratio = if (graded == 0) 0f else advanced.toFloat() / graded
+        if (graded < 10) return Result(3, ratio, graded)
 
-        val ratio = advanced.toFloat() / graded
         val grade = when {
             ratio < 0.04f -> 1
             ratio < 0.09f -> 2

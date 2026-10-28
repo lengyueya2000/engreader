@@ -14,6 +14,15 @@ object Cloze {
     const val BLANK = "______"
 
     /**
+     * What counts as part of a longer word, shared with [Tokenizer].
+     *
+     * The previous ASCII-only class let an accented letter through, so `cole` matched
+     * inside `École` and blanking it taught the spelling `É______` — the exact failure
+     * this object exists to prevent.
+     */
+    private val BOUNDARY = Tokenizer.BOUNDARY_CLASS
+
+    /**
      * Blanks the [occurrence]-th whole-word match of [word] in [sentence].
      *
      * Matching is case-insensitive and anchored to word boundaries, so blanking
@@ -23,7 +32,7 @@ object Cloze {
     fun blank(sentence: String, word: String, occurrence: Int = 0): String {
         if (sentence.isBlank() || word.isBlank()) return sentence
         val matches = Regex(
-            "(?<![A-Za-z'\\u2019-])" + Regex.escape(word) + "(?![A-Za-z'\\u2019-])",
+            "(?<!$BOUNDARY)" + Regex.escape(word) + "(?!$BOUNDARY)",
             RegexOption.IGNORE_CASE,
         ).findAll(sentence).toList()
         val match = matches.getOrNull(occurrence.coerceAtLeast(0)) ?: return sentence

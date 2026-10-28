@@ -175,17 +175,28 @@ object Sentences {
     }
 
     /**
-     * True when the word before the one-letter word ending at [terminator] is
-     * capitalised, or the one-letter word opens the sentence.
+     * True when the one-letter word ending at [terminator] opens its sentence, which
+     * is what makes it an initial or a list label rather than a sentence's last word.
      *
-     * An initial is preceded by a first name or a title ("J. Smith", "Dr. J. Smith").
-     * A one-letter word ending a sentence ("The grade is A.") is preceded by an
-     * ordinary lowercase word, which is the case this separates out.
+     * `J. Smith` and `I. Introduction` open their sentences, and `A.`/`B.` after
+     * another sentence's full stop is a label too, so in all of those the dot does not
+     * end anything. The `A.` of `The grade is A. She was pleased.` has an ordinary word
+     * in front of it, so its dot really does end the sentence.
+     *
+     * The previous version only recognised the paragraph-initial case (`i < 0`), so the
+     * same `B.` split off as a one-word sentence of its own whenever a sentence happened
+     * to end before it: `A. That is it. B. This too.` came back as three sentences, with
+     * `B.` alone and `A.` still joined to its text.
      */
     private fun followsCapital(s: String, terminator: Int): Boolean {
         var i = terminator - 2
-        while (i >= 0 && (s[i].isWhitespace() || s[i] == '.')) i--
+        while (i >= 0 && s[i].isWhitespace()) i--
         if (i < 0) return true
+        // A terminator immediately before the letter — including the dot of a previous
+        // initial (`Dr. J. Smith`) — means the letter opens what follows.
+        if (s[i] == '.' || s[i] == '!' || s[i] == '?' || s[i] == '\u2026' ||
+            s[i] == ';' || s[i] == ':'
+        ) return true
         val end = i + 1
         while (i >= 0 && (s[i].isLetter() || s[i] == '\'' || s[i] == '\u2019' || s[i] == '-')) i--
         val before = s.substring(i + 1, end)

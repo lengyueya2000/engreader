@@ -49,12 +49,6 @@ object AdaptiveReader {
      */
     const val COMFORT_RATE = 0.05
 
-    /** Under this there is almost nothing left to learn from the text. */
-    const val EASY_BELOW = 0.02
-
-    /** Over this the reader spends more time looking words up than reading. */
-    const val HARD_ABOVE = 0.08
-
     /**
      * Below this many study-worthy lemmas a rate is noise.
      *
@@ -64,10 +58,21 @@ object AdaptiveReader {
      */
     const val MIN_LEMMAS = VocabularyProfile.MIN_PROFILED_LEMMAS
 
-    fun fit(rate: Double): Fit = when {
-        rate < EASY_BELOW -> Fit.Easy
-        rate <= HARD_ABOVE -> Fit.Comfort
-        else -> Fit.Hard
+    /**
+     * Which side of the comfort zone a rate falls on, from the same table the reader's
+     * recommendation uses.
+     *
+     * The badge and [VocabularyProfile.verdict] describe one rate, so they cannot be
+     * allowed different boundaries: a 6% article used to wear `i+1 · 刚好` while the
+     * sheet underneath it said 生词偏多，建议先预习生词再读 — the badge had a 2–8% window
+     * of its own. The verdict's convention gives the badge three bands rather than four,
+     * so its `Stretch` and `TooHard` both read as [Fit.Hard], "the closest approach to
+     * i+1" — which is what the picker already chose it for.
+     */
+    fun fit(rate: Double): Fit = when (VocabularyProfile.verdictFor(rate.toFloat())) {
+        VocabularyProfile.Verdict.Comfortable -> Fit.Easy
+        VocabularyProfile.Verdict.Suitable -> Fit.Comfort
+        VocabularyProfile.Verdict.Stretch, VocabularyProfile.Verdict.TooHard -> Fit.Hard
     }
 
     /**
@@ -110,12 +115,21 @@ object AdaptiveReader {
      * hard case is a claim about that choice, and would be wrong on any other article.
      */
     fun reason(ready: Readiness): String {
+        // `pick()` never returns a rate below [MIN_LEMMAS] lemmas, but the reader and the
+        // home card can hold a `Readiness` for a shorter text: `rate` is 0.0 when nothing
+        // was profiled, `fit(0.0)` is [Fit.Easy], and the card then told the reader "生词
+        // 只有 0 个，这篇读起来很轻松" about a text the profiler never measured.
+        if (ready.total < MIN_LEMMAS) {
+            return "这篇文章只挑出 ${ready.total} 个必学词，样本太少，生词率还不能说明难度。"
+        }
         val percent = (ready.rate * 100).roundToInt()
         return when (fit(ready.rate)) {
             Fit.Easy ->
                 "生词只有 ${ready.unknown} 个（约 $percent%），这篇读起来很轻松，适合先热身。"
             Fit.Comfort ->
-                "生词 ${ready.unknown} 个（约 $percent%），${100 - percent}% 的词你已经认识，" +
+                // "必学词" rather than "词": the rate is over study-worthy lemmas, and the
+                // old wording claimed a share of the whole running text.
+                "生词 ${ready.unknown} 个（约 $percent%），约 ${100 - percent}% 的必学词你已经认识，" +
                     "正好是「i+1」的难度。"
             Fit.Hard ->
                 "生词 ${ready.unknown} 个（约 $percent%），是当前列表里离你水平最近的一篇；" +

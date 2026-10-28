@@ -1,6 +1,7 @@
 package com.engreader.app.nlp
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -73,14 +74,48 @@ class AdaptiveReaderTest {
         assertNull(AdaptiveReader.pick(listOf(ready(1, unknown = 1, total = 10))))
     }
 
+    /**
+     * The badge's bands, which are now [VocabularyProfile.verdictFor]'s.
+     *
+     * **Behaviour intentionally changed.** The badge used to carry a 2–8% window of its
+     * own, so a 6%-unknown article wore `i+1 · 刚好` while the reader's own sheet, built
+     * from the same rate, said 生词偏多，建议先预习生词再读. The boundaries are the verdict's
+     * 2% / 5% / 10%, so `fit(0.02)` is now Easy (was Comfort) and `fit(0.08)` is now
+     * Hard (was Comfort) — see [AdaptiveReader.fit] for why the window narrowed.
+     */
     @Test
-    fun `the comfort window is two to eight per cent`() {
+    fun `the badge uses the reader's verdict bands`() {
         assertEquals(Fit.Easy, AdaptiveReader.fit(0.0))
         assertEquals(Fit.Easy, AdaptiveReader.fit(0.019))
-        assertEquals(Fit.Comfort, AdaptiveReader.fit(0.02))
+        assertEquals(Fit.Easy, AdaptiveReader.fit(0.02))
+        assertEquals(Fit.Comfort, AdaptiveReader.fit(0.021))
         assertEquals(Fit.Comfort, AdaptiveReader.fit(0.05))
-        assertEquals(Fit.Comfort, AdaptiveReader.fit(0.08))
+        assertEquals(Fit.Hard, AdaptiveReader.fit(0.051))
+        assertEquals(Fit.Hard, AdaptiveReader.fit(0.08))
         assertEquals(Fit.Hard, AdaptiveReader.fit(0.081))
+        assertEquals(Fit.Hard, AdaptiveReader.fit(0.5))
+    }
+
+    /**
+     * The invariant the two used to break: nothing the verdict calls a stretch or too
+     * hard may wear an "i+1" chip, and everything it calls comfortable is the easy band.
+     */
+    @Test
+    fun `no rate can be challenging to the verdict and comfortable to the badge`() {
+        var rate = 0.0
+        while (rate <= 0.25) {
+            val verdict = VocabularyProfile.verdictFor(rate.toFloat())
+            when (verdict) {
+                VocabularyProfile.Verdict.Comfortable ->
+                    assertEquals("$rate is $verdict", Fit.Easy, AdaptiveReader.fit(rate))
+                VocabularyProfile.Verdict.Suitable ->
+                    assertEquals("$rate is $verdict", Fit.Comfort, AdaptiveReader.fit(rate))
+                VocabularyProfile.Verdict.Stretch,
+                VocabularyProfile.Verdict.TooHard ->
+                    assertEquals("$rate is $verdict", Fit.Hard, AdaptiveReader.fit(rate))
+            }
+            rate += 0.001
+        }
     }
 
     @Test
@@ -88,6 +123,8 @@ class AdaptiveReaderTest {
         val comfortable = AdaptiveReader.reason(ready(1, unknown = 10))
         assertTrue(comfortable, comfortable.contains("10"))
         assertTrue(comfortable, comfortable.contains("i+1"))
+        // A share of the study-worthy lemmas, not of the running text.
+        assertTrue(comfortable, comfortable.contains("必学词"))
 
         val easy = AdaptiveReader.reason(ready(1, unknown = 1))
         assertTrue(easy, easy.contains("轻松"))
@@ -95,6 +132,20 @@ class AdaptiveReaderTest {
         val hard = AdaptiveReader.reason(ready(1, unknown = 40))
         assertTrue(hard, hard.contains("40"))
         assertTrue(hard, hard.contains("最近"))
+    }
+
+    /**
+     * A text the profiler skipped has no rate at all, and `fit(0.0)` is the easy band —
+     * so the card used to read "生词只有 0 个…这篇读起来很轻松" about an unmeasured text.
+     */
+    @Test
+    fun `a text too short to profile is reported as unmeasured`() {
+        val short = AdaptiveReader.reason(Readiness(id = 7, unknown = 0, total = 0))
+        assertFalse(short, short.contains("轻松"))
+        assertFalse(short, short.contains("i+1"))
+
+        val nearly = AdaptiveReader.reason(Readiness(id = 8, unknown = 1, total = 5))
+        assertFalse(nearly, nearly.contains("轻松"))
     }
 
     /** The best on offer is not an i+1, and the chip must not say it is. */
