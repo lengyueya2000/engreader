@@ -106,7 +106,10 @@ object EpubParser {
      * hundred kilobytes of highly repetitive deflate streams become gigabytes, and
      * the `OutOfMemoryError` that follows is an `Error`, so it escapes the import
      * path's `catch (Exception)` and takes the app down instead of reporting a bad
-     * file. Real books are far below this.
+     * file. Real books are far below this. Each entry is capped as well, because the
+     * total alone left the first entry free to be as large as the whole budget, and
+     * an image that overflows the per-entry cap is dropped rather than refused: a
+     * scans-heavy EPUB is still worth its text, and the reader only shows the cover.
      */
     private fun readEntries(bytes: ByteArray): Map<String, ByteArray> {
         val out = HashMap<String, ByteArray>()
@@ -116,11 +119,25 @@ object EpubParser {
                 val entry = zip.nextEntry ?: break
                 if (entry.isDirectory) continue
                 val name = entry.name.replace('\\', '/')
+                val remaining = MAX_UNPACKED_BYTES - total
+                if (remaining <= 0) {
+                    throw BookFormat.Companion.Unsupported("这个 EPUB 解压后过大，可能不是电子书")
+                }
+                val image = name.substringAfterLast('.', "").lowercase() in IMAGE_EXTENSIONS
+                val limit = minOf(if (image) MAX_IMAGE_BYTES else MAX_ENTRY_BYTES, remaining)
                 // Read through the cap rather than with `readBytes()`: the whole point
-                // is to stop before the allocation happens, and a single entry is
-                // enough to exhaust the heap on its own.
-                val content = zip.readCapped(MAX_UNPACKED_BYTES - total)
-                    ?: throw BookFormat.Companion.Unsupported("这个 EPUB 解压后过大，可能不是电子书")
+                // is to stop before the allocation happens, and a single entry used to
+                // be enough to exhaust the heap on its own.
+                val content = zip.readCapped(limit, entry.size)
+                if (content == null) {
+                    if (!image) {
+                        throw BookFormat.Companion.Unsupported("这个 EPUB 里有一个条目过大，可能不是电子书")
+                    }
+                    // Still charged against the archive's budget: a bomb of oversized
+                    // images would otherwise be decompressed for as long as it wanted.
+                    total += limit
+                    continue
+                }
                 total += content.size
                 out[name] = content
             }
@@ -128,17 +145,33 @@ object EpubParser {
         return out
     }
 
-    /** The entry's bytes, or null once [limit] is passed. */
-    private fun ZipInputStream.readCapped(limit: Int): ByteArray? {
-        val buffer = java.io.ByteArrayOutputStream()
+    /**
+     * The entry's bytes, or null once [limit] is passed.
+     *
+     * A growable array rather than a `ByteArrayOutputStream`: `toByteArray()` holds the
+     * stream's buffer and its own full copy at the same time, so one large entry needed
+     * over twice its size at once — a single 250 MB entry measured 511 MB of a 512 MB
+     * heap although the archive's own ceiling was 256 MB. [declared] is the entry's
+     * size field, which sizes the array up front when the generator wrote one.
+     */
+    private fun ZipInputStream.readCapped(limit: Int, declared: Long): ByteArray? {
+        var out = ByteArray(if (declared in 1..limit.toLong()) declared.toInt() else minOf(limit, INITIAL_ENTRY_BYTES))
+        var length = 0
         val chunk = ByteArray(16 * 1024)
         while (true) {
             val read = read(chunk)
             if (read < 0) break
-            if (buffer.size() + read > limit) return null
-            buffer.write(chunk, 0, read)
+            if (length + read > limit) return null
+            val needed = length + read
+            if (needed > out.size) {
+                var grown = out.size.toLong() * 2
+                if (grown < needed) grown = needed.toLong()
+                out = out.copyOf(minOf(grown, limit.toLong()).toInt())
+            }
+            System.arraycopy(chunk, 0, out, length, read)
+            length = needed
         }
-        return buffer.toByteArray()
+        return if (length == out.size) out else out.copyOf(length)
     }
 
     /** `META-INF/container.xml` → the OPF's path inside the archive. */
@@ -174,6 +207,17 @@ object EpubParser {
             bytes[1] == 0xBB.toByte() && bytes[2] == 0xBF.toByte()
         ) {
             return String(bytes, 3, bytes.size - 3, Charsets.UTF_8)
+        }
+        // UTF-16 is legal in XHTML 1.1, and its declaration cannot be read from the
+        // Latin-1 preview below because every character is interleaved with a NUL
+        // (`<\0?\0x\0m\0l\0`), so the BOM is the only thing that can decide. Without
+        // this the bytes decoded as UTF-8, the markup became text full of U+FFFD and
+        // NUL, and the chapter imported as unreadable gibberish.
+        if (bytes.size >= 2 && bytes[0] == 0xFF.toByte() && bytes[1] == 0xFE.toByte()) {
+            return String(bytes, 2, bytes.size - 2, Charsets.UTF_16LE)
+        }
+        if (bytes.size >= 2 && bytes[0] == 0xFE.toByte() && bytes[1] == 0xFF.toByte()) {
+            return String(bytes, 2, bytes.size - 2, Charsets.UTF_16BE)
         }
         val head = String(bytes, 0, minOf(bytes.size, 200), Charsets.ISO_8859_1)
         val declared = Regex("encoding\\s*=\\s*[\"']([A-Za-z0-9._-]+)[\"']")
@@ -277,6 +321,18 @@ object EpubParser {
     }
 
     /**
+     * Navigation patterns, compiled once.
+     *
+     * These were built inside the loops that used them, so a book with a thousand
+     * navPoints compiled a thousand pairs of `Regex` objects to read one index file.
+     */
+    private val NAV_POINT_TAG = Regex("(?is)</?navPoint\\b[^>]*>")
+    private val NAV_LABEL = Regex("(?is)<navLabel\\b.*?</navLabel>")
+    private val CONTENT_TAG = Regex("(?is)<content\\b[^>]*>")
+    private val NAV_LINK = Regex("(?is)<a\\b[^>]*>")
+    private val NAV_OPEN = Regex("(?is)<nav\\b[^>]*>")
+
+    /**
      * Every navPoint, including the ones nested inside another.
      *
      * A lazy `<navPoint>.*?</navPoint>` stops at the *first* closing tag, so for a
@@ -289,17 +345,24 @@ object EpubParser {
         val dir = ncxPath.substringBeforeLast('/', "")
         val out = mutableListOf<NavPoint>()
         val open = ArrayDeque<Int>()
-        for (tag in Regex("(?is)</?navPoint\\b[^>]*>").findAll(xml)) {
+        for (tag in NAV_POINT_TAG.findAll(xml)) {
             if (tag.value.startsWith("</")) {
                 val start = open.removeLastOrNull() ?: continue
-                val body = xml.substring(start, tag.range.first)
-                val label = Regex("(?is)<navLabel\\b.*?</navLabel>").find(body)?.value
+                // Searched within the navPoint's own span rather than in a copy of it:
+                // a crafted NCX nests its points so that one span reaches the end of the
+                // document, and `substring` copied every one of those spans.
+                val end = tag.range.first
+                val label = NAV_LABEL.findTextBetween(xml, start, end)
                     ?.let { elementText(it, "text") }
                     ?: continue
-                val src = Regex("(?is)<content\\b[^>]*>").find(body)
-                    ?.let { attr(it.value, "src") }
+                val src = CONTENT_TAG.findTextBetween(xml, start, end)
+                    ?.let { attr(it, "src") }
                     ?: continue
                 out += toNavPoint(src, label, dir)
+                // A reference book's NCX can hold thousands of points, and each one
+                // becomes a chapter, so the list stops at the same cap the heading
+                // split uses.
+                if (out.size >= MAX_CHAPTERS) break
             } else {
                 open.addLast(tag.range.last + 1)
             }
@@ -315,14 +378,14 @@ object EpubParser {
         // it for `<a>` found nothing, so every EPUB 3 nav document parsed as empty and
         // the book fell through to NCX or to heading detection.
         val nav = tocNavBody(html) ?: html
-        return Regex("(?is)<a\\b[^>]*>").findAll(nav).mapNotNull { tag ->
+        return NAV_LINK.findAll(nav).mapNotNull { tag ->
             val href = attr(tag.value, "href") ?: return@mapNotNull null
             val end = nav.indexOf("</a>", tag.range.last)
             if (end < 0) return@mapNotNull null
             val label = BookText.fromHtml(nav.substring(tag.range.last + 1, end))
                 .replace("\n", " ").trim()
             if (label.isEmpty()) null else toNavPoint(href, label, dir)
-        }.toList()
+        }.take(MAX_CHAPTERS).toList()
     }
 
     /**
@@ -336,7 +399,7 @@ object EpubParser {
     private fun tocNavBody(html: String): String? {
         var at = 0
         while (true) {
-            val open = Regex("(?is)<nav\\b[^>]*>").find(html, at) ?: return null
+            val open = NAV_OPEN.find(html, at) ?: return null
             val close = html.indexOf("</nav", open.range.last + 1)
             if (close < 0) return null
             val type = attr(open.value, "epub:type") ?: attr(open.value, "type")
@@ -363,9 +426,16 @@ object EpubParser {
         val byPath = nav.groupBy { it.path }
         val out = mutableListOf<Chapter>()
         for (section in sections) {
+            // Built once per section, and only when a target in it carries an anchor:
+            // looking each anchor up with its own regex re-scanned the whole section per
+            // target, and a crafted NCX can name thousands of targets in one file.
+            var offsets: Map<String, Int>? = null
             val targets = byPath[section.path].orEmpty()
                 .mapNotNull { point ->
-                    val at = if (point.anchor.isEmpty()) 0 else anchorOffset(section.html, point.anchor)
+                    val at = if (point.anchor.isEmpty()) 0 else {
+                        val index = offsets ?: elementOffsets(section.html).also { offsets = it }
+                        index[point.anchor]
+                    }
                     if (at == null) null else point to at
                 }
                 .sortedBy { it.second }
@@ -391,35 +461,48 @@ object EpubParser {
     }
 
     /**
-     * Offset of the element carrying `id="anchor"` (or `name="anchor"`), or null.
+     * Every `id`/`name` in [html], mapped to the offset of its element's opening `<`.
      *
-     * The returned offset is the element's opening `<`, not the attribute: a chapter
-     * that began mid-tag would keep the tag's tail (`id="pre">`) as its first line of
-     * text, which then shows up in the reader as junk before the heading.
+     * The offset is the element's opening `<`, not the attribute: a chapter that began
+     * mid-tag would keep the tag's tail (`id="pre">`) as its first line of text, which
+     * then shows up in the reader as junk before the heading.
      */
-    private fun anchorOffset(html: String, anchor: String): Int? {
-        val escaped = Regex.escape(anchor)
-        val match = Regex("(?is)\\b(?:id|name)\\s*=\\s*[\"']" + escaped + "[\"']").find(html)
-            ?: return null
-        val open = html.lastIndexOf('<', match.range.first)
-        return if (open < 0) match.range.first else open
+    private fun elementOffsets(html: String): Map<String, Int> {
+        val out = HashMap<String, Int>()
+        for (match in ELEMENT_ANCHOR.findAll(html)) {
+            val open = html.lastIndexOf('<', match.range.first)
+            out.putIfAbsent(match.groupValues[1], if (open < 0) match.range.first else open)
+        }
+        return out
     }
+
+    private val ELEMENT_ANCHOR = Regex("(?is)\\b(?:id|name)\\s*=\\s*[\"']([^\"']+)[\"']")
 
     /**
      * Fallback split for a section with no navigation entry: one chapter per
      * top-level heading, or the whole section when it has none.
      */
     private fun splitByHeadings(section: Section): List<Chapter> {
-        val headings = Regex("(?is)<h([12])\\b[^>]*>").findAll(section.html).map { it.range.first }.toList()
+        // Bounded, and stopped early: every heading becomes a `fromHtml` pass and a
+        // `Chapter` before the forty-word filter runs, so an uncapped split of a crafted
+        // section multiplies the input many times over. The last slice runs to the end
+        // of the section, so the tail is kept rather than dropped.
+        val headings = ArrayList<Int>()
+        for (match in HEADING.findAll(section.html)) {
+            if (headings.size > MAX_CHAPTERS) break
+            headings.add(match.range.first)
+        }
         if (headings.isEmpty()) return listOf(headingChapter(section, 0, section.html.length))
         val out = mutableListOf<Chapter>()
         if (headings.first() > 0) out += headingChapter(section, 0, headings.first())
         headings.forEachIndexed { index, at ->
-            val end = headings.getOrNull(index + 1) ?: section.html.length
+            val end = if (index == headings.lastIndex) section.html.length else headings[index + 1]
             out += headingChapter(section, at, end)
         }
         return out
     }
+
+    private val HEADING = Regex("(?is)<h([12])\\b[^>]*>")
 
     private fun headingChapter(
         section: Section,
@@ -528,9 +611,17 @@ object EpubParser {
         while (i < value.length) {
             val c = value[i]
             if (c == '%' && i + 2 < value.length) {
-                val code = value.substring(i + 1, i + 3).toIntOrNull(16)
-                if (code != null) {
-                    bytes.write(code)
+                // Only two hex digits are an escape: `toIntOrNull(16)` also accepts a
+                // leading sign, so `%+1` decoded to byte 0x01 and `%-1` to 0xFF, and a
+                // href carrying one resolved to a different, unprintable name instead
+                // of failing the lookup.
+                val digits = value.substring(i + 1, i + 3)
+                // `Character.digit` answers -1 for anything that is not a hex digit,
+                // which is what rules out the sign `toIntOrNull(16)` happily accepted.
+                val high = Character.digit(digits[0], 16)
+                val low = Character.digit(digits[1], 16)
+                if (high >= 0 && low >= 0) {
+                    bytes.write(high shl 4 or low)
                     i += 3
                     continue
                 }
@@ -567,6 +658,25 @@ object EpubParser {
         Regex("(?is)(?<![\\w:.-])$name\\s*=\\s*(\"([^\"]*)\"|'([^']*)')")
     }
 
+    /**
+     * The text of this pattern's first match between [from] and [to], or null.
+     *
+     * `find(input, from)` searches to the end of the document, so using it to look
+     * inside one element re-scanned everything after that element once per call. The
+     * matcher's region is what bounds it, and it is what keeps a document with many
+     * elements linear overall. The matched text is returned rather than a `MatchResult`
+     * because that is all either caller needs.
+     */
+    private fun Regex.findTextBetween(input: String, from: Int, to: Int): String? {
+        val end = to.coerceIn(0, input.length)
+        val start = from.coerceIn(0, end)
+        // A `Matcher` limited to the region: the pattern cannot see past [to], which is
+        // what makes this equivalent to matching a copy of the span without building one.
+        val matcher = toPattern().matcher(input)
+        matcher.region(start, end)
+        return if (matcher.find()) matcher.group() else null
+    }
+
     private val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "gif", "webp")
 
     /**
@@ -574,9 +684,39 @@ object EpubParser {
      *
      * A real book is a few megabytes. This is high enough that no genuine EPUB is
      * refused and low enough that a zip bomb is reported as an unsupported file
-     * instead of exhausting the heap.
+     * instead of exhausting the heap: the unpacked bytes live on beside the parsed
+     * text, and one measured entry cost 2.1-2.6× its own size in live heap, so 64 MB
+     * here is already ~160 MB before a chapter is extracted.
      */
-    private const val MAX_UNPACKED_BYTES = 256 * 1024 * 1024
+    private const val MAX_UNPACKED_BYTES = 64 * 1024 * 1024
+
+    /**
+     * Cap on a single entry, whatever the total has left.
+     *
+     * Without it the first entry could claim the whole 64 MB, and it was the entry
+     * that ran out of heap first.
+     */
+    private const val MAX_ENTRY_BYTES = 8 * 1024 * 1024
+
+    /**
+     * Cap on a single image entry. Past this the image is dropped, not the book.
+     *
+     * A page scan can be tens of megabytes and the reader never shows anything but the
+     * cover, so refusing the whole import over one of them would lose the text too.
+     */
+    private const val MAX_IMAGE_BYTES = 4 * 1024 * 1024
+
+    /** Starting size of an entry buffer whose declared size is unknown. */
+    private const val INITIAL_ENTRY_BYTES = 256 * 1024
+
+    /**
+     * Most chapters one section may be cut into.
+     *
+     * The heading and navigation splits are both fan-out points: each heading becomes a
+     * slice, a `fromHtml` pass and a `Chapter` object before the forty-word filter runs,
+     * so an uncapped split is worth tens of megabytes of heap per megabyte of input.
+     */
+    private const val MAX_CHAPTERS = 4_000
 
     /**
      * Fewest words a chapter needs to be worth listing.

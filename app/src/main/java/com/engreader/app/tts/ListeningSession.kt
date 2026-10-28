@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Which sleep timer the listener picked.
@@ -117,12 +118,36 @@ class ListeningSession(private val container: AppContainer) {
     private val _state = MutableStateFlow(State())
     val state: StateFlow<State> = _state.asStateFlow()
 
-    private var queue: List<Spoken> = emptyList()
+    /**
+     * The sentences being read, in order.
+     *
+     * Written from the main thread ([start]/[stop]) and from `Dispatchers.Default` (the
+     * load continuation, and [endOfPiece]'s advance), and read from both; `@Volatile` is
+     * what makes the hand-off visible. The reference is only ever replaced wholesale,
+     * never mutated, and [speakAt] reads it once so the membership test and the element
+     * come from the same list.
+     */
+    @Volatile private var queue: List<Spoken> = emptyList()
     private var collectJob: Job? = null
     private var timerJob: Job? = null
     private var loadJob: Job? = null
     private var advanceJob: Job? = null
-    private var lastIndex = -1
+
+    /** The sentence being read, or -1 between a pause and the next [speakAt]. */
+    @Volatile private var lastIndex = -1
+
+    /**
+     * The id of the request the queue is waiting on, or null when it is waiting on
+     * nothing.
+     *
+     * Every request gets an id of its own — see [issue] — and only that id ends the
+     * sentence. Comparing the sentence index instead is what made a superseded request's
+     * completion advance the queue.
+     */
+    @Volatile private var issuedUtteranceId: String? = null
+
+    /** Serial for the next request; two requests for one sentence are two ids. */
+    private val requestSerial = AtomicInteger(0)
 
     /**
      * Bumped by every [open] and [stop].
@@ -134,8 +159,14 @@ class ListeningSession(private val container: AppContainer) {
      * was still loading ended with A's sentences being spoken under B's title, and
      * stopping while a chapter lookup was in flight started the next chapter of a
      * session the listener had already dismissed.
+     *
+     * Atomic because both [start]/[toggle] (main) and [endOfPiece]'s advance
+     * (`Dispatchers.Default`) reach [open]: `++` is a read and a write, so two concurrent
+     * opens used to capture the *same* generation, after which every guard below passed
+     * for both of them — the guard this class leans on could be defeated by exactly the
+     * interaction it was written for.
      */
-    private var sessionGeneration = 0
+    private val sessionGeneration = AtomicInteger(0)
 
     /**
      * Where a pause left off, so resuming continues instead of restarting.
@@ -143,10 +174,10 @@ class ListeningSession(private val container: AppContainer) {
      * Reset by every path that ends the session outright — unlike [lastIndex], which is
      * cleared by a pause as well.
      */
-    private var pausedIndex = -1
+    @Volatile private var pausedIndex = -1
 
     /** Set while the end of a piece is being handled, so a second event cannot repeat it. */
-    private var ending = false
+    @Volatile private var ending = false
 
     /**
      * True between asking for a piece and its first sentence actually being handed over.
@@ -158,13 +189,19 @@ class ListeningSession(private val container: AppContainer) {
      * opened at: tapping twice threw the listener back to the top of the article. A pause
      * arriving in the same window is honoured by clearing the flag, so the pending start
      * does not play on after the listener asked for quiet.
+     *
+     * `@Volatile`, like the other flags here, because [open] sets it on one thread and the
+     * load continuation reads it on another — with no volatile, no lock and (when the
+     * voice is already `Ready`) no suspension between the two, there is nothing ordering
+     * the write before the read, so a pause could be missed and the first sentence would
+     * play into the quiet.
      */
-    private var starting = false
+    @Volatile private var starting = false
 
     /** The sentence [starting] is heading for, so a pause in that window resumes there. */
-    private var startIndex = 0
+    @Volatile private var startIndex = 0
 
-    private var startedAt = 0L
+    @Volatile private var startedAt = 0L
 
     init {
         // Installed once for the life of the app rather than by whichever screen is on
@@ -214,6 +251,12 @@ class ListeningSession(private val container: AppContainer) {
     fun pause() {
         if (!_state.value.active) return
         val at = lastIndex
+        // Cleared before the voice is stopped, and before anything else can look at it.
+        // A request abandoned by this pause reports its own id, and the queue treats a
+        // report for the id it is waiting on as a request to play that sentence again —
+        // which is the right answer to a voice change and the wrong one to the reader
+        // pressing pause.
+        issuedUtteranceId = null
         container.speaker.stop()
         lastIndex = -1
         // A pause before the first sentence is a pause on the start itself. Nothing has
@@ -255,9 +298,10 @@ class ListeningSession(private val container: AppContainer) {
 
     fun stop() {
         val current = _state.value
-        sessionGeneration++
+        sessionGeneration.incrementAndGet()
         starting = false
         cancelJobs()
+        issuedUtteranceId = null
         container.speaker.stop()
         lastIndex = -1
         pausedIndex = -1
@@ -314,13 +358,14 @@ class ListeningSession(private val container: AppContainer) {
         // the time spent on the piece being left would be dropped.
         if (_state.value.active && _state.value.articleId != articleId) writeProgress(_state.value)
         cancelJobs()
+        issuedUtteranceId = null
         container.speaker.stop()
         lastIndex = -1
         pausedIndex = -1
         ending = false
         startedAt = 0L
         queue = emptyList()
-        val generation = ++sessionGeneration
+        val generation = sessionGeneration.incrementAndGet()
         starting = true
         startIndex = fromIndex
         // The voice is asked for before the body is read, so the model loads while the
@@ -345,19 +390,19 @@ class ListeningSession(private val container: AppContainer) {
         }
         loadJob = container.appScope.launch {
             if (!load(articleId, generation)) {
-                if (generation != sessionGeneration) return@launch
+                if (generation != sessionGeneration.get()) return@launch
                 _state.update { it.copy(active = false, loading = false, error = "这篇内容读不出来") }
                 return@launch
             }
             // The session was replaced or stopped while the body was being read.
-            if (generation != sessionGeneration) return@launch
+            if (generation != sessionGeneration.get()) return@launch
             // The voice is still loading its model when the body is already split, and
             // `Speaker.speak` before it is Ready reports the utterance as failed rather
             // than queueing it. Waiting here is what makes the first sentence audible
             // when listening is started from a screen that never prepared the voice —
             // the book shelf's chapter row is the one that does that.
             awaitVoice()
-            if (generation != sessionGeneration) return@launch
+            if (generation != sessionGeneration.get()) return@launch
             // Paused while the voice was still loading. The piece is loaded and ready,
             // but the listener asked for quiet after asking to listen, and the answer is
             // the later of the two.
@@ -374,7 +419,7 @@ class ListeningSession(private val container: AppContainer) {
             val subscribed = CompletableDeferred<Unit>()
             collectJob = container.appScope.launch { observeEvents(subscribed) }
             withTimeoutOrNull(SUBSCRIBE_WAIT_MS) { subscribed.await() }
-            if (generation != sessionGeneration) return@launch
+            if (generation != sessionGeneration.get()) return@launch
             startSleepTimer()
             speakAt(fromIndex.coerceIn(0, (queue.size - 1).coerceAtLeast(0)))
         }
@@ -417,7 +462,7 @@ class ListeningSession(private val container: AppContainer) {
                 }
             }
         }
-        if (generation != sessionGeneration) return false
+        if (generation != sessionGeneration.get()) return false
         queue = spoken
         startedAt = System.currentTimeMillis()
         _state.update {
@@ -444,7 +489,13 @@ class ListeningSession(private val container: AppContainer) {
 
     private fun speakAt(index: Int) {
         starting = false
-        if (index !in queue.indices) {
+        // One snapshot for both the membership test and the element. `queue` is replaced
+        // by another thread's stop()/open(), and reading it twice let the second read land
+        // past the end of a list that had just been swapped for a shorter one — an
+        // IndexOutOfBoundsException in whatever thread was speaking, the main thread for a
+        // tap on the text.
+        val q = queue
+        if (index !in q.indices) {
             endOfPiece()
             return
         }
@@ -455,7 +506,7 @@ class ListeningSession(private val container: AppContainer) {
         pausedIndex = -1
         val wasPlaying = _state.value.playing
         lastIndex = index
-        val spoken = queue[index]
+        val spoken = q[index]
         _state.update {
             it.copy(
                 index = index,
@@ -472,7 +523,7 @@ class ListeningSession(private val container: AppContainer) {
         // every path in — the reader's button, the lock screen, the listening screen —
         // so it is asked for here rather than at each entry point. Idempotent.
         if (container.settings.speakTranslation) container.speaker.prepareTranslation()
-        container.speaker.speak(queue[index].text, UtteranceId.english(index))
+        container.speaker.speak(spoken.text, issue(SpeechRole.Reading, index))
         prefetchAfter(index)
         // The notification's middle button and the lock screen both read `playing`, and
         // a skip or a seek from a paused state starts audio without going through
@@ -483,13 +534,38 @@ class ListeningSession(private val container: AppContainer) {
     }
 
     private fun speakTranslationAt(index: Int, chinese: String) {
-        container.speaker.speak(chinese, UtteranceId.translation(index), SpeechRole.Translation)
+        container.speaker.speak(chinese, issue(SpeechRole.Translation, index), SpeechRole.Translation)
         // What follows this Chinese line is the next sentence's English, so that is what
         // is worth synthesising now. Prefetching the next *Chinese* line here asked the
         // Mandarin engine for a sentence that would not be wanted for another two
         // utterances, and left the English one — the one actually about to play —
         // to be synthesised from scratch after the Chinese finished.
         queue.getOrNull(index + 1)?.let { container.speaker.prefetch(it.text, SpeechRole.Reading) }
+    }
+
+    /**
+     * The id for one request, unique to that request.
+     *
+     * The queue remembers the id it issued and treats only that id's ending as the end of
+     * the sentence. The sentence index is not the identity of a request: tapping the
+     * sentence being read asks for the same index again, and the completion of the request
+     * the queue had already replaced used to arrive under the id it was waiting for and
+     * advance it — a replay turned into a skip, with no race involved. Every request
+     * therefore takes a serial, English or Chinese.
+     *
+     * Recorded as it is issued, before the voice is handed the text, because the voice can
+     * report the utterance finished synchronously (empty text, a missing Chinese engine,
+     * a voice that is not up).
+     */
+    private fun issue(role: SpeechRole, index: Int): String {
+        val serial = requestSerial.incrementAndGet()
+        val id = if (role == SpeechRole.Translation) {
+            UtteranceId.translation(index, serial)
+        } else {
+            UtteranceId.english(index, serial)
+        }
+        issuedUtteranceId = id
+        return id
     }
 
     /**
@@ -519,46 +595,73 @@ class ListeningSession(private val container: AppContainer) {
                 if (!_state.value.playing) return@collect
                 when (event) {
                     is SpeechEvent.Finished -> onFinished(event.utteranceId)
-                    // Only a failure of the sentence being read is this session's
-                    // failure. `speak` reports one for a request it could not hand to the
-                    // voice, and by the time that report arrives the queue may already be
-                    // on a newer sentence; stopping on it would end a session that is
-                    // playing fine.
-                    is SpeechEvent.Failed -> if (isCurrent(event.utteranceId)) stop()
+                    // Only a failure of the request the queue is waiting on is this
+                    // session's failure. `speak` reports one for a request it could not
+                    // hand to the voice, and by the time that report arrives the queue may
+                    // already be on a newer sentence; stopping on it would end a session
+                    // that is playing fine.
+                    is SpeechEvent.Failed -> if (isAwaiting(event.utteranceId)) stop()
+                    is SpeechEvent.Abandoned -> onAbandoned(event.utteranceId)
                 }
             }
     }
 
-    /** True when [utteranceId] names the sentence the queue is on right now. */
-    private fun isCurrent(utteranceId: String): Boolean =
-        UtteranceId.parse(utteranceId)?.index == lastIndex
+    /**
+     * True when [utteranceId] is the request the queue is waiting on.
+     *
+     * The index is not enough: a report that names the sentence being read may have been
+     * produced by the request the queue already replaced — tapping the sentence being read
+     * asks for the same index twice — and both the failure and the recovery below have to
+     * act on the latest request only.
+     */
+    private fun isAwaiting(utteranceId: String): Boolean = utteranceId == issuedUtteranceId
+
+    /**
+     * The request the queue is waiting on was abandoned before it could report anything.
+     *
+     * Two paths lead here: the voice was replaced while the request waited for it — the
+     * manual voice change, which no queue path knows about — and the request was
+     * superseded by a stop the queue did not issue. Nothing will ever report that id
+     * finished, so without this the session sat on a highlighted sentence with the button
+     * reading "pause" and no audio, indefinitely. The sentence is simply asked for again;
+     * if it is the voice that is gone, the fresh request fails and the session stops with
+     * a report instead of hanging.
+     */
+    private fun onAbandoned(utteranceId: String) {
+        if (!isAwaiting(utteranceId) || !_state.value.playing) return
+        speakAt(_state.value.index)
+    }
 
     /**
      * Advances the queue by one utterance.
      *
      * The English of sentence N is followed by its Chinese when the listener asked for
      * it, and by the English of N+1 otherwise; the Chinese of N is always followed by
-     * the English of N+1.
+     * the English of N+1. Which of those happens is decided by [QueueAdvance], which is
+     * where the rule about the request serial lives and where it is unit-tested; this only
+     * carries the decision out.
      */
     private fun onFinished(utteranceId: String) {
         val spoken = UtteranceId.parse(utteranceId) ?: return
-        // Ignore a late callback from a sentence the listener already skipped.
-        if (spoken.index != lastIndex) return
-        val next = spoken.index + 1
-        if (spoken.role == SpeechRole.Translation) {
-            if (next < queue.size) speakAt(next) else endOfPiece()
-            return
-        }
+        val q = queue
         val chinese = if (container.settings.speakTranslation) {
-            queue.getOrNull(spoken.index)?.chinese
+            q.getOrNull(spoken.index)?.chinese
         } else {
             null
         }
-        if (chinese != null) {
-            speakTranslationAt(spoken.index, chinese)
-            return
+        when (
+            val step = QueueAdvance.after(
+                utteranceId = utteranceId,
+                issued = issuedUtteranceId,
+                total = q.size,
+                translationPending = chinese != null,
+            )
+        ) {
+            is QueueAdvance.Step.English -> speakAt(step.index)
+            is QueueAdvance.Step.Translation -> chinese?.let { speakTranslationAt(spoken.index, it) }
+            QueueAdvance.Step.EndOfPiece -> endOfPiece()
+            QueueAdvance.Step.Ignore -> Unit
         }
-        if (next < queue.size) speakAt(next) else endOfPiece()
     }
 
     /**
@@ -589,14 +692,14 @@ class ListeningSession(private val container: AppContainer) {
             stop()
             return
         }
-        val generation = sessionGeneration
+        val generation = sessionGeneration.get()
         advanceJob = container.appScope.launch {
             val next = runCatching {
                 container.books.chapterIdAt(current.bookId, current.chapterIndex + 1)
             }.getOrNull()
             // The session was stopped, or replaced with another piece, while the next
             // chapter was being looked up.
-            if (generation != sessionGeneration) return@launch
+            if (generation != sessionGeneration.get()) return@launch
             if (next == null) {
                 stop()
                 return@launch

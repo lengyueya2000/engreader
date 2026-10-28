@@ -4,6 +4,7 @@ Taps are fired from this script so the audio and the actions share one clock; th
 result is a wav whose envelope can be read back to see where the sound starts, where
 it is cut off, and how long each utterance actually lasts.
 """
+import os
 import subprocess
 import sys
 import time
@@ -12,11 +13,25 @@ import wave
 import numpy as np
 import soundcard as sc
 
-ADB = "G:/android-sdk/platform-tools/adb.exe"
-DEVICE = "emulator-5556"
+def default_adb():
+    """`adb` from this machine's SDK, or whatever is on PATH.
 
-# (seconds after recording starts, label, x, y)
-TAPS = [float(a) for a in sys.argv[1].split(",")] if len(sys.argv) > 1 else []
+    The path used to be hardcoded to one developer's Windows SDK, so the script would
+    only run on that machine. `ANDROID_HOME` and `ANDROID_SDK_ROOT` are the standard
+    variables; `ADB` overrides both.
+    """
+    suffix = ".exe" if os.name == "nt" else ""
+    for root in (os.environ.get("ANDROID_HOME"), os.environ.get("ANDROID_SDK_ROOT")):
+        if root:
+            candidate = os.path.join(root, "platform-tools", "adb" + suffix)
+            if os.path.exists(candidate):
+                return candidate
+    return "adb"
+
+
+ADB = os.environ.get("ADB") or default_adb()
+DEVICE = os.environ.get("ANDROID_SERIAL", "emulator-5556")
+
 SCRIPT = sys.argv[2] if len(sys.argv) > 2 else "rec.wav"
 DURATION = float(sys.argv[3]) if len(sys.argv) > 3 else 14.0
 
@@ -32,9 +47,13 @@ def tap(x, y):
 
 
 def main():
+    if len(sys.argv) < 2:
+        raise SystemExit("usage: record_taps.py t,x,y[,t,x,y...] [out.wav] [seconds]")
     plan = []
     # argv[1] is a flat list: t,x,y,t,x,y,...
     args = [float(a) for a in sys.argv[1].split(",")]
+    if not args or len(args) % 3 != 0:
+        raise SystemExit("taps must be t,x,y triples; got %d numbers" % len(args))
     for i in range(0, len(args), 3):
         plan.append((args[i], int(args[i + 1]), int(args[i + 2])))
     plan.sort()

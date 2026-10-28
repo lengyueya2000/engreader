@@ -69,6 +69,14 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
     private val posCache = java.util.concurrent.ConcurrentHashMap<String, PartOfSpeech>()
 
     /**
+     * Cache for [verbReadingFromAlternative]: word → "another headword this spelling
+     * belongs to is a verb". Kept apart from [posCache] because it answers a different
+     * question — the *primary* reading of `left` is the adjective 左边的, and only its
+     * second reading is a verb.
+     */
+    private val verbReadingCache = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+
+    /**
      * How many part-of-speech answers are kept.
      *
      * [analyze] runs on `Dispatchers.Default`, so two sentences can be parsed at once
@@ -83,6 +91,12 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
         "because", "although", "though", "even", "if", "unless", "until", "till",
         "since", "as", "after", "before", "while", "whilst", "whereas", "whether",
         "once", "whenever", "wherever", "provided", "supposing", "given", "now",
+        // `when` and `where` were missing from this set while `whenever` and `wherever`
+        // were in it, and [adverbialSense] already carried branches for both. A sentence
+        // opening "When it rains, the roads flood." therefore came out as a *single*
+        // clause whose backbone was "When it rains" — the panel taught the opposite of
+        // the truth for one of the commonest clause types in English.
+        "when", "where",
         "so", "such", "than", "lest", "whereupon",
     )
 
@@ -568,6 +582,72 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
         "something", "anything", "everything", "nothing",
     )
 
+    /**
+     * Punctuation that can sit between a clause boundary and its subject.
+     *
+     * Imported EPUB and MOBI prose is full of curly quotes, and a straight apostrophe or
+     * a bracket reads the same way to a reader: none of them is the subject.
+     */
+    private val QUOTES_AND_BRACKETS = charArrayOf(
+        '\u201C', '\u201D', '\u2018', '\u2019', '"', '\'', '(', ')', '[', ']',
+        '\u2014', '\u2013', '-',
+    )
+
+    /**
+     * Words that open a fronted phrase functioning as an adverbial rather than as the
+     * subject: `In 2020, the government announced…`, `On Monday, the plan…`.
+     */
+    private val PREPOSITIONS = setOf(
+        "in", "on", "at", "by", "with", "without", "under", "over", "after", "before",
+        "during", "since", "for", "from", "to", "into", "within", "throughout",
+        "between", "among", "against", "despite", "than", "as", "about", "around",
+        "near", "behind", "beyond", "across", "along", "upon", "until", "till",
+        "because", "if", "when", "where", "while", "although", "though", "unless",
+    )
+
+    /** Sentence-initial adverbs that play the same role as a fronted prepositional phrase. */
+    private val FRONTED_ADVERBIALS = setOf(
+        "however", "therefore", "meanwhile", "nevertheless", "nonetheless", "still",
+        "yet", "then", "later", "today", "yesterday", "tomorrow", "recently",
+        "finally", "first", "second", "third", "next", "last", "instead",
+        "otherwise", "accordingly", "consequently", "similarly", "likewise",
+        "additionally", "also", "besides", "indeed", "hence", "thus", "ultimately",
+        "initially", "eventually", "subsequently", "previously", "already",
+    )
+
+    /**
+     * The subject text with a fronted adverbial removed.
+     *
+     * The subject used to be "everything before the finite verb", so a fronted time or
+     * place phrase was glued into it: `In 2020, the government announced…` reported the
+     * subject as `In 2020, the government`, and `On Monday, the plan…` as
+     * `On Monday, the plan`. Fronting is ordinary in the news prose this app is built
+     * around, so the breakdown was systematically wrong rather than wrong on an edge case.
+     *
+     * The two comma shapes have to be told apart. A phrase that opens with a preposition
+     * (or one of the adverbs that behave the same way) is the clause's adverbial, so the
+     * subject is what follows the comma. In `the man, who was tired, left` the comma
+     * closes a clausal modifier *of the subject*, so the noun phrase before it is the
+     * subject — and a comma that only separates list items
+     * (`the plan, the timetable and the budget`) must keep the whole phrase, which is why
+     * the head is preferred only when the tail actually contains a finite verb.
+     */
+    private fun withoutFrontedAdverbial(raw: String): String {
+        val text = raw.trim()
+        val comma = text.indexOf(',')
+        if (comma <= 0) return text
+        val head = text.substring(0, comma).trim()
+        val tail = text.substring(comma + 1).trim()
+        if (head.isEmpty() || tail.isEmpty()) return text
+        val opener = Tokenizer.words(head).firstOrNull()?.lowercase().orEmpty()
+        val fronted = opener in PREPOSITIONS ||
+            opener in FRONTED_ADVERBIALS ||
+            opener.firstOrNull()?.isDigit() == true
+        if (fronted) return tail
+        val tailWords = Tokenizer.words(tail).map { it.lowercase() }
+        return if (tailWords.indices.any { isFiniteVerb(tailWords, it) }) head else text
+    }
+
     private fun addSegment(
         out: MutableList<Segment>,
         sentence: String,
@@ -611,10 +691,14 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
             else -> {
                 val verbEnd = verbPhraseEnd(segment.text, tokens, offsets, verbStart)
                 val subjectEnd = offsets.getOrElse(verbStart) { 0 }
+                // Quotes and brackets are punctuation, not a subject: `“We're leaving,”
+                // she said.` reported the subject as `“`, because a curly quote is not
+                // blank and so the contraction's own subject — the thing the
+                // hidden-subject branch exists to read — was never tried.
                 val rawSubject = stripLeadingMarker(
-                    trimToLastBoundary(segment.text.substring(0, subjectEnd)),
+                    withoutFrontedAdverbial(trimToLastBoundary(segment.text.substring(0, subjectEnd))),
                     segment.marker,
-                )
+                ).trim(*QUOTES_AND_BRACKETS)
                 val afterVerb = segment.text.substring(verbEnd).trim().trimStart(',', ';', ':').trim()
                 // "We're expecting…" opens with a contraction that carries its own
                 // subject, so there is no text before the verb to read it from; the
@@ -671,7 +755,7 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
             // what was said, not a tail of `said`.
             if (PartOfSpeechParser.contraction(w)?.subject != null) break
             val isAux = w in AUXILIARIES
-            val isVerbLike = isAux || posOf(w) == PartOfSpeech.Verb
+            val isVerbLike = isAux || posOf(w) == PartOfSpeech.Verb || verbReadingFromAlternative(w)
             val isNegation = w == "not" || w == "n't" || w == "never"
             val isAdverb = posOf(w) == PartOfSpeech.Adverb && i2 == i + 1
             val continuesVerbPhrase = isAux || (isVerbLike && prevAux)
@@ -895,13 +979,14 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
         if (PartOfSpeechParser.contractionPos(w) == PartOfSpeech.Verb) return true
         if (index > 0 && lower[index - 1] == "to") return false
         if (w.endsWith("ing") && w !in ING_STEM_VERBS) return false
-        return posOf(w) == PartOfSpeech.Verb
+        return posOf(w) == PartOfSpeech.Verb || verbReadingFromAlternative(w)
     }
 
     private fun isVerb(word: String): Boolean =
         word in AUXILIARIES ||
             PartOfSpeechParser.contractionPos(word) == PartOfSpeech.Verb ||
-            posOf(word) == PartOfSpeech.Verb
+            posOf(word) == PartOfSpeech.Verb ||
+            verbReadingFromAlternative(word)
 
     /**
      * Part of speech for a word: contractions, then the dictionary, then suffix
@@ -926,6 +1011,42 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
         }
         if (posCache.size < POS_CACHE_LIMIT) posCache[key] = pos
         return pos
+    }
+
+    /**
+     * True when a headword other than the primary one is a verb.
+     *
+     * ECDICT files an inflected form under its own headword whenever the spelling has a
+     * life of its own — `left` is also the adjective 左边的, `said` 上述的, `published`
+     * 已发布的, `failed` 失败的 — and `Dictionary.resolve` picks whichever of the two
+     * readings is more frequent as the primary one, attaching the other in
+     * `WordEntry.otherReadings`. [posOf] answers from the *primary* gloss line, because
+     * that is the reading the lookup sheet shows, so for those words it reports an
+     * adjective and [isFiniteVerb] rejected them. No finite verb was then found at all
+     * and the clause had no subject, no predicate and no backbone: `He said no.` and
+     * `She left the room.` came out as "the sentence as written".
+     *
+     * Scanning every line of the primary gloss instead — the obvious repair — is worse,
+     * not better. An entry that is simply both a noun and a verb (`interest`, `rate`,
+     * `plan`, `report`) would answer yes, and [buildClause] takes the *first* finite verb
+     * in the segment, so `Interest rates rose to 3.5 per cent.` would report `interest`
+     * as the predicate and an empty subject. Only a *different headword* the spelling
+     * belongs to is evidence that this occurrence is the verb.
+     *
+     * `Dictionary.withAlternative` writes each alternative gloss as
+     * `"<pos label> <gloss>"`, and [PartOfSpeechParser.parse] only reads ECDICT's English
+     * markers, so the label is matched directly rather than re-parsed.
+     */
+    private fun verbReadingFromAlternative(word: String): Boolean {
+        val key = Tokenizer.normalize(word)
+        if (key.isEmpty()) return false
+        verbReadingCache[key]?.let { return it }
+        val marker = "${PartOfSpeech.Verb.label} "
+        val found = dictionary.lookup(key)?.otherReadings
+            .orEmpty()
+            .any { (_, lines) -> lines.any { it.startsWith(marker) } }
+        if (verbReadingCache.size < POS_CACHE_LIMIT) verbReadingCache[key] = found
+        return found
     }
 
     /** Character offset of each token in the original string, in token order. */

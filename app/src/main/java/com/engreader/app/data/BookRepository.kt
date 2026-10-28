@@ -6,6 +6,7 @@ import android.database.Cursor
 import android.net.Uri
 import android.util.Log
 import com.engreader.app.book.BookFormat
+import com.engreader.app.book.BookPicker
 import com.engreader.app.book.BookText
 import com.engreader.app.book.EpubParser
 import com.engreader.app.book.MobiParser
@@ -50,10 +51,23 @@ class BookRepository(
      * loop began — so a failure part way through left a book on the shelf with no
      * chapters and an orphan image on disk, which is exactly what the comment on the
      * transaction claimed could not happen.
+     *
+     * The file is read under [BookPicker.maxImportBytes]'s ceiling for its kind, and
+     * under the size the picker already declared when it has one: the whole file used
+     * to be read with `readBytes()` first, so a pick past what the heap can hold died
+     * with an `OutOfMemoryError` instead of an error about the file.
      */
-    suspend fun import(uri: Uri, displayName: String): Book = withContext(Dispatchers.IO) {
-        val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-            ?: throw BookFormat.Companion.Unsupported("读不到这个文件")
+    suspend fun import(
+        uri: Uri,
+        displayName: String,
+        knownSize: Long = 0L,
+    ): Book = withContext(Dispatchers.IO) {
+        val bytes = BookPicker.readLimited(
+            context,
+            uri,
+            BookPicker.maxImportBytes(displayName.ifBlank { uri.lastPathSegment.orEmpty() }),
+            knownSize,
+        )
         if (bytes.isEmpty()) throw BookFormat.Companion.Unsupported("这个文件是空的")
 
         val format = BookFormat.detect(bytes)
@@ -132,10 +146,18 @@ class BookRepository(
                             put("bookId", rowId)
                             put("chapterIndex", index)
                         }
-                        insertWithOnConflict(
+                        val inserted = insertWithOnConflict(
                             "article", null, values,
                             android.database.sqlite.SQLiteDatabase.CONFLICT_IGNORE,
                         )
+                        // `CONFLICT_IGNORE` reports a dropped row as -1 instead of
+                        // throwing, while the book row already claims
+                        // `chapterCount = parsed.chapters.size`: a chapter that never
+                        // landed would leave a shelf that offers a chapter which is not
+                        // there. Failing the import and rolling back is the honest
+                        // outcome. The chapter URL is `book:<bookId>/<index>` with a
+                        // fresh book id, so a conflict is not expected.
+                        check(inserted != -1L) { "第 ${index + 1} 节写入失败" }
                     }
                     setTransactionSuccessful()
                     rowId
@@ -228,8 +250,10 @@ class BookRepository(
      * Written on every chapter change rather than on exit: leaving the app from the
      * middle of a chapter is the normal way to stop, and `onCleared` is not guaranteed
      * to run when the process is killed.
+     *
+     * True when the row was there to mark.
      */
-    suspend fun markOpened(id: Long, chapterIndex: Int) = withContext(Dispatchers.IO) {
+    suspend fun markOpened(id: Long, chapterIndex: Int): Boolean = withContext(Dispatchers.IO) {
         db.writableDatabase.update(
             "book",
             ContentValues().apply {
@@ -237,8 +261,7 @@ class BookRepository(
                 put("lastChapter", chapterIndex)
             },
             "id = ?", arrayOf(id.toString()),
-        )
-        Unit
+        ) > 0
     }
 
     suspend fun addReadSeconds(id: Long, seconds: Int) = withContext(Dispatchers.IO) {
@@ -259,25 +282,30 @@ class BookRepository(
      * "articles started" would count a book that is no longer on the shelf. Look-ups
      * are deliberately left alone: the word was still met while reading, and the
      * wordbook's history should not lose it because the book it came from was deleted.
+     *
+     * True when the book row was actually removed; the shelf has already taken it off
+     * the list by the time this returns.
      */
-    suspend fun delete(id: Long) = withContext(Dispatchers.IO) {
+    suspend fun delete(id: Long): Boolean = withContext(Dispatchers.IO) {
         val cover = get(id)?.coverFile
-        db.writableDatabase.beginTransaction()
+        val database = db.writableDatabase
+        var removed = false
+        database.beginTransaction()
         try {
             val chapters = "articleId IN (SELECT id FROM article WHERE bookId = ?)"
             val args = arrayOf(id.toString())
-            db.writableDatabase.delete("session", chapters, args)
-            db.writableDatabase.delete("quiz", chapters, args)
-            db.writableDatabase.delete("article", "bookId = ?", args)
-            db.writableDatabase.delete("book", "id = ?", args)
-            db.writableDatabase.setTransactionSuccessful()
+            database.delete("session", chapters, args)
+            database.delete("quiz", chapters, args)
+            database.delete("article", "bookId = ?", args)
+            removed = database.delete("book", "id = ?", args) > 0
+            database.setTransactionSuccessful()
         } finally {
-            db.writableDatabase.endTransaction()
+            database.endTransaction()
         }
         // Deleted after the commit: a rolled-back delete must not take the image with
         // it, or the book would come back with a broken cover.
         cover?.takeIf { it.isNotBlank() }?.let { File(coversDir(), it).delete() }
-        Unit
+        removed
     }
 
     /** The cover image on disk, or null when the book has none. */

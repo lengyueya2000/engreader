@@ -43,6 +43,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.engreader.app.tts.SpeechBackend
+import com.engreader.app.tts.SpeechState
 import com.engreader.app.tts.VoiceCatalog
 import com.engreader.app.ui.components.HairLine
 import com.engreader.app.ui.theme.ReadingTheme
@@ -62,7 +63,7 @@ fun TypographySheet(
     speechVoice: String,
     activeVoice: VoiceCatalog.BundledVoice?,
     backend: SpeechBackend,
-    speechReady: Boolean,
+    speechState: SpeechState,
     onFontSize: (Int) -> Unit,
     onLineHeight: (Float) -> Unit,
     onTheme: (ReadingTheme) -> Unit,
@@ -252,7 +253,7 @@ fun TypographySheet(
                 voices = VoiceCatalog.forLocale(speechLocale),
                 speechVoice = speechVoice,
                 activeVoice = activeVoice,
-                speechReady = speechReady,
+                speechState = speechState,
                 onSpeechVoice = onSpeechVoice,
                 onPreviewVoice = onPreviewVoice,
             )
@@ -282,7 +283,7 @@ private fun VoiceList(
     voices: List<VoiceCatalog.BundledVoice>,
     speechVoice: String,
     activeVoice: VoiceCatalog.BundledVoice?,
-    speechReady: Boolean,
+    speechState: SpeechState,
     onSpeechVoice: (String) -> Unit,
     onPreviewVoice: () -> Unit,
 ) {
@@ -299,9 +300,17 @@ private fun VoiceList(
     )
     Spacer(Modifier.height(8.dp))
 
-    if (!speechReady) {
+    // "Not ready" and "will never be ready" are different promises: the first is a
+    // wait worth taking, the second used to be shown as the same indefinite
+    // "正在载入语音模型…", so a device whose bundled model failed to load told the
+    // reader to keep waiting for a state that never arrives.
+    if (speechState != SpeechState.Ready) {
         Text(
-            text = "正在载入语音模型，首次使用需要几秒钟。",
+            text = if (speechState == SpeechState.Unavailable) {
+                "语音模型没能加载，内置音色暂时不可用。可以改用系统语音，或重装后再试。"
+            } else {
+                "正在载入语音模型，首次使用需要几秒钟。"
+            },
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

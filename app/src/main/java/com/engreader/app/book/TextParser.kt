@@ -42,6 +42,13 @@ object TextParser {
         // ignore, and they are the only title the file has.
         val meta = gutenbergMetadata(paragraphs)
         val chapters = splitOnHeadings(stripGutenbergBoilerplate(paragraphs))
+        // Checked again *after* the licence strip and the heading split, not only before
+        // them: a file whose END marker is the first paragraph lost its whole body to
+        // the cut, and a file whose every paragraph is a heading leaves `splitOnHeadings`
+        // with no body at all. Both returned a book with zero chapters, which the
+        // repository stored and the shelf reported as "共 0 章" — a successful import of
+        // nothing. The other three parsers refuse an empty body exactly this way.
+        if (chapters.isEmpty()) throw BookFormat.Companion.Unsupported("这个文本文件里没有正文")
         return EpubParser.Book(
             title = meta.first,
             author = meta.second,
@@ -208,10 +215,15 @@ object TextParser {
      */
     private fun stripGutenbergBoilerplate(paragraphs: List<String>): List<String> {
         val start = paragraphs.indexOfFirst { START_MARKER.matches(it.trim()) }
+        // Without a START marker there is no header to cut, and the file is left whole:
+        // the old `from = 0` fallback kept the header and then cut everything before the
+        // END marker, so a text that carried only the footer (or listed the END marker
+        // first) came back with no paragraphs at all. A lone END marker paragraph stays
+        // in the text, which is the lesser evil next to discarding the book.
+        if (start < 0) return paragraphs
         val end = paragraphs.indexOfFirst { END_MARKER.matches(it.trim()) }
-        val from = if (start >= 0) start + 1 else 0
-        val to = if (end >= from) end else paragraphs.size
-        return paragraphs.subList(from, to)
+        val to = if (end > start) end else paragraphs.size
+        return paragraphs.subList(start + 1, to)
     }
 
     private val START_MARKER =
@@ -322,17 +334,35 @@ object TextParser {
 
     /** Cuts the document at its top-level headings, so each becomes a chapter. */
     private fun splitOnHtmlHeadings(html: String): List<String> {
-        val headings = HEADING.findAll(html).map { it.range.first }.toList()
+        // Bounded, and stopped early: a crafted document with a million `<h1>` tags made
+        // a million slices, and every one of them was extracted before the forty-word
+        // filter ran (2 MB measured 277 MB of live heap). The scan stops at the cap and
+        // the last slice runs to the end of the document, so no text is lost.
+        val headings = ArrayList<Int>()
+        for (match in HEADING.findAll(html)) {
+            if (headings.size > MAX_CHAPTERS) break
+            headings.add(match.range.first)
+        }
         if (headings.size < 2) return listOf(html)
-        val out = mutableListOf<String>()
+        val out = ArrayList<String>(headings.size + 1)
         if (headings.first() > 0) out += html.substring(0, headings.first())
         headings.forEachIndexed { index, at ->
-            out += html.substring(at, headings.getOrNull(index + 1) ?: html.length)
+            val end = if (index == headings.lastIndex) html.length else headings[index + 1]
+            out += html.substring(at, end)
         }
         return out
     }
 
     private val HEADING = Regex("(?is)<h[12]\\b[^>]*>")
+
+    /**
+     * Most chapters one document may be cut into.
+     *
+     * No real book has four thousand chapters, and the count is what the parser's
+     * memory amplification is proportional to, so the split stops here rather than at
+     * the document's own heading count.
+     */
+    private const val MAX_CHAPTERS = 4_000
 
     /** The `<title>` of the page, for a book made of one HTML file. */
     private fun firstTitle(html: String): String {
@@ -358,11 +388,15 @@ object TextParser {
      * fallback to GB18030, because a Chinese edition saved by an old editor is not
      * UTF-8 and decodes to a screen of replacement characters otherwise.
      */
-    private fun decode(bytes: ByteArray): String {
+    internal fun decode(bytes: ByteArray): String {
         val utf8 = com.engreader.app.source.PageCharset.decode(bytes, null)
         if (hasByteOrderMark(bytes)) return utf8
         val broken = utf8.count { it == '\uFFFD' }
-        if (broken == 0 || broken * 100 <= utf8.length) return utf8
+        // In 64 bits: `broken * 100` wraps negative past 21.4 M replacement characters,
+        // and the negative value then passes this test — so a >21 MB legacy-encoded
+        // Chinese novel was returned as a screen of U+FFFD without the fallback below
+        // ever being tried, which is the exact case it exists for.
+        if (broken == 0 || broken.toLong() * 100 <= utf8.length) return utf8
         val legacy = runCatching { String(bytes, Charset.forName("GB18030")) }.getOrNull() ?: return utf8
         return if (legacy.count { it == '\uFFFD' } < broken) legacy else utf8
     }

@@ -63,10 +63,17 @@ class ArticleRepository(
         val lemmas = withContext(Dispatchers.IO) { profile.contentLemmas(article.body) }
         if (lemmas.isNotEmpty()) {
             withContext(Dispatchers.IO) {
+                // Guarded by the body that was tokenised. `persist` clears this cache
+                // when a re-fetch replaces the text, and the two run on different
+                // dispatchers, so an unguarded write could put the previous body's
+                // lemma list permanently on the new one — the "new words" panel and the
+                // unknown rate would keep describing text that is no longer stored. A
+                // zero-row update means exactly that race and the cache stays empty.
                 db.writableDatabase.update(
                     "article",
                     ContentValues().apply { put("vocabProfile", VocabularyProfile.encode(lemmas)) },
-                    "id = ?", arrayOf(article.id.toString()),
+                    "id = ? AND body = ?",
+                    arrayOf(article.id.toString(), article.body),
                 )
             }
         }
@@ -122,8 +129,17 @@ class ArticleRepository(
                 // quote the old sentences. Unlike the translation it is regenerated on
                 // demand, so clearing it costs nothing but a rebuild.
                 values.put("quizJson", "")
+                // The paragraph the reader stopped at belongs to the old text as well: a
+                // shorter re-fetch would resume past the end, or land somewhere
+                // unrelated with no explanation. Zero is the top, the honest answer for
+                // a body that is not the one the position was taken in.
+                values.put("readParagraph", 0)
             }
-            db.writableDatabase.update("article", values, "id = ?", arrayOf(existingId.toString()))
+            val written = db.writableDatabase.update("article", values, "id = ?", arrayOf(existingId.toString()))
+            // The row can be deleted between the read that produced `existingId` and
+            // this write; `requireNotNull(get(id))` below used to report that as a
+            // failed fetch with no explanation.
+            require(written > 0) { "Article ${item.url} vanished while it was being re-fetched" }
             existingId
         } else {
             val inserted = db.writableDatabase.insertWithOnConflict(
@@ -222,51 +238,52 @@ class ArticleRepository(
         ).use { if (it.moveToFirst()) it.toArticle() else null }
     }
 
-    suspend fun setSaved(id: Long, saved: Boolean) = withContext(Dispatchers.IO) {
+    /** True when the flag reached a row; the caller has already flipped it in memory. */
+    suspend fun setSaved(id: Long, saved: Boolean): Boolean = withContext(Dispatchers.IO) {
         db.writableDatabase.update(
             "article",
             ContentValues().apply { put("saved", if (saved) 1 else 0) },
             "id = ?", arrayOf(id.toString()),
-        )
-        Unit
+        ) > 0
     }
 
-    suspend fun setTranslation(id: Long, translation: List<String>) = withContext(Dispatchers.IO) {
-        db.writableDatabase.update(
-            "article",
-            ContentValues().apply { put("translation", encodeTranslation(translation)) },
-            "id = ?", arrayOf(id.toString()),
-        )
-        Unit
-    }
-
-    suspend fun saveQuiz(id: Long, questions: List<QuizQuestion>) = withContext(Dispatchers.IO) {
-        val array = JSONArray()
-        questions.forEach { q ->
-            array.put(
-                JSONObject().apply {
-                    put("q", q.question)
-                    put("o", JSONArray(q.options))
-                    put("a", q.answerIndex)
-                    put("e", q.explanation)
-                }
-            )
+    /** True when the translation reached a row. */
+    suspend fun setTranslation(id: Long, translation: List<String>): Boolean =
+        withContext(Dispatchers.IO) {
+            db.writableDatabase.update(
+                "article",
+                ContentValues().apply { put("translation", encodeTranslation(translation)) },
+                "id = ?", arrayOf(id.toString()),
+            ) > 0
         }
-        db.writableDatabase.update(
-            "article",
-            ContentValues().apply { put("quizJson", array.toString()) },
-            "id = ?", arrayOf(id.toString()),
-        )
-        Unit
-    }
 
-    suspend fun markOpened(id: Long) = withContext(Dispatchers.IO) {
+    suspend fun saveQuiz(id: Long, questions: List<QuizQuestion>): Boolean =
+        withContext(Dispatchers.IO) {
+            val array = JSONArray()
+            questions.forEach { q ->
+                array.put(
+                    JSONObject().apply {
+                        put("q", q.question)
+                        put("o", JSONArray(q.options))
+                        put("a", q.answerIndex)
+                        put("e", q.explanation)
+                    }
+                )
+            }
+            db.writableDatabase.update(
+                "article",
+                ContentValues().apply { put("quizJson", array.toString()) },
+                "id = ?", arrayOf(id.toString()),
+            ) > 0
+        }
+
+    /** True when the article was there to mark. */
+    suspend fun markOpened(id: Long): Boolean = withContext(Dispatchers.IO) {
         db.writableDatabase.update(
             "article",
             ContentValues().apply { put("lastReadAt", System.currentTimeMillis()) },
             "id = ?", arrayOf(id.toString()),
-        )
-        Unit
+        ) > 0
     }
 
     suspend fun addReadSeconds(id: Long, seconds: Int) = withContext(Dispatchers.IO) {
@@ -278,9 +295,27 @@ class ArticleRepository(
         Unit
     }
 
-    suspend fun delete(id: Long) = withContext(Dispatchers.IO) {
-        db.writableDatabase.delete("article", "id = ?", arrayOf(id.toString()))
-        Unit
+    /**
+     * Removes one article and the study rows that belong to it.
+     *
+     * The sessions and quizzes are deleted in the same transaction: without them the
+     * article's reading time keeps counting towards the day chart and the streak, and
+     * its quiz results keep counting towards the accuracy figure, for a piece that is
+     * no longer stored. `BookRepository.delete` already cascades this way; this entry
+     * point did not.
+     */
+    suspend fun delete(id: Long): Boolean = withContext(Dispatchers.IO) {
+        val args = arrayOf(id.toString())
+        db.writableDatabase.beginTransaction()
+        try {
+            db.writableDatabase.delete("session", "articleId = ?", args)
+            db.writableDatabase.delete("quiz", "articleId = ?", args)
+            val removed = db.writableDatabase.delete("article", "id = ?", args) > 0
+            db.writableDatabase.setTransactionSuccessful()
+            removed
+        } finally {
+            db.writableDatabase.endTransaction()
+        }
     }
 
     /**

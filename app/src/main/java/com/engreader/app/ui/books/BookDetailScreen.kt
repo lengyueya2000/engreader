@@ -35,6 +35,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -50,10 +51,10 @@ import com.engreader.app.model.Book
 import com.engreader.app.model.ChapterRef
 import com.engreader.app.ui.askForNotificationPermission
 import com.engreader.app.ui.components.EmptyState
+import com.engreader.app.ui.components.ErrorState
 import com.engreader.app.ui.components.HairLine
 import com.engreader.app.ui.components.LoadingBlock
 import com.engreader.app.ui.containerScopedViewModel
-import com.engreader.app.ui.theme.Palette
 
 /**
  * A book's own page: what it is, how far through it the reader is, and its chapters.
@@ -71,13 +72,17 @@ fun BookDetailScreen(
 ) {
     val viewModel = containerScopedViewModel(key = "book:$bookId") { BookDetailViewModel(it, bookId) }
     val state = viewModel.state
-    var showAllChapters by remember { mutableStateOf(false) }
+    // Keyed on the book: this destination is reused when the reader opens another book,
+    // so a plain `remember` would carry "显示全部章节" from the previous one — a 600-chapter
+    // book would open with its table of contents already expanded.
+    var showAllChapters by remember(bookId) { mutableStateOf(false) }
+    var reload by remember { mutableIntStateOf(0) }
     val context = LocalContext.current
     val notifications = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { }
 
-    androidx.compose.runtime.LaunchedEffect(bookId) { viewModel.load() }
+    androidx.compose.runtime.LaunchedEffect(bookId, reload) { viewModel.load() }
 
     Box(
         Modifier
@@ -87,6 +92,16 @@ fun BookDetailScreen(
         when {
             state.loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 LoadingBlock(label = "正在打开这本书…")
+            }
+
+            state.book == null && state.retryable -> Box(
+                Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center,
+            ) {
+                ErrorState(
+                    message = state.error ?: "打开这本书时出错。",
+                    onRetry = { reload++ },
+                )
             }
 
             state.book == null -> EmptyState(
@@ -107,7 +122,7 @@ fun BookDetailScreen(
                         bottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding() + 24.dp,
                     ),
                 ) {
-                    item { BookHeader(book = book, cover = rememberCover(book)) }
+                    item { BookHeader(book = book, chapterCount = state.chapters.size, cover = rememberCover(book)) }
 
                     item {
                         val next = book.lastChapter.coerceIn(0, (state.chapters.size - 1).coerceAtLeast(0))
@@ -217,8 +232,15 @@ private fun BookTopBar(title: String, onBack: () -> Unit) {
     }
 }
 
+/**
+ * The top of the book page.
+ *
+ * [chapterCount] is the number of chapters actually loaded, not `book.chapterCount`:
+ * the table of contents below lists that same list, and a header claiming a different
+ * total from the one the reader can count in the list reads as a bug.
+ */
 @Composable
-private fun BookHeader(book: Book, cover: android.graphics.Bitmap?) {
+private fun BookHeader(book: Book, chapterCount: Int, cover: android.graphics.Bitmap?) {
     Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
         if (cover != null) {
             Image(
@@ -267,9 +289,16 @@ private fun BookHeader(book: Book, cover: android.graphics.Bitmap?) {
                 )
             }
             Spacer(Modifier.height(10.dp))
+            // Under an hour, say minutes: `estimatedMinutes` bottoms out at 1, so the
+            // old `estimatedMinutes / 60` rendered "约 0 小时" for every book below
+            // 10,800 words — which is most of them.
+            val duration = if (book.estimatedMinutes < 60) {
+                "约 ${book.estimatedMinutes} 分钟"
+            } else {
+                "约 ${book.estimatedMinutes / 60} 小时"
+            }
             Text(
-                text = "${book.chapterCount} 章 · ${book.wordCount} 词 · 约 ${book.estimatedMinutes / 60}" +
-                    " 小时",
+                text = "$chapterCount 章 · ${book.wordCount} 词 · $duration",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -286,12 +315,12 @@ private fun BookHeader(book: Book, cover: android.graphics.Bitmap?) {
                 LinearProgressIndicator(
                     progress = { book.progress },
                     modifier = Modifier.fillMaxWidth().height(4.dp),
-                    color = Palette.Pine,
+                    color = MaterialTheme.colorScheme.primary,
                     trackColor = MaterialTheme.colorScheme.surfaceContainer,
                 )
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    text = "已读到第 ${book.lastChapter + 1} / ${book.chapterCount} 章",
+                    text = "已读到第 ${book.lastChapter + 1} / $chapterCount 章",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

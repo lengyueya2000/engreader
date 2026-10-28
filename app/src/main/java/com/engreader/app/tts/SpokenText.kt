@@ -322,7 +322,32 @@ object SpokenText {
         "nicholas", "paul", "peter", "adrian", "charlemagne", "napoleon",
     )
 
-    private val ROMAN = Regex("(?<![\\p{L}])([IVXLCDM]{1,9})(?![\\p{L}])")
+    /**
+     * A strict roman numeral, in the two shapes a numeral is written in prose.
+     *
+     * A **single** numeral letter only counts as a numeral when it is `I`, `V` or `X`.
+     * `C`, `D`, `M` and `L` standing alone are far more often item labels than numbers —
+     * `Appendix C`, `Section D`, `Figure C`, `Table D`, `Part C`, `Chapter M` — and
+     * reading one as a number both says "one hundred" where the writer said a letter and
+     * used to run off the end of the number tables while saying it (`cardinal`'s tables
+     * stopped at 99, so `Appendix C` threw `ArrayIndexOutOfBoundsException` straight into
+     * the Compose click handler that asked for this rewrite). Inside a longer numeral the
+     * full alphabet still counts: `Chapter XL` is forty and `Volume CD` four hundred.
+     */
+    private val ROMAN = Regex("(?<![\\p{L}])([IVX]|[IVXLCDM]{2,})(?![\\p{L}])")
+
+    /**
+     * Divisions whose number is as often a letter as a numeral.
+     *
+     * `Appendix X` and `The letter X marks the spot` label an item with a letter, and a
+     * lone numeral letter spoken there says "ten" where the writer said "ex" — the same
+     * mistake `Appendix C` makes when it is read as "one hundred". `chapter`, `part` and
+     * `book` are deliberately absent: `Chapter X` really is chapter ten, and a test pins
+     * that reading down.
+     */
+    private val LETTER_LABELS = setOf(
+        "appendix", "section", "figure", "fig", "table", "plate", "letter",
+    )
 
     private fun spellRomanNumerals(text: String): String {
         if (!text.contains(Regex("[IVXLCDM]"))) return text
@@ -343,13 +368,17 @@ object SpokenText {
             // preceding word is an ordinary one.
             val before = text.substring(0, match.range.first).trimEnd()
             val frame = before.takeLastWhile { it.isLetter() }
+            val label = frame.lowercase()
+            // A lone numeral letter after a label-shaped frame names the item by letter:
+            // `Appendix X` is appendix ex, `Chapter X` is chapter ten.
+            if (token.length == 1 && label in LETTER_LABELS) return@replace token
             // A heading is set in capitals — `CHAPTER VI.` — and the word replacing the
             // numeral has to match it, or the voice's prosody shifts mid-heading. Roman
             // numerals are always capitals, so the case has to be read off the word in
             // front of them, not off the numeral.
             val shout = frame.length > 1 && frame.all { it.isUpperCase() }
             fun say(word: String) = if (shout) word.uppercase() else word
-            when (frame.lowercase()) {
+            when (label) {
                 in DIVISIONS -> say(cardinal(value))
                 in REGNAL -> "the ${ordinal(value)}"
                 else -> token
@@ -439,8 +468,31 @@ object SpokenText {
         "", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
     )
 
-    /** 1–99 as words, hyphenated the way a year is written: `thirty-seven`. */
-    private fun cardinal(value: Int): String = when {
+    /**
+     * 0–9999 in words, hyphenated the way a year is written: `thirty-seven`.
+     *
+     * Anything outside that range is handed over as digits. The tables used to stop at 99
+     * and index off their end for a larger number, which is what a single `Appendix C`
+     * did to the process; digits are wrong in exactly one word, while an exception in a
+     * Compose callback is a crash.
+     */
+    private fun cardinal(value: Int): String {
+        if (value < 0 || value > 9999) return value.toString()
+        if (value < 20) return ONES[value]
+        if (value < 100) return underHundred(value)
+        val thousands = value / 1000
+        val rest = value % 1000
+        val hundreds = rest / 100
+        val tail = rest % 100
+        return listOf(
+            if (thousands > 0) "${ONES[thousands]} thousand" else "",
+            if (hundreds > 0) "${ONES[hundreds]} hundred" else "",
+            if (tail > 0) underHundred(tail) else "",
+        ).filter { it.isNotEmpty() }.joinToString(" ")
+    }
+
+    /** 1–99 as words; the shape the hundreds and the thousands reuse. */
+    private fun underHundred(value: Int): String = when {
         value < 20 -> ONES[value]
         value % 10 == 0 -> TENS[value / 10]
         else -> "${TENS[value / 10]}-${ONES[value % 10]}"
@@ -457,7 +509,29 @@ object SpokenText {
         "seventieth", "eightieth", "ninetieth",
     )
 
-    private fun ordinal(value: Int): String = when {
+    /**
+     * [value] as an ordinal, up to 9999, or as digits outside that range.
+     *
+     * The ordinal table had the same hole as the cardinal one, and the same fallback now
+     * closes it: `Pope XX` used to work and `Pope CC` used to throw.
+     */
+    private fun ordinal(value: Int): String {
+        if (value < 0 || value > 9999) return value.toString()
+        if (value < 20) return ORDINAL_ONES[value]
+        if (value < 100) return underHundredOrdinal(value)
+        val tail = value % 100
+        if (tail == 0) {
+            return when {
+                value % 1000 == 0 -> "${cardinal(value / 1000)} thousandth"
+                value < 1000 -> "${ONES[value / 100]} hundredth"
+                else -> "${cardinal(value - value % 1000)} ${ordinal(value % 1000)}"
+            }
+        }
+        return "${cardinal(value - tail)} ${underHundredOrdinal(tail)}"
+    }
+
+    /** 1–99 in ordinal form: `twenty-first`. */
+    private fun underHundredOrdinal(value: Int): String = when {
         value < 20 -> ORDINAL_ONES[value]
         value % 10 == 0 -> ORDINAL_TENS[value / 10]
         else -> "${TENS[value / 10]}-${ORDINAL_ONES[value % 10]}"

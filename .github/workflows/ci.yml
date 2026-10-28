@@ -1,0 +1,48 @@
+﻿name: CI
+
+# The repository had no CI at all, which is how a lint error that fails the build and a
+# batch of untested fixes can sit on `main` unnoticed. These are the same three commands
+# a release is cut with, minus the signing.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      # The wrapper is committed; the executable bit is not always preserved by a
+      # checkout on a fresh runner.
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Unit tests
+        run: ./gradlew --no-daemon testDebugUnitTest
+
+      - name: Android Lint
+        run: ./gradlew --no-daemon lintDebug
+
+      - name: Assemble debug APK
+        run: ./gradlew --no-daemon assembleDebug
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            app/build/reports/tests/testDebugUnitTest
+            app/build/reports/lint-results-debug.html
+          if-no-files-found: ignore

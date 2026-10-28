@@ -120,9 +120,11 @@ class NeuralTts(private val context: Context) {
      * Bumped by [stop] and by every new [speak], and captured by the job that owns
      * it. A job whose token no longer matches has been superseded and gives up at its
      * next checkpoint, which is what lets a skip cut a sentence short — without a
-     * shared flag that a later utterance could clear by accident.
+     * shared flag that a later utterance could clear by accident. The counter itself is
+     * [RequestGeneration], which is where the rule is written down and tested: a
+     * superseded request is reported as superseded, never as finished.
      */
-    private val generation = AtomicInteger(0)
+    private val generation = RequestGeneration()
 
     /**
      * Bumped whenever the engine or the voice changes.
@@ -161,15 +163,32 @@ class NeuralTts(private val context: Context) {
     @Volatile
     private var prefetched: Clip? = null
 
-    /** Text of the clip currently being generated, so a repeat is not queued twice. */
-    private var prefetchingText: String? = null
+    /**
+     * Text the newest [prefetch] asked for, so a task for anything older gives up at its
+     * entry point instead of synthesising a sentence the reader has already left.
+     */
+    private var prefetchWanted: String? = null
 
-    /** Guards [prefetched] and [prefetchingText], which two threads touch. */
+    /** Guards [prefetched] and [prefetchWanted], which two threads touch. */
     private val prefetchLock = Any()
 
     /** The track currently playing, so [stop] can silence it. */
     @Volatile
     private var track: AudioTrack? = null
+
+    /**
+     * Serialises the two threads that touch the [AudioTrack].
+     *
+     * The playback worker is normally inside a blocking `write`, while [stop] — reached
+     * from every skip, pause and voice change — pauses and flushes the same track from
+     * the caller's thread. `track` is `@Volatile`, which buys visibility and no mutual
+     * exclusion: a flush landing in the middle of a blocking write can make that write
+     * return zero, dropping the rest of the sentence while the utterance is still
+     * reported, and concurrent `pause`/`flush` during a blocking write is not a
+     * documented-safe use of the class. The lock is held for one chunk at a time, so a
+     * skip still silences the audio within tens of milliseconds.
+     */
+    private val trackLock = Any()
 
     /**
      * Loads a voice, or returns the one already loaded.
@@ -304,6 +323,13 @@ class NeuralTts(private val context: Context) {
      * Callbacks arrive on a background thread, so a caller that touches UI must hop
      * to the main thread.
      *
+     * A request replaced before it was heard to its end reports [onSuperseded], not
+     * [onDone]. The two are not interchangeable: the read-aloud queue advances on a
+     * completion, so reporting a superseded request as finished made the queue consume a
+     * completion that belonged to a request it had already replaced — the deterministic
+     * "say this sentence again" that skipped to the next one instead of replaying, and
+     * the loser of two requests for the same next sentence advancing the queue twice.
+     *
      * A clip recorded by [prefetch] is played straight away; without that, the wait
      * between two sentences would be the whole synthesis time.
      */
@@ -313,6 +339,7 @@ class NeuralTts(private val context: Context) {
         rate: Float,
         onStart: () -> Unit,
         onDone: () -> Unit,
+        onSuperseded: () -> Unit,
         onError: () -> Unit,
     ) {
         val engine = engineFor(role) ?: run { onError(); return }
@@ -320,11 +347,11 @@ class NeuralTts(private val context: Context) {
             onDone()
             return
         }
-        val token = generation.incrementAndGet()
+        val token = generation.next()
         val sid = engine.sid
         val engineGen = engineGeneration.get()
         takePrefetched(text, role, rate, sid, engineGen)?.let { clip ->
-            playbackWorker.execute { play(clip, token, onStart, onDone, onError) }
+            playbackWorker.execute { play(clip, token, onStart, onDone, onSuperseded, onError) }
             return
         }
         engineWorker.execute {
@@ -335,14 +362,14 @@ class NeuralTts(private val context: Context) {
             // still be dropped, and without it tapping one word and then another makes
             // the second wait for the first to be built and then thrown away.
             if (stale(token)) {
-                onDone()
+                onSuperseded()
                 return@execute
             }
             // A prefetch for this very sentence may have been queued ahead of this
             // task; the FIFO worker means it has finished by now, so look again
             // before paying for a second synthesis of the same text.
             takePrefetched(text, role, rate, sid, engineGen)?.let { clip ->
-                playbackWorker.execute { play(clip, token, onStart, onDone, onError) }
+                playbackWorker.execute { play(clip, token, onStart, onDone, onSuperseded, onError) }
                 return@execute
             }
             // `release` runs on this same worker, so an engine that is no longer the
@@ -364,7 +391,7 @@ class NeuralTts(private val context: Context) {
                 return@execute
             }
             val clip = Clip(text, role, rate, sid, audio.samples, audio.sampleRate, engineGen)
-            playbackWorker.execute { play(clip, token, onStart, onDone, onError) }
+            playbackWorker.execute { play(clip, token, onStart, onDone, onSuperseded, onError) }
         }
     }
 
@@ -377,9 +404,13 @@ class NeuralTts(private val context: Context) {
      * two sentences as an audible pause.
      *
      * One sentence is held at a time — a novel's paragraph is a handful of sentences,
-     * so a deeper queue would buy nothing and hold megabytes of samples. A request
-     * that arrives while the engine is busy with an earlier one is dropped rather
-     * than queued: the next [speak] will synthesise it if it is still wanted.
+     * so a deeper queue would buy nothing and hold megabytes of samples — and which one
+     * that is, is the *newest* one asked for: a request arriving while the worker is busy
+     * with an earlier text replaces it, and the older task gives up at its entry point
+     * instead of paying for a synthesis nobody will ever hear. [engineWorker] is a single
+     * FIFO thread, so without that a burst of taps put a whole abandoned synthesis — 0.3 s
+     * for a short sentence, over 5 s for a long one — in front of the sentence the reader
+     * was actually waiting for.
      */
     fun prefetch(text: String, role: SpeechRole, rate: Float) {
         val engine = engineFor(role) ?: return
@@ -388,23 +419,27 @@ class NeuralTts(private val context: Context) {
         val engineGen = engineGeneration.get()
         synchronized(prefetchLock) {
             if (prefetched?.matches(text, role, rate, sid, engineGen) == true) return
-            if (prefetchingText == text) return
-            prefetchingText = text
+            if (prefetchWanted == text) return
+            prefetchWanted = text
         }
-        // `prefetchingText` is set before the task is queued, so a rejection — the worker
+        // `prefetchWanted` is set before the task is queued, so a rejection — the worker
         // is shut down once the voice is released — has to clear it. Left set, that text
         // would be refused by the dedupe check above for the rest of the process.
         val queued = runCatching {
             engineWorker.execute {
+                // A newer text is already wanted: this task is ahead of it in the FIFO
+                // queue, and running it would synthesise a sentence the reader has left.
+                val stillWanted = synchronized(prefetchLock) { prefetchWanted == text }
+                if (!stillWanted) return@execute
                 // The engine was replaced while this was queued; generating now would
                 // either use a freed native handle or record a clip for the wrong voice.
                 if (engineGeneration.get() != engineGen || engineFor(role) !== engine) {
-                    synchronized(prefetchLock) { if (prefetchingText == text) prefetchingText = null }
+                    synchronized(prefetchLock) { if (prefetchWanted == text) prefetchWanted = null }
                     return@execute
                 }
                 val audio = runCatching { engine.tts.generate(text = text, sid = sid, speed = rate) }.getOrNull()
                 synchronized(prefetchLock) {
-                    if (prefetchingText == text) prefetchingText = null
+                    if (prefetchWanted == text) prefetchWanted = null
                     val samples = audio?.samples
                     // A clip nobody asked for is harmless — `speak` only takes the one
                     // whose text and voice match — so no utterance token is checked here.
@@ -417,7 +452,7 @@ class NeuralTts(private val context: Context) {
             }
         }
         if (queued.isFailure) {
-            synchronized(prefetchLock) { if (prefetchingText == text) prefetchingText = null }
+            synchronized(prefetchLock) { if (prefetchWanted == text) prefetchWanted = null }
         }
     }
 
@@ -446,14 +481,15 @@ class NeuralTts(private val context: Context) {
         token: Int,
         onStart: () -> Unit,
         onDone: () -> Unit,
+        onSuperseded: () -> Unit,
         onError: () -> Unit,
     ) {
         // Superseded before a single sample played: this is a skip, not a failure.
         // Reporting it as one stopped playback outright, because the reader treats a
         // failure as "the voice is gone" while a skip is just the next sentence
-        // arriving first.
+        // arriving first. It is not a completion either — see [onSuperseded].
         if (stale(token)) {
-            onDone()
+            onSuperseded()
             return
         }
         var output: AudioTrack? = null
@@ -463,20 +499,30 @@ class NeuralTts(private val context: Context) {
             output.play()
             onStart()
             writeInChunks(output, clip.samples, token)
-            if (!stale(token)) waitForDrain(output)
-            // Reported as finished either way. A superseded utterance is not a
-            // failure — the reader's `Finished` handler already ignores an id it has
-            // moved past, while its `Failed` handler stops listening altogether, so
-            // calling `onError` here is what made a sentence skip kill playback.
-            onDone()
+            if (stale(token)) {
+                // Cut off mid-sentence by a newer request or by a stop. The sentence was
+                // not heard to its end, so it is reported as superseded: the queue's
+                // `Finished` handler consumes a completion, and letting this one through
+                // under the id the queue was waiting for is exactly how a superseded
+                // request advanced the queue.
+                onSuperseded()
+            } else {
+                waitForDrain(output)
+                onDone()
+            }
         } catch (error: Throwable) {
             Log.w(TAG, "playback failed", error)
             onError()
         } finally {
-            if (track === output) track = null
-            runCatching { output?.pause() }
-            runCatching { output?.flush() }
-            runCatching { output?.release() }
+            // Under the same lock as the write loop and [stop]: pausing or releasing a
+            // track another thread is inside a blocking `write` on is not a
+            // documented-safe use of AudioTrack.
+            synchronized(trackLock) {
+                if (track === output) track = null
+                runCatching { output?.pause() }
+                runCatching { output?.flush() }
+                runCatching { output?.release() }
+            }
         }
     }
 
@@ -487,12 +533,16 @@ class NeuralTts(private val context: Context) {
      * this cannot free memory a worker is still using.
      */
     fun stop() {
-        generation.incrementAndGet()
+        generation.supersede()
         // Pause and flush rather than release: the playback worker owns the track and
         // releases it, so releasing here would leave that thread writing to a freed
-        // handle.
-        runCatching { track?.pause() }
-        runCatching { track?.flush() }
+        // handle. The lock is what keeps the flush from landing inside the worker's
+        // blocking write; releasing the lock on the caller's thread is what keeps this
+        // from being a foreign thread driving the track.
+        synchronized(trackLock) {
+            runCatching { track?.pause() }
+            runCatching { track?.flush() }
+        }
         // A held clip belongs to the utterance just abandoned; keeping it would play
         // the wrong sentence if the reader resumes on the same text.
         synchronized(prefetchLock) { prefetched = null }
@@ -540,7 +590,7 @@ class NeuralTts(private val context: Context) {
     }
 
     /** True once this utterance has been superseded by a stop or a newer one. */
-    private fun stale(token: Int): Boolean = generation.get() != token
+    private fun stale(token: Int): Boolean = generation.isStale(token)
 
     private fun openTrack(sampleRate: Int): AudioTrack {
         val rate = sampleRate.takeIf { it > 0 } ?: DEFAULT_SAMPLE_RATE
@@ -592,7 +642,12 @@ class NeuralTts(private val context: Context) {
         var offset = 0
         while (offset < samples.size && !stale(token)) {
             val count = minOf(CHUNK_SAMPLES, samples.size - offset)
-            val written = output.write(samples, offset, count, AudioTrack.WRITE_BLOCKING)
+            // Under [trackLock]: [stop] pauses and flushes the same track from the
+            // caller's thread, and a flush landing inside this blocking write can make it
+            // return zero, which ends the loop with the rest of the sentence unplayed.
+            val written = synchronized(trackLock) {
+                output.write(samples, offset, count, AudioTrack.WRITE_BLOCKING)
+            }
             if (written <= 0) return
             offset += written
         }
@@ -611,7 +666,11 @@ class NeuralTts(private val context: Context) {
         // One buffer of silence goes in after the speech; once the playback head has
         // crossed it, everything before it has been heard.
         val target = output.playbackHeadPosition + frames
-        runCatching { output.write(FloatArray(frames), 0, frames, AudioTrack.WRITE_BLOCKING) }
+        runCatching {
+            synchronized(trackLock) {
+                output.write(FloatArray(frames), 0, frames, AudioTrack.WRITE_BLOCKING)
+            }
+        }
         val deadline = System.currentTimeMillis() + DRAIN_TIMEOUT_MS
         while (System.currentTimeMillis() < deadline) {
             if (output.playbackHeadPosition >= target) return

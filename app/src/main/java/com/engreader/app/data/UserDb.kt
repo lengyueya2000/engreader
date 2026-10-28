@@ -14,6 +14,18 @@ import android.database.sqlite.SQLiteOpenHelper
  */
 class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) {
 
+    init {
+        // Write-ahead logging, so a read — the home list, the stats screen, the reader's
+        // own `addReadSeconds` write — is not queued behind the single write lock a book
+        // import or a restore holds for its whole transaction. Set on the helper rather
+        // than on a connection, because it has to be in place before the first open.
+        //
+        // `onConfigure` still enables foreign keys; no table declares a `FOREIGN KEY`
+        // yet, so that call enforces nothing today and the aggregate queries filter
+        // orphan rows themselves.
+        setWriteAheadLoggingEnabled(true)
+    }
+
     override fun onConfigure(db: SQLiteDatabase) {
         db.setForeignKeyConstraintsEnabled(true)
     }
@@ -273,17 +285,23 @@ class UserDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VERSION) 
      * already runs the upgrade in a transaction, and the work is one pass over the
      * stored bodies on a database the repositories only touch from a background
      * dispatcher.
+     *
+     * Streamed one body at a time: collecting every `(id, body)` pair first put the
+     * whole library in the heap, and an OOM inside the upgrade transaction rolls the
+     * upgrade back — `user_version` stays old, every later attempt re-materialises the
+     * bodies, and the build that expects the v7 schema cannot use its own database. The
+     * statement is closed too; leaving it open leaked one per attempt.
      */
     private fun backfillWordCounts(db: SQLiteDatabase) {
-        val rows = mutableListOf<Pair<Long, String>>()
-        db.rawQuery("SELECT id, body FROM article", null).use { c ->
-            while (c.moveToNext()) rows += c.getLong(0) to c.getString(1).orEmpty()
-        }
-        val update = db.compileStatement("UPDATE article SET wordCount = ? WHERE id = ?")
-        rows.forEach { (id, body) ->
-            update.bindLong(1, com.engreader.app.nlp.Tokenizer.countWords(body).toLong())
-            update.bindLong(2, id)
-            update.executeUpdateDelete()
+        db.compileStatement("UPDATE article SET wordCount = ? WHERE id = ?").use { update ->
+            db.rawQuery("SELECT id, body FROM article", null).use { c ->
+                while (c.moveToNext()) {
+                    val words = com.engreader.app.nlp.Tokenizer.countWords(c.getString(1).orEmpty())
+                    update.bindLong(1, words.toLong())
+                    update.bindLong(2, c.getLong(0))
+                    update.executeUpdateDelete()
+                }
+            }
         }
     }
 

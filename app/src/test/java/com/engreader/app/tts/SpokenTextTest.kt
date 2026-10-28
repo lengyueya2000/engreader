@@ -242,6 +242,56 @@ class SpokenTextTest {
     }
 
     @Test
+    fun `a letter-numbered division is neither a crash nor a number`() {
+        // The number tables stopped at 99, so a single `C`, `D` or `M` in a division frame
+        // was read as 100, 500 or 1000 and indexed off the end of them —
+        // `ArrayIndexOutOfBoundsException` from `spellRomanNumerals`, through
+        // `Speaker.spoken`, into the Compose click handler that started the reading. All
+        // eight shapes below were measured as crashes against the 1.7.4 classes, and all
+        // eight are common in textbooks, papers and non-fiction: the letter is a label and
+        // must survive as one.
+        for (text in listOf(
+            "See Appendix C for details.",
+            "Appendix C",
+            "Section D covers it.",
+            "Figure C shows the result.",
+            "Chapter M is long.",
+            "Part C of the book.",
+            "Table D lists it.",
+            "The letter C is third.",
+        )) {
+            assertEquals(text, SpokenText.of(text))
+        }
+    }
+
+    @Test
+    fun `a lone numeral letter in a label frame is a label`() {
+        // `Appendix X` came back as "Appendix ten" and `The letter X marks the spot` as
+        // "the letter ten": a lone numeral letter where the writer labelled an item with a
+        // letter. `chapter X` stays chapter ten — see the cardinal test above — because a
+        // chapter really is numbered.
+        assertEquals("Appendix X", SpokenText.of("Appendix X"))
+        assertEquals(
+            "The letter X marks the spot.",
+            SpokenText.of("The letter X marks the spot."),
+        )
+        assertEquals("Figure X is overleaf.", SpokenText.of("Figure X is overleaf."))
+    }
+
+    @Test
+    fun `a numeral over a hundred is spelled out rather than thrown`() {
+        // The other half of the same defect: `Chapter XL` (forty) worked, `Chapter CD`
+        // (four hundred) and `Volume MM` (two thousand) did not, because the tables had no
+        // words above ninety-nine. A longer numeral still counts, even where a lone letter
+        // is a label.
+        assertEquals("Chapter forty of it", SpokenText.of("Chapter XL of it"))
+        assertEquals("Volume four hundred", SpokenText.of("Volume CD"))
+        assertEquals("Volume two thousand", SpokenText.of("Volume MM"))
+        // The ordinal table had the same hole: `Pope XX` worked, `Pope CC` threw.
+        assertEquals("Pope the two hundredth reigned.", SpokenText.of("Pope CC reigned."))
+    }
+
+    @Test
     fun `no rewrite invents or loses words`() {
         // The voice must never be handed a sentence that says something the page does
         // not. Every case is a rewrite of markup or of a numeral, so the alphabetic

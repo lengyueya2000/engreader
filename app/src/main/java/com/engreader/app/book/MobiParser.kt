@@ -125,15 +125,25 @@ object MobiParser {
         for (i in textStart until textStart + recordCount) {
             // Every record's expansion is bounded by what is left of the ceiling, so a
             // file whose records each claim to expand enormously is refused rather than
-            // accumulated until the process dies.
+            // accumulated until the process dies. The budget is passed to each decoder,
+            // not just consulted here: the check sees only the total *before* a record,
+            // so the last record used to sail past MAX_TEXT_LENGTH on its own (a 15 MB
+            // PalmDOC record measured 76 MB of text against a 64 MB ceiling).
             val remaining = MAX_TEXT_LENGTH - text.size()
             if (remaining <= 0) throw BookFormat.Companion.Unsupported("MOBI 的正文过大")
             val raw = records.getOrNull(i) ?: break
             val trimmed = trimTrailingEntries(raw, extraFlags)
             val expanded = when {
                 huffman != null -> huffman.decode(trimmed, remaining)
-                compression == COMPRESSION_PALMDOC -> palmDoc(trimmed)
-                compression == COMPRESSION_NONE -> trimmed
+                compression == COMPRESSION_PALMDOC -> palmDoc(trimmed, remaining)
+                compression == COMPRESSION_NONE -> {
+                    // Counted too: one record is as large as the file makes it, and the
+                    // check at the top of the loop cannot see inside the record.
+                    if (trimmed.size > remaining) {
+                        throw BookFormat.Companion.Unsupported("MOBI 的正文过大")
+                    }
+                    trimmed
+                }
                 else -> throw BookFormat.Companion.Unsupported("不支持的压缩方式（$compression）")
             }
             text.write(expanded)
@@ -165,8 +175,11 @@ object MobiParser {
     /** The PDB directory as a list of record slices. */
     private fun splitRecords(bytes: ByteArray): List<ByteArray> {
         if (bytes.size < PDB_HEADER_LENGTH) return emptyList()
+        // The count is a 16-bit field, so 65 535 records is the format's own ceiling and
+        // the per-entry bounds check inside the loop is what actually protects the read.
+        // A separate `MAX_RECORDS = 100_000` constant here could never fire.
         val count = readShort(bytes, PDB_RECORD_COUNT_OFFSET)
-        if (count <= 0 || count > MAX_RECORDS) return emptyList()
+        if (count <= 0) return emptyList()
         val starts = IntArray(count + 1)
         for (i in 0 until count) {
             val at = PDB_HEADER_LENGTH + i * 8
@@ -222,8 +235,14 @@ object MobiParser {
     private fun readExth(header: ByteArray, mobiHeaderLength: Int): Map<Int, ByteArray> {
         val flags = readInt(header, MOBI_EXTH_FLAGS)
         if (flags and 0x40 == 0) return emptyMap()
-        var at = PALMDOC_HEADER_LENGTH + mobiHeaderLength
-        if (at + 12 > header.size) return emptyMap()
+        // The sum is computed in 64 bits, the way `fullName` checks its own offsets:
+        // `16 + mobiHeaderLength` in `Int` is negative for every field below -16 and
+        // wraps to Int.MIN_VALUE for a large positive one, and `at + 12 > header.size`
+        // cannot see either — `String(header, at, 4, …)` then threw
+        // `StringIndexOutOfBoundsException` on a file whose text was never even read.
+        val start = PALMDOC_HEADER_LENGTH.toLong() + mobiHeaderLength
+        if (start < 0 || start + 12 > header.size) return emptyMap()
+        var at = start.toInt()
         if (String(header, at, 4, Charsets.US_ASCII) != EXTH_MAGIC) return emptyMap()
         val length = readInt(header, at + 4)
         val count = readInt(header, at + 8)
@@ -288,26 +307,46 @@ object MobiParser {
      * followed by the byte with its top bit cleared. A back-reference is a big-endian
      * 16-bit value holding an 11-bit distance and a 3-bit length minus three, and it
      * may overlap the output cursor, so it has to be copied one byte at a time.
+     *
+     * [budget] is the ceiling the caller has left. A back-reference is two bytes that
+     * emit up to ten, so the format's own 5× expansion is enough to push a book's text
+     * past `MAX_TEXT_LENGTH` from records that look modest on disk — a 15 MB record
+     * measured 76 MB of text against a 64 MB ceiling. Passing the ceiling in is what
+     * makes the caller's "bounded expansion" comment true; it used to be consulted only
+     * before each record was decoded.
      */
-    private fun palmDoc(data: ByteArray): ByteArray {
+    internal fun palmDoc(data: ByteArray, budget: Int): ByteArray {
         // A plain growable array rather than a stream: back-references are resolved by
         // index, and reading an element back out of a stream would mean copying the
-        // whole buffer on every byte of every match.
-        var out = ByteArray((data.size * 3).coerceAtLeast(64))
+        // whole buffer on every byte of every match. The arithmetic is 64-bit so a
+        // multi-hundred-MB record cannot wrap `data.size * 3` or `out.size * 2` into a
+        // smaller, or negative, size.
+        var out = ByteArray(minOf(data.size.toLong() * 3, budget.toLong()).coerceAtLeast(64L).toInt())
         var length = 0
         var p = 0
+
+        fun grow(needed: Int) {
+            if (length + needed > budget) throw BookFormat.Companion.Unsupported("MOBI 的正文过大")
+            if (length + needed > out.size) {
+                val wanted = length.toLong() + needed
+                var grown = out.size.toLong() * 2
+                if (grown < wanted) grown = wanted
+                out = out.copyOf(minOf(grown, budget.toLong()).toInt())
+            }
+        }
+
         while (p < data.size) {
             val c = data[p++].toInt() and 0xFF
             when {
                 c in 1..8 -> {
                     val end = (p + c).coerceAtMost(data.size)
-                    if (length + (end - p) > out.size) out = out.copyOf((out.size * 2).coerceAtLeast(length + end - p))
+                    grow(end - p)
                     System.arraycopy(data, p, out, length, end - p)
                     length += end - p
                     p = end
                 }
                 c < 0x80 -> {
-                    if (length + 1 > out.size) out = out.copyOf(out.size * 2)
+                    grow(1)
                     out[length++] = c.toByte()
                 }
                 c < 0xC0 -> {
@@ -316,7 +355,7 @@ object MobiParser {
                     val distance = (pair shr 3) and 0x07FF
                     val run = (pair and 0x07) + 3
                     if (distance <= 0 || distance > length) break
-                    if (length + run > out.size) out = out.copyOf((out.size * 2).coerceAtLeast(length + run))
+                    grow(run)
                     // Byte at a time: a match may overlap the output cursor, so the
                     // bytes being copied can include ones this loop just wrote.
                     repeat(run) {
@@ -325,13 +364,14 @@ object MobiParser {
                     }
                 }
                 else -> {
-                    if (length + 2 > out.size) out = out.copyOf(out.size * 2)
+                    grow(2)
                     out[length++] = ' '.code.toByte()
                     out[length++] = (c xor 0x80).toByte()
                 }
             }
         }
-        return out.copyOf(length)
+        // Returned as it is when it is already exact, so a full buffer is not copied.
+        return if (length == out.size) out else out.copyOf(length)
     }
 
     /**
@@ -458,15 +498,17 @@ object MobiParser {
                 if (length == 0) break
                 var max = dict1[code ushr 24]
                 if (!terms[code ushr 24]) {
+                    // The loop cannot leave `length` above 32 (`length < 32` is its own
+                    // bound, and `minCode` has 33 entries), so there is no check for it.
                     while (length < 32 && code < minCode[length]) length++
-                    if (length > 32) break
                     max = maxCode[length]
                 }
                 available -= length
                 bitsLeft -= length
                 if (bitsLeft < 0) break
+                // `ushr` cannot produce a negative value, so only the upper bound is real.
                 val index = (max - code) ushr (32 - length)
-                if (index < 0 || index >= phrases.size) break
+                if (index >= phrases.size) break
                 val (bytes, plain) = phrases[index]
                 // Every code costs at least one bit and may write a 32 KB phrase, so a
                 // crafted record can claim gigabytes out of a few kilobytes of input.
@@ -516,7 +558,9 @@ object MobiParser {
         val fdst = records[index]
         if (fdst.size < 20 || String(fdst, 0, 4, Charsets.US_ASCII) != "FDST") return text
         val pieces = readInt(fdst, 8)
-        if (pieces <= 1 || fdst.size < 12 + pieces * 8) return text
+        // In `Long`: `12 + pieces * 8` wraps negative for a piece count above 2^28, and
+        // the guard then passes instead of rejecting the malformed record.
+        if (pieces <= 1 || fdst.size.toLong() < 12L + pieces * 8L) return text
         val start = readInt(fdst, 12)
         val end = readInt(fdst, 16)
         if (start < 0 || end <= start || end > text.size) return text
@@ -570,7 +614,11 @@ object MobiParser {
      * extracted, so no text is lost between the markers.
      */
     private fun splitChapters(markup: String): List<EpubParser.Chapter> {
-        val byBreak = Regex("(?i)<\\s*/?\\s*mbp:pagebreak[^>]*>").split(markup)
+        // Bounded: a crafted file with a million `<mbp:pagebreak>` markers produced a
+        // million pieces and extracted every one of them before the forty-word filter
+        // ran, which is tens of megabytes of heap per megabyte of input. The tail of
+        // the document stays in the last piece, so no text is dropped.
+        val byBreak = PAGEBREAK.split(markup, MAX_CHAPTERS)
         // Each piece is extracted once and the decision is made on the result.
         // Counting the words first and extracting again for real converted every
         // chapter of the book twice, which is the expensive half of an import.
@@ -594,16 +642,26 @@ object MobiParser {
     }
 
     private fun splitOnHeadings(markup: String): List<String> {
-        val headings = Regex("(?is)<h([12])\\b[^>]*>").findAll(markup).map { it.range.first }.toList()
+        // Bounded like the pagebreak split: the scan stops at the cap and the last slice
+        // runs to the end of the markup.
+        val headings = ArrayList<Int>()
+        for (match in HEADING.findAll(markup)) {
+            if (headings.size > MAX_CHAPTERS) break
+            headings.add(match.range.first)
+        }
         if (headings.size < 2) return listOf(markup)
-        val out = mutableListOf<String>()
+        val out = ArrayList<String>(headings.size + 1)
         if (headings.first() > 0) out += markup.substring(0, headings.first())
         headings.forEachIndexed { index, at ->
-            val end = headings.getOrNull(index + 1) ?: markup.length
+            val end = if (index == headings.lastIndex) markup.length else headings[index + 1]
             out += markup.substring(at, end)
         }
         return out
     }
+
+    private val PAGEBREAK = Regex("(?i)<\\s*/?\\s*mbp:pagebreak[^>]*>")
+
+    private val HEADING = Regex("(?is)<h([12])\\b[^>]*>")
 
     // ---------------------------------------------------------------- cover
 
@@ -681,11 +739,17 @@ object MobiParser {
         }
     }
 
-    /** A record count above this is a corrupt directory, not a book. */
-    private const val MAX_RECORDS = 100_000
-
     /** How deep a compressed phrase may nest before the table is treated as broken. */
     private const val MAX_PHRASE_DEPTH = 20
+
+    /**
+     * Most chapters one file may be cut into.
+     *
+     * No real book has four thousand chapters, and the chapter count is what the
+     * split's memory amplification is proportional to, so both the pagebreak and the
+     * heading split stop here.
+     */
+    private const val MAX_CHAPTERS = 4_000
 
     /** One phrase per code is the format's own ceiling, so 2^16 is the most a real table holds. */
     private const val MAX_PHRASES = 1 shl 16

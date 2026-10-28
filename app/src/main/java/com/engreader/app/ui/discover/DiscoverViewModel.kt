@@ -21,6 +21,8 @@ data class DiscoverState(
     val sourceFilter: String? = null,
     val openingUrl: String? = null,
     val message: String? = null,
+    /** True while the bundled public-domain pack is being read and stored. */
+    val loadingOffline: Boolean = false,
 )
 
 /**
@@ -104,6 +106,11 @@ class DiscoverViewModel(private val container: AppContainer) : ViewModel() {
             state = state.copy(openingUrl = null)
             article.id
         } catch (e: CancellationException) {
+            // The coroutine was cancelled — the reader left the tab mid-fetch. Clear the
+            // marker before rethrowing: this ViewModel is activity-scoped, so it outlives
+            // the composition, and a marker left behind pins that headline on
+            // "正在抓取全文…" with `clickable(enabled = !opening)`, i.e. permanently dead.
+            state = state.copy(openingUrl = null)
             throw e
         } catch (e: Exception) {
             state = state.copy(openingUrl = null, message = "这篇没能抓取成功：${e.message ?: "未知错误"}")
@@ -111,19 +118,54 @@ class DiscoverViewModel(private val container: AppContainer) : ViewModel() {
         }
     }
 
-    suspend fun loadOfflineLibrary(): Int = withContext(Dispatchers.IO) {
-        val seeds = container.seedLibrary.load()
-        var added = 0
-        seeds.forEach { seed ->
-            val existing = container.articles.findByUrl(seed.item.url)
-            if (existing == null) {
-                runCatching {
-                    container.articles.save(seed.item, seed.extracted)
-                    container.articles.seedTranslation(seed.item.url, seed.translation)
-                }.onSuccess { added++ }
+    /**
+     * Installs the bundled public-domain passages, reporting the outcome through
+     * `state.message`.
+     *
+     * The count used to be returned to a caller that dropped it: the row looked identical
+     * before and after the tap, so the only reasonable reading was "it did nothing" and
+     * the reader tapped again — re-reading and re-parsing all eight seeds each time.
+     */
+    suspend fun loadOfflineLibrary() {
+        if (state.loadingOffline) return
+        state = state.copy(loadingOffline = true, message = null)
+        try {
+            val (added, failed) = withContext(Dispatchers.IO) {
+                val seeds = container.seedLibrary.load()
+                var added = 0
+                var failed = 0
+                seeds.forEach { seed ->
+                    val existing = container.articles.findByUrl(seed.item.url)
+                    if (existing == null) {
+                        // `onFailure` was missing, so a seed that could not be stored was
+                        // folded into "not added" and reported as nothing at all.
+                        runCatching {
+                            container.articles.save(seed.item, seed.extracted)
+                            container.articles.seedTranslation(seed.item.url, seed.translation)
+                        }.onSuccess { added++ }.onFailure { failed++ }
+                    }
+                }
+                added to failed
             }
+            state = state.copy(
+                loadingOffline = false,
+                message = when {
+                    failed > 0 -> "载入完成：新增 $added 篇，$failed 篇失败"
+                    added > 0 -> "已载入 $added 篇短文"
+                    else -> "离线短文都已经载入过了"
+                },
+            )
+        } catch (e: CancellationException) {
+            state = state.copy(loadingOffline = false)
+            throw e
+        } catch (e: Throwable) {
+            // Including `SeedLibrary.load` itself: without this the busy flag would stay
+            // on and the button would be dead until the process restarted.
+            state = state.copy(
+                loadingOffline = false,
+                message = "离线短文载入失败：${e.message ?: "未知错误"}",
+            )
         }
-        added
     }
 
     fun consumeMessage() {

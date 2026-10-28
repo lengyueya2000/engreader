@@ -206,7 +206,9 @@ fun DiscoverScreen(onOpenArticle: (Long) -> Unit) {
                 }
                 item {
                     Spacer(Modifier.height(20.dp))
-                    OfflinePackRow { scope.launch { viewModel.loadOfflineLibrary() } }
+                    OfflinePackRow(loading = state.loadingOffline) {
+                        scope.launch { viewModel.loadOfflineLibrary() }
+                    }
                 }
             }
         }
@@ -296,7 +298,7 @@ private fun FeedRow(item: FeedItem, opening: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-private fun OfflinePackRow(onLoad: () -> Unit) {
+private fun OfflinePackRow(loading: Boolean, onLoad: () -> Unit) {
     Row(
         Modifier
             .padding(horizontal = 20.dp)
@@ -325,7 +327,9 @@ private fun OfflinePackRow(onLoad: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        TextButton(onClick = onLoad) { Text("载入") }
+        TextButton(onClick = onLoad, enabled = !loading) {
+            Text(if (loading) "载入中…" else "载入")
+        }
     }
 }
 

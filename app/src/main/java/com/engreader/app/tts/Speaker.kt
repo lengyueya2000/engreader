@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /** Which engine is actually producing the voice. */
 enum class SpeechBackend {
@@ -60,8 +61,16 @@ class Speaker(private val context: Context) {
 
     private val neural = NeuralTts(context)
 
-    /** Bumped on every [prepare]; a load whose generation is stale is discarded. */
-    @Volatile private var loadGeneration = 0
+    /**
+     * Bumped on every [prepare]; a load whose generation is stale is discarded.
+     *
+     * Atomic rather than a plain `@Volatile Int`: `prepare` runs from the main thread
+     * (the settings picker, the reader's own prep) *and* from `Dispatchers.Default`
+     * (a chapter rolling into the next one), and `++` is a read and a write, so two loads
+     * could capture the same value and both pass the staleness check — leaving the app
+     * reporting one voice as active while synthesising with another.
+     */
+    private val loadGeneration = AtomicInteger(0)
 
     /** The voice the in-flight load is for, so a repeat request is not a reload. */
     @Volatile private var loadingVoiceId: String? = null
@@ -158,14 +167,14 @@ class Speaker(private val context: Context) {
         }
         // Already loading this exact voice: the in-flight load will finish it.
         if (_state.value == SpeechState.Preparing && loadingVoiceId == voice.id) return
-        val generation = ++loadGeneration
+        val generation = loadGeneration.incrementAndGet()
         loadingVoiceId = voice.id
         _state.value = SpeechState.Preparing
         scope.launch(Dispatchers.Default) {
             val loaded = neural.prepare(localeTag, voiceId)
             scope.launch {
                 // A newer request superseded this one while the model was loading.
-                if (generation != loadGeneration || closed) return@launch
+                if (generation != loadGeneration.get() || closed) return@launch
                 loadingVoiceId = null
                 if (loaded) {
                     _backend.value = SpeechBackend.Bundled
@@ -272,6 +281,15 @@ class Speaker(private val context: Context) {
             // with the button still reading "pause" and no sound. Reporting the failure
             // is what lets the queue stop and say so.
             onUnavailable = { emit(SpeechEvent.Failed(utteranceId)) },
+            // The voice was replaced under the request — picking another accent or voice
+            // calls `stop`, which no queue path knows about — so this request was thrown
+            // away while it waited and nothing will ever report its id. Left silent the
+            // session sat on a highlighted sentence with no audio and no event for good.
+            // `Abandoned` rather than `Failed`: the voice is not gone, this one request is.
+            onDropped = {
+                Log.w(TAG, "utterance abandoned while the voice was loading: $utteranceId")
+                emit(SpeechEvent.Abandoned(utteranceId))
+            },
         )
     }
 
@@ -314,6 +332,14 @@ class Speaker(private val context: Context) {
                 rate = rate,
                 onStart = { scope.launch { _speaking.value = true } },
                 onDone = { emit(SpeechEvent.Finished(utteranceId)) },
+                // A newer request replaced this one before it was heard to its end — a
+                // skip, a replay of the same sentence, or a stop. It must not be reported
+                // as finished: the queue advances on that report, and the report used to
+                // carry only the sentence index, so the replaced request's completion
+                // arrived under the id the queue was waiting for and advanced it. The id
+                // now carries the request serial, and this is the honest report for a
+                // request the voice let go of.
+                onSuperseded = { emit(SpeechEvent.Abandoned(utteranceId)) },
                 // A failure of the Chinese half is reported as finished, not failed.
                 // The reader treats `Failed` as "the voice is gone" and stops the whole
                 // read-aloud, which is right for the English voice and wrong for an
@@ -333,9 +359,24 @@ class Speaker(private val context: Context) {
         }
     }
 
-    /** What the voice is handed: the spoken form for English, the line itself for Chinese. */
-    private fun spoken(text: String, role: SpeechRole): String =
-        if (role == SpeechRole.Translation) text else SpokenText.of(text)
+    /**
+     * What the voice is handed: the spoken form for English, the line itself for Chinese.
+     *
+     * The rewrite of untrusted book text is done behind `runCatching`, and this is the
+     * last point where that can be done at all: when the voice is already up, `onReady` is
+     * called inline (see [whenVoiceReady]), so an exception raised here travels straight
+     * back into the Compose click handler that asked to speak — an uncaught exception on
+     * the main thread, which takes the process down. The defect that made this necessary
+     * is fixed in [SpokenText]; a book is untrusted input all the same, and the sentence
+     * as written beats both a crash and silence.
+     */
+    private fun spoken(text: String, role: SpeechRole): String {
+        if (role == SpeechRole.Translation) return text
+        return runCatching { SpokenText.of(text) }.getOrElse { error ->
+            Log.w(TAG, "could not rewrite the sentence for the voice; reading it as written", error)
+            text
+        }
+    }
 
     /**
      * Speaks a sample so the reader can hear a voice before committing to it.
@@ -360,6 +401,9 @@ class Speaker(private val context: Context) {
                 rate = rate,
                 onStart = {},
                 onDone = { oneShot = false },
+                // A one-shot that was replaced before it sounded has nothing to report,
+                // but it still owns the flag that kept the queue from prefetching.
+                onSuperseded = { oneShot = false },
                 onError = { oneShot = false },
             )
         } else {
@@ -411,6 +455,9 @@ class Speaker(private val context: Context) {
                 rate = rate,
                 onStart = {},
                 onDone = { oneShot = false },
+                // A one-shot that was replaced before it sounded has nothing to report,
+                // but it still owns the flag that kept the queue from prefetching.
+                onSuperseded = { oneShot = false },
                 onError = { oneShot = false },
             )
         } else {
@@ -422,7 +469,9 @@ class Speaker(private val context: Context) {
     }
 
     /**
-     * Runs [onReady] once the voice can actually speak, or [onUnavailable] when it cannot.
+     * Runs [onReady] once the voice can actually speak, [onUnavailable] when it cannot,
+     * or [onDropped] when the reader asked for quiet — or the voice was replaced — while
+     * the request was still waiting.
      *
      * The decision itself lives in [awaitVoiceThen], which is where the reasoning is;
      * this only arranges for it to happen on the speaker's own scope and hands back the
@@ -430,7 +479,11 @@ class Speaker(private val context: Context) {
      *
      * @return the job doing the waiting, when there is one, so a one-shot can replace it.
      */
-    private fun whenVoiceReady(onReady: () -> Unit, onUnavailable: () -> Unit): Job? {
+    private fun whenVoiceReady(
+        onReady: () -> Unit,
+        onUnavailable: () -> Unit,
+        onDropped: () -> Unit = {},
+    ): Job? {
         // No voice was ever asked for, so there is no load to wait on and nothing to
         // report a failure about: the request to speak is itself the first thing to ask
         // for one. Reporting `Failed` here is what turned a speak that arrived before any
@@ -457,13 +510,14 @@ class Speaker(private val context: Context) {
             when (awaitVoiceThen(state, READY_WAIT_MS, generation, { stopGeneration })) {
                 VoiceOutcome.Ready -> onReady()
                 VoiceOutcome.Unavailable -> onUnavailable()
-                // Dropped without a word: the queue reads `Failed` as "the voice is
-                // gone" and tears the session down, so reporting a pause would kill a
-                // session that had already moved on to a newer sentence. Nothing is left
-                // waiting either — `stop` is only reached from the queue's own pause,
-                // stop and piece-change, all of which issue a fresh speak or are done
-                // with the queue.
-                VoiceOutcome.Dropped -> Unit
+                // The reader asked for quiet while the model was loading, or a voice
+                // change stopped the speaker under the request. Reporting `Failed` would
+                // tear a session down that is playing fine, so the request is reported as
+                // abandoned instead — the caller decides what to do about it, and the
+                // queue's answer is to ask for its sentence again. Staying silent was the
+                // third option and the worst one: the session waited on an utterance
+                // nobody would ever report, indefinitely.
+                VoiceOutcome.Dropped -> onDropped()
             }
         }
     }
@@ -492,7 +546,7 @@ class Speaker(private val context: Context) {
     fun shutdown() {
         if (closed) return
         closed = true
-        loadGeneration++
+        loadGeneration.incrementAndGet()
         stop()
         job.cancel()
         neural.shutdown()

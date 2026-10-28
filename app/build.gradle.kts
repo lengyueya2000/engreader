@@ -7,16 +7,38 @@ plugins {
 import java.util.Properties
 
 /**
- * Release signing, read from `keystore.properties` when it is present.
+ * Release signing, read from `keystore.properties`.
  *
- * The file is git-ignored, so a fresh clone still builds: without it the release
- * APK is produced unsigned instead of failing the build.
+ * The file is git-ignored, so a fresh clone has none. Asking for a *release* artifact
+ * without it used to exit 0 and leave `app-release-unsigned.apk` behind — an APK that
+ * cannot be installed — which a release script would then publish. That is an error
+ * now; `-Pengreader.allowUnsignedRelease=true` restores the old behaviour for the rare
+ * case of wanting to inspect an unsigned release build.
  */
 val keystoreProperties = Properties().apply {
     val file = rootProject.file("keystore.properties")
     if (file.exists()) file.inputStream().use { load(it) }
 }
-val hasReleaseSigning = keystoreProperties.getProperty("storeFile") != null
+val requiredSigningKeys = listOf("storeFile", "storePassword", "keyAlias", "keyPassword")
+val missingSigningKeys = requiredSigningKeys.filter { keystoreProperties.getProperty(it).isNullOrBlank() }
+val hasReleaseSigning = missingSigningKeys.isEmpty()
+val signingStoreFile = keystoreProperties.getProperty("storeFile")
+    ?.takeIf { it.isNotBlank() }
+    ?.let { rootProject.file(it) }
+
+// Checked while the build is being configured, not in `packageRelease`: a partial
+// `keystore.properties` used to fail after the whole release compilation had run.
+val releaseRequested = gradle.startParameter.taskNames.any { it.contains("Release", ignoreCase = true) }
+val unsignedReleaseAllowed = providers.gradleProperty("engreader.allowUnsignedRelease").isPresent
+if (releaseRequested && !hasReleaseSigning && !unsignedReleaseAllowed) {
+    error(
+        "keystore.properties is missing or incomplete (missing: ${missingSigningKeys.joinToString()}); " +
+            "a release APK must be signed. Pass -Pengreader.allowUnsignedRelease=true to build one anyway.",
+    )
+}
+if (releaseRequested && signingStoreFile != null && !signingStoreFile.exists()) {
+    error("keystore.properties names a storeFile that does not exist: ${signingStoreFile.path}")
+}
 
 android {
     namespace = "com.engreader.app"
@@ -57,6 +79,11 @@ android {
 
     buildTypes {
         release {
+            // Shrinking stays off: turning it on changes every release APK, and the
+            // bundled speech engine is reached through JNI by name. The keep rules it
+            // would need are in proguard-rules.pro, written up front so that enabling
+            // this is a one-line change instead of a debugging session — the vendored
+            // sherpa-onnx AAR carries an empty proguard.txt, so nothing else keeps them.
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             if (hasReleaseSigning) signingConfig = signingConfigs.getByName("release")

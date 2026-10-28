@@ -34,6 +34,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -46,6 +47,7 @@ import com.engreader.app.data.ProgressSnapshot
 import com.engreader.app.data.VocabResult
 import com.engreader.app.dict.DifficultyBand
 import com.engreader.app.ui.components.EmptyState
+import com.engreader.app.ui.components.ErrorState
 import com.engreader.app.ui.components.HairLine
 import com.engreader.app.ui.components.LoadingBlock
 import com.engreader.app.ui.components.SectionHeader
@@ -53,6 +55,8 @@ import com.engreader.app.ui.components.StatBlock
 import com.engreader.app.ui.containerViewModel
 import com.engreader.app.ui.home.formatMinutes
 import com.engreader.app.ui.theme.Palette
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.launch
 
 class ProgressViewModel(private val container: AppContainer) : ViewModel() {
 
@@ -67,11 +71,27 @@ class ProgressViewModel(private val container: AppContainer) : ViewModel() {
 
     val goalMinutes: Int get() = container.settings.dailyGoalMinutes
 
+    /** Set when the last load failed; the screen shows it with a retry. */
+    var error by mutableStateOf<String?>(null)
+        private set
+
     suspend fun load() {
         loading = true
-        snapshot = container.progress.snapshot()
-        vocab = container.vocabTest.latest()
-        loading = false
+        error = null
+        try {
+            snapshot = container.progress.snapshot()
+            vocab = container.vocabTest.latest()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            // Neither read was guarded. The throw escaped the screen's `LaunchedEffect`
+            // as an uncaught coroutine exception — and since nothing here sets `loading`
+            // back on the failure path, the alternative was "正在统计…" forever with no
+            // data, no message and no retry.
+            error = e.message ?: "无法读取学习记录。"
+        } finally {
+            loading = false
+        }
     }
 }
 
@@ -86,6 +106,9 @@ class ProgressViewModel(private val container: AppContainer) : ViewModel() {
 fun ProgressScreen(onOpenSettings: () -> Unit, onOpenVocabTest: () -> Unit) {
     val viewModel = containerViewModel(key = "progress") { ProgressViewModel(it) }
     val snapshot = viewModel.snapshot
+    val error = viewModel.error
+    val scope = rememberCoroutineScope()
+    val retry: () -> Unit = { scope.launch { viewModel.load() } }
 
     LaunchedEffect(Unit) { viewModel.load() }
 
@@ -128,6 +151,10 @@ fun ProgressScreen(onOpenSettings: () -> Unit, onOpenVocabTest: () -> Unit) {
 
         if (viewModel.loading) {
             item { LoadingBlock(label = "正在统计…") }
+        } else if (snapshot == null && error != null) {
+            // Nothing to show and the read failed: the empty state would claim there is
+            // no history, which is not what happened.
+            item { ErrorState(message = error, onRetry = retry) }
         } else if (snapshot == null) {
             item {
                 EmptyState(
@@ -137,6 +164,11 @@ fun ProgressScreen(onOpenSettings: () -> Unit, onOpenVocabTest: () -> Unit) {
                 )
             }
         } else {
+            if (error != null) {
+                // Statistics already on screen: report the failed refresh above them
+                // rather than throwing away what the reader was looking at.
+                item { ErrorState(message = error, onRetry = retry) }
+            }
             item { GoalCard(snapshot, viewModel.goalMinutes) }
             item { Spacer(Modifier.height(18.dp)) }
             item {

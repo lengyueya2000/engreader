@@ -44,12 +44,14 @@ import com.engreader.app.ui.books.BookCover
 import com.engreader.app.ui.books.rememberCover
 import com.engreader.app.ui.components.DifficultyChip
 import com.engreader.app.ui.components.EmptyState
+import com.engreader.app.ui.components.ErrorState
 import com.engreader.app.ui.components.HairLine
 import com.engreader.app.ui.components.LoadingBlock
 import com.engreader.app.ui.components.SectionHeader
 import com.engreader.app.ui.components.Tag
 import com.engreader.app.ui.containerViewModel
 import com.engreader.app.ui.theme.Palette
+import kotlinx.coroutines.launch
 
 @Composable
 fun HomeScreen(
@@ -86,6 +88,16 @@ fun HomeScreen(
         if (state.loading) {
             item { LoadingBlock(label = "正在准备词库与文章…") }
         } else {
+            // Reported above whatever is already on screen rather than instead of it: a
+            // failed refresh should not take away the list the reader was looking at.
+            state.error?.let { message ->
+                item {
+                    ErrorState(
+                        message = message,
+                        onRetry = { scope.launch { viewModel.load() } },
+                    )
+                }
+            }
             if (state.books.isNotEmpty()) {
                 item {
                     SectionHeader(

@@ -1,5 +1,6 @@
 package com.engreader.app.ui.reader
 
+import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -74,6 +75,8 @@ data class ReaderState(
     val translation: List<String> = emptyList(),
     val translationStatus: TranslationStatus = TranslationStatus.Idle,
     val translationError: String? = null,
+    /** Why the last quiz build failed, or null. Cleared by the next attempt. */
+    val quizError: String? = null,
     val highlightSaved: Boolean = true,
     /** Whether words whose review is due are marked in the body. */
     val highlightDue: Boolean = true,
@@ -123,6 +126,17 @@ data class ReaderState(
      * that watches it fire again on every scroll.
      */
     val resumeParagraph: Int = 0,
+    /**
+     * An explicit jump asked for from outside the text, or -1.
+     *
+     * Kept apart from [resumeParagraph] because a jump to paragraph zero is a real
+     * request — a search hit in the title or the first paragraph — while a stored
+     * position of zero means "nothing to restore". [jumpRequest] counts the requests,
+     * so two jumps to the same paragraph both land.
+     */
+    val jumpParagraph: Int = -1,
+    /** Increments on every applied jump; the screen watches this, not the paragraph. */
+    val jumpRequest: Long = 0,
     val searchVisible: Boolean = false,
     val searchQuery: String = "",
     val searchResults: List<SearchHit> = emptyList(),
@@ -449,19 +463,46 @@ class ReaderViewModel(
             ((System.currentTimeMillis() - sessionStart) / 1000).toInt()
         }
         if (seconds <= 0 && count <= 0) return
-        if (seconds > 0) sessionStart = System.currentTimeMillis()
         val words = if (seconds > 0) coveredWords() else 0
         val bookId = state.article?.bookId ?: 0
+        // The amounts are claimed here, so a second flush while this write is in
+        // flight cannot count them twice. A failure hands them back below: the old
+        // order reset the clock and the count first, so a write that threw lost that
+        // interval and those look-ups for good, with no trace of it anywhere.
+        if (seconds > 0) sessionStart = System.currentTimeMillis()
         lookups = 0
         container.appScope.launch {
-            container.wordbook.recordSession(articleId, seconds, words, count)
-            if (seconds > 0) {
-                container.articles.addReadSeconds(articleId, seconds)
-                // Time on a chapter is time on the book: without this the shelf would show
-                // a book that was read for an hour as never having been opened.
-                if (bookId > 0) container.books.addReadSeconds(bookId, seconds)
+            try {
+                container.wordbook.recordSession(articleId, seconds, words, count)
+                if (seconds > 0) {
+                    container.articles.addReadSeconds(articleId, seconds)
+                    // Time on a chapter is time on the book: without this the shelf would show
+                    // a book that was read for an hour as never having been opened.
+                    if (bookId > 0) container.books.addReadSeconds(bookId, seconds)
+                }
+            } catch (e: CancellationException) {
+                // Never written: hand the amounts back rather than dropping them.
+                restoreUnflushed(seconds, count)
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "session flush failed; keeping ${seconds}s/${count} look-ups for the next flush", e)
+                restoreUnflushed(seconds, count)
             }
         }
+    }
+
+    /**
+     * Puts an unwritten flush back on the clock.
+     *
+     * [sessionStart] is moved back by the seconds that never reached the database, so
+     * the interval is reported again by the next flush instead of being lost; the same
+     * for the look-up count. Called only when the write failed.
+     */
+    private fun restoreUnflushed(seconds: Int, count: Int) {
+        if (seconds > 0) {
+            sessionStart = System.currentTimeMillis() - seconds * 1000L
+        }
+        lookups += count
     }
 
     /**
@@ -572,7 +613,15 @@ class ReaderViewModel(
         val target = pendingJump.coerceIn(0, state.paragraphs.lastIndex)
         pendingJump = -1
         readParagraph = target
-        state = state.copy(resumeParagraph = target)
+        // Both signals are written: `resumeParagraph` keeps the restore effect from
+        // scrolling to the old stored position behind the jump, and the jump pair is
+        // what actually places the list — a jump to paragraph zero is invisible to a
+        // restore that only moves when the target is above zero.
+        state = state.copy(
+            resumeParagraph = target,
+            jumpParagraph = target,
+            jumpRequest = state.jumpRequest + 1,
+        )
     }
 
     // ------------------------------------------------------------ lifecycle
@@ -693,6 +742,7 @@ class ReaderViewModel(
      */
     suspend fun switchReading(headword: String) {
         val lookup = state.lookup ?: return
+        val generation = cardGeneration
         // The reading being left is offered as the alternative, so the switch can be
         // undone: without it the chip vanished and there was no way back.
         val parts = withContext(Dispatchers.IO) {
@@ -701,6 +751,9 @@ class ReaderViewModel(
             container.lookupParts(found)
         } ?: return
         val entry = parts.entry ?: return
+        // The reader may have swiped the sheet away while the dictionary was reading;
+        // writing now would slide it back up.
+        if (generation != cardGeneration) return
         val saved = container.wordbook.contains(entry.lemma)
         state = state.copy(
             lookup = container.lookupState(
@@ -719,26 +772,33 @@ class ReaderViewModel(
     suspend fun toggleSave() {
         val lookup = state.lookup ?: return
         val entry = lookup.entry ?: return
-        if (lookup.saved) {
-            container.wordbook.remove(entry.lemma)
-            state = state.copy(
-                lookup = lookup.copy(saved = false),
-                savedLemmas = state.savedLemmas - entry.lemma.lowercase(),
-                // Removing the word takes it out of the review queue too, so the body
-                // must stop marking it.
-                dueLemmas = state.dueLemmas - entry.lemma.lowercase(),
-            )
-        } else {
+        val generation = cardGeneration
+        val lemma = entry.lemma.lowercase()
+        val saved = !lookup.saved
+        if (saved) {
             container.wordbook.save(entry)
-            state = state.copy(
-                lookup = lookup.copy(saved = true),
-                savedLemmas = state.savedLemmas + entry.lemma.lowercase(),
-                dueLemmas = state.dueLemmas + entry.lemma.lowercase(),
-            )
+        } else {
+            container.wordbook.remove(entry.lemma)
         }
+        // The wordbook change stands either way — the reader did ask for it, and the
+        // body must mark it — but the card is only touched if the same one is still
+        // open. A dismiss (or a newer tap) while the write was in flight used to have
+        // its result overwritten and the sheet re-opened by itself.
+        state = state.copy(
+            savedLemmas = if (saved) state.savedLemmas + lemma else state.savedLemmas - lemma,
+            // Removing the word takes it out of the review queue too, so the body
+            // must stop marking it.
+            dueLemmas = if (saved) state.dueLemmas + lemma else state.dueLemmas - lemma,
+        )
+        if (generation != cardGeneration) return
+        state = state.copy(lookup = lookup.copy(saved = saved))
     }
 
     fun dismissLookup() {
+        // Every look-up and switch in flight belongs to the card being closed; the bump
+        // makes them drop their result instead of re-opening the sheet the reader just
+        // swiped away.
+        cardGeneration++
         state = state.copy(lookup = null)
     }
 
@@ -756,6 +816,9 @@ class ReaderViewModel(
     }
 
     fun dismissAnalysis() {
+        // Same as [dismissLookup]: a parse still running must not re-open the panel
+        // that was just closed.
+        cardGeneration++
         state = state.copy(analysis = null)
     }
 
@@ -976,11 +1039,23 @@ class ReaderViewModel(
         val article = state.article ?: return emptyList()
         // Building the questions re-reads the whole article and looks every candidate
         // up in the dictionary; it is the heaviest thing the reader does on demand.
-        val questions = withContext(Dispatchers.Default) {
-            container.quiz.build(article.body, maxQuestions = 5)
+        // Failure is reported rather than thrown: the caller is a UI coroutine with no
+        // handler above it, so a throw here used to leave the button on "出题中…" (or
+        // take the process down). Same shape as [requestTranslation].
+        val questions = try {
+            val built = withContext(Dispatchers.Default) {
+                container.quiz.build(article.body, maxQuestions = 5)
+            }
+            if (built.isNotEmpty()) container.articles.saveQuiz(articleId, built)
+            built
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "quiz build failed for article $articleId", e)
+            state = state.copy(quizError = e.message ?: "出题失败")
+            return emptyList()
         }
-        if (questions.isNotEmpty()) container.articles.saveQuiz(articleId, questions)
-        state = state.copy(quiz = questions)
+        state = state.copy(quiz = questions, quizError = null)
         return questions
     }
 
@@ -1018,6 +1093,8 @@ class ReaderViewModel(
     }
 
     private companion object {
+        const val TAG = "ReaderViewModel"
+
         /** Shorter queries match nearly every paragraph and say nothing. */
         const val MIN_SEARCH_CHARS = 2
 

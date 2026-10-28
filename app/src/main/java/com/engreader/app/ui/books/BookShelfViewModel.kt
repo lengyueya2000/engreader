@@ -37,7 +37,16 @@ class BookShelfViewModel(private val container: AppContainer) : ViewModel() {
 
     suspend fun load() {
         state = state.copy(loading = true)
-        state = state.copy(loading = false, books = container.books.all())
+        try {
+            state = state.copy(loading = false, books = container.books.all())
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            // Same shape as `import` below: an unguarded repository throw would escape
+            // the screen's `LaunchedEffect` as an uncaught coroutine exception, and the
+            // shelf would report an empty shelf rather than the failure.
+            state = state.copy(loading = false, error = e.message ?: "无法读取书架。")
+        }
     }
 
     /**
@@ -48,9 +57,15 @@ class BookShelfViewModel(private val container: AppContainer) : ViewModel() {
      * refused with a message that says so.
      */
     suspend fun import(uri: Uri) {
-        val picked = withContext(Dispatchers.IO) { BookPicker.describe(container.appContext, uri) }
-        state = state.copy(importing = picked.name, message = null, error = null)
         try {
+            // `describe` reads the picked file to decide what it is, so it fails on a
+            // malformed or unreadable file exactly like the rest of the import does. It
+            // used to run one line *before* this `try`, which let its failure escape the
+            // caller's `LaunchedEffect`: the screen never reached `onImportHandled()`,
+            // kept the URI parked, and replayed the same doomed import on every later
+            // visit to 我的书.
+            val picked = withContext(Dispatchers.IO) { BookPicker.describe(container.appContext, uri) }
+            state = state.copy(importing = picked.name, message = null, error = null)
             // Importing the same file twice used to add a second copy: the URL
             // uniqueness that protects articles is scoped per book id, so the chapters
             // did not collide either and the shelf quietly grew a duplicate. The
@@ -64,7 +79,11 @@ class BookShelfViewModel(private val container: AppContainer) : ViewModel() {
                 )
                 return
             }
-            val book = container.books.import(uri, picked.name)
+            // `picked.size` is what `OpenableColumns.SIZE` reported, or 0 when the
+            // provider did not say — which is exactly `knownSize`'s default. BookPicker
+            // already reads it; until it was passed on, the repository's size ceiling had
+            // nothing to compare against until the whole file had been read.
+            val book = container.books.import(uri, picked.name, knownSize = picked.size)
             state = state.copy(
                 importing = null,
                 books = container.books.all(),
@@ -72,7 +91,10 @@ class BookShelfViewModel(private val container: AppContainer) : ViewModel() {
             )
         } catch (e: CancellationException) {
             // The coroutine was cancelled, not the import: swallowing this would leave
-            // the shelf showing a spinner that never resolves.
+            // the shelf showing a spinner that never resolves. Clear the marker first
+            // for the same reason — the ViewModel is activity-scoped, so it outlives
+            // the screen that started the import.
+            state = state.copy(importing = null)
             throw e
         } catch (e: Throwable) {
             // `Throwable` rather than `Exception`: a malformed book can exhaust the heap

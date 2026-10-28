@@ -47,13 +47,13 @@ import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.engreader.app.tts.ListeningSession
 import com.engreader.app.tts.SleepOption
 import com.engreader.app.tts.SleepTimer
 import com.engreader.app.ui.LocalContainer
 import com.engreader.app.ui.theme.Palette
 import kotlinx.coroutines.delay
-import androidx.compose.runtime.collectAsState
 
 /** Speeds offered on the listening screen; the reader's own rate is whatever was last set. */
 private val SPEEDS = listOf(0.8f, 0.95f, 1.15f, 1.35f)
@@ -75,7 +75,7 @@ fun ListeningScreen(
 ) {
     val container = LocalContainer.current
     val session = container.listening
-    val state by session.state.collectAsState()
+    val state by session.state.collectAsStateWithLifecycle()
 
     val statusBar = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     val navBar = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()

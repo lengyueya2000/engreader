@@ -10,6 +10,26 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 /**
+ * Which branch one HTTP status code takes.
+ *
+ * Pulled out of [ArticleFetcher.request] so the classification can be tested without a
+ * live socket — and, more to the point, so the branch order cannot be got wrong again.
+ * `304` is *inside* `300..399`: while the request matched codes with an ordered `when`,
+ * the redirect arm swallowed it, `Location` was absent, and a "not modified" answer
+ * raised `FetchException("Redirect without Location")`. The conditional-request fast
+ * path was therefore dead, and refreshing an unchanged feed reported a network error
+ * instead of keeping the list already on screen.
+ */
+internal enum class HttpOutcome { NotModified, Redirect, Body, Error }
+
+internal fun statusOutcome(code: Int): HttpOutcome = when {
+    code == 304 -> HttpOutcome.NotModified
+    code in 300..399 -> HttpOutcome.Redirect
+    code in 200..299 -> HttpOutcome.Body
+    else -> HttpOutcome.Error
+}
+
+/**
  * Network access to the public feeds and article pages.
  *
  * Uses `HttpURLConnection` from the platform rather than adding an HTTP client
@@ -116,6 +136,14 @@ class ArticleFetcher(private val context: Context) {
             throw FetchException("不支持的链接协议（$scheme）：$url")
         }
         if (target.host.isNullOrBlank()) throw FetchException("链接没有主机名：$url")
+        // Cleartext is refused by the platform on targetSdk 28+ (the manifest sets
+        // neither `usesCleartextTraffic` nor `networkSecurityConfig`), so an `http://`
+        // link can never be fetched. Left to fail inside the socket, the user saw a
+        // generic network error with nothing to act on; feeds in the wild do carry
+        // `http://` links. Naming the cause makes the fix obvious.
+        if (scheme == "http") {
+            throw FetchException("该链接是明文 http，已被 Android 禁止访问，请改用 https：$url")
+        }
         val connection = (target.openConnection() as HttpURLConnection).apply {
             connectTimeout = 15_000
             readTimeout = 25_000
@@ -141,8 +169,19 @@ class ArticleFetcher(private val context: Context) {
         var handedOff = false
         try {
             val code = connection.responseCode
-            when {
-                code in 300..399 -> {
+            // Classified first, so that the branch order cannot be got wrong again: `304`
+            // sits *inside* `300..399`, and the old `when` put the redirect range first,
+            // so every "not modified" answer took the redirect path and the missing
+            // `Location` header raised `FetchException("Redirect without Location")`.
+            // The ETag short path — the whole reason the request is conditional — was
+            // dead code, and a pull-to-refresh on an unchanged feed reported a network
+            // error instead of keeping the list already on screen.
+            when (statusOutcome(code)) {
+                HttpOutcome.NotModified -> {
+                    connection.disconnect()
+                    return null
+                }
+                HttpOutcome.Redirect -> {
                     if (redirectsLeft <= 0) throw FetchException("Too many redirects for $url")
                     val location = connection.getHeaderField("Location")
                         ?: throw FetchException("Redirect without Location for $url")
@@ -150,13 +189,7 @@ class ArticleFetcher(private val context: Context) {
                     val next = resolve(url, location)
                     return request(next, accept, redirectsLeft - 1, conditional)
                 }
-                // Only reachable for a conditional request, which is the only kind that
-                // sends a validator; without one the server has no way to answer this.
-                code == 304 -> {
-                    connection.disconnect()
-                    return null
-                }
-                code in 200..299 -> {
+                HttpOutcome.Body -> {
                     if (conditional) {
                         HttpCache.remember(
                             url,
@@ -175,7 +208,7 @@ class ArticleFetcher(private val context: Context) {
                     handedOff = true
                     return response
                 }
-                else -> throw FetchException("HTTP $code for $url")
+                HttpOutcome.Error -> throw FetchException("HTTP $code for $url")
             }
         } finally {
             if (!handedOff) connection.disconnect()

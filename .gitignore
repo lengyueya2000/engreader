@@ -10,7 +10,8 @@ keystore.properties
 captures/
 tools/raw/
 
-.verify/
+# Review reports and probe programs written next to the app, not part of it.
+verify/
 
 # Release APKs are published to GitHub Releases, not committed:
 # https://github.com/lengyueya2000/engreader/releases

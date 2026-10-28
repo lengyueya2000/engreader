@@ -11,6 +11,7 @@ import com.engreader.app.model.Book
 import com.engreader.app.nlp.AdaptiveReader
 import com.engreader.app.nlp.Readiness
 import com.engreader.app.nlp.VocabularyProfile
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -58,6 +59,12 @@ data class HomeState(
      * arithmetic rather than advice.
      */
     val recommendation: Recommendation? = null,
+    /**
+     * Set when the last load failed, so the screen can say what happened and offer a
+     * retry. Without it a repository throw left the home screen with no content, no
+     * explanation and no way to ask again.
+     */
+    val error: String? = null,
 )
 
 class HomeViewModel(private val container: AppContainer) : ViewModel() {
@@ -66,24 +73,35 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
         private set
 
     suspend fun load() {
-        state = state.copy(loading = true)
-        val opened = container.articles.recent(limit = 20)
-        // Before the user has opened anything, the library is still worth showing:
-        // the bundled passages are already readable, so fall back to stored articles.
-        val list = opened.ifEmpty { container.articles.all().take(20) }
-        val saved = container.articles.saved()
-        val progress = container.progress.snapshot()
-        state = HomeState(
-            loading = false,
-            continueReading = list.firstOrNull(),
-            recent = list,
-            saved = saved,
-            books = container.books.all(),
-            progress = progress,
-            dueWords = progress.dueNow,
-        )
-        val profile = profile(list)
-        state = state.copy(unknownCounts = profile.counts, recommendation = profile.recommendation)
+        state = state.copy(loading = true, error = null)
+        try {
+            val opened = container.articles.recent(limit = 20)
+            // Before the user has opened anything, the library is still worth showing:
+            // the bundled passages are already readable, so fall back to stored articles.
+            val list = opened.ifEmpty { container.articles.all().take(20) }
+            val saved = container.articles.saved()
+            val progress = container.progress.snapshot()
+            state = HomeState(
+                loading = false,
+                continueReading = list.firstOrNull(),
+                recent = list,
+                saved = saved,
+                books = container.books.all(),
+                progress = progress,
+                dueWords = progress.dueNow,
+            )
+            val profile = profile(list)
+            state = state.copy(unknownCounts = profile.counts, recommendation = profile.recommendation)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            // None of the reads above was guarded. The throw escaped the screen's
+            // `LaunchedEffect` as an uncaught coroutine exception, and the screen — which
+            // has no `runCatching` of its own — had no error branch to fall into.
+            // Keeping the previous state means a failed *refresh* still shows the list
+            // the reader was looking at, with the failure reported above it.
+            state = state.copy(loading = false, error = e.message ?: "无法读取本机数据。")
+        }
     }
 
     /**

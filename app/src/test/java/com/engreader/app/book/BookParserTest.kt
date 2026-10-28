@@ -234,10 +234,14 @@ class BookParserTest {
         try {
             MobiParser.parse(cut)
             fail("a truncated file must not parse")
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             // Any of the format exceptions is fine; what matters is that it does not
-            // return a book, and that it does not take the process down.
-            assertFalse(e is OutOfMemoryError)
+            // return a book. An `Error` (the OOM this parser used to risk, or a
+            // `StackOverflowError`) is a real failure and is rethrown: the assertion
+            // that used to sit here, `assertFalse(e is OutOfMemoryError)`, could never
+            // be true because `OutOfMemoryError` is not an `Exception` and so never
+            // reached the catch block at all.
+            if (e is Error) throw e
         }
     }
 

@@ -82,7 +82,11 @@ class ProgressRepository(
         val week = days.filter { it.day in weekKeys }.sumOf { it.seconds }
 
         ProgressSnapshot(
-            streakDays = streak(days.map { it.day }),
+            // The streak comes from every day with a session, not from the chart window:
+            // `readDays(limit = 60)` is what the screen draws, and a reader on a 100-day
+            // streak was shown exactly 60 with no way to grow past it until a day fell
+            // out of the window.
+            streakDays = streak(dayKeys()),
             todaySeconds = byDay[today]?.seconds ?: 0,
             weekSeconds = week,
             // Book chapters are excluded, as [ArticleRepository] excludes them from
@@ -93,8 +97,15 @@ class ProgressRepository(
                 "SELECT COUNT(*) FROM article WHERE lastReadAt > 0 AND bookId = 0"
             ),
             articlesFinished = count(
-                "SELECT COUNT(DISTINCT articleId) FROM session " +
-                    "WHERE seconds > 60 AND articleId IN (SELECT id FROM article WHERE bookId = 0)"
+                // Coverage, not time: `session.seconds` is one flush's worth, so "any
+                // flush over 60 seconds" counted an article the reader sampled for a
+                // minute out of ten, and counted it for every article they opened. A
+                // piece counts as read once a flush reports it got through almost all
+                // of it, and `wordCount > 0` keeps rows whose count was never written
+                // out of the answer instead of matching everything.
+                "SELECT COUNT(DISTINCT s.articleId) FROM session s " +
+                    "JOIN article a ON a.id = s.articleId " +
+                    "WHERE a.bookId = 0 AND a.wordCount > 0 AND s.wordsRead * 10 >= a.wordCount * 9"
             ),
             lookups = lookups,
             wordbookTotal = count("SELECT COUNT(*) FROM word"),
@@ -174,6 +185,18 @@ class ProgressRepository(
                 }
             }
         }
+
+    /**
+     * Every day with a session, newest first.
+     *
+     * Separate from [readDays] because the two answer different questions: the chart
+     * draws a fixed window, while the streak has to count back as far as the reader has
+     * actually studied. One row per active day, so this stays small.
+     */
+    private fun dayKeys(): List<String> =
+        db.readableDatabase.rawQuery(
+            "SELECT day FROM session GROUP BY day ORDER BY day DESC", null,
+        ).use { c -> buildList { while (c.moveToNext()) add(c.getString(0)) } }
 
     /**
      * Consecutive days with activity, counting back from today or yesterday.

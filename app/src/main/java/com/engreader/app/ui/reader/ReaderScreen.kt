@@ -148,6 +148,18 @@ private class SpokenBounds {
 }
 
 /**
+ * A paragraph's own top-left corner, remembered across compositions.
+ *
+ * Deliberately not Compose state. `onGloballyPositioned` re-runs on every placement —
+ * i.e. on every frame of a scroll — and while this was a state read by the paragraph's
+ * composition it invalidated that paragraph and, as an effect key, cancelled and
+ * restarted its bounds effect once per frame. It is read from a coroutine only.
+ */
+private class LayoutOrigin {
+    var topLeft: Offset? = null
+}
+
+/**
  * Where a layout is on screen, unclipped.
  *
  * [boundsInWindow] is not usable here: it is clipped to the window, so a sentence that
@@ -215,12 +227,12 @@ fun ReaderScreen(
     /**
      * How many list items come before the first paragraph.
      *
-     * The header, plus the translation-failure notice when there is one. Every jump to a
-     * paragraph — the listening auto-scroll, the search results, restoring the reading
-     * position — has to add it, and having one number for it is what keeps them from
-     * disagreeing.
+     * The header, and nothing else: the translation-failure notice is rendered inside
+     * the header item rather than as an item of its own. As its own item it changed
+     * this count whenever a translation run failed or was retried, which renumbered
+     * every paragraph below it — and the paragraphs are keyed by that position.
      */
-    val leadingItems = 1 + if (state.showTranslation && state.translationStatus == TranslationStatus.Failed) 1 else 0
+    val leadingItems = 1
     /**
      * Where each sentence currently is on screen, for the listening auto-scroll.
      *
@@ -232,6 +244,29 @@ fun ReaderScreen(
     var showTypography by remember { mutableStateOf(false) }
     var showQuiz by remember { mutableStateOf(false) }
     var preparingQuiz by remember { mutableStateOf(false) }
+    /**
+     * Builds the comprehension quiz and opens it.
+     *
+     * `preparingQuiz` is cleared in a `finally`, so the chip always comes back to its
+     * label; the failure itself is reported by the ViewModel through `quizError` and
+     * shown under the action row. Clearing the flag only on the success path is what
+     * used to leave the button on "出题中…" for the rest of the session.
+     */
+    val startQuiz: () -> Unit = {
+        if (!preparingQuiz) {
+            preparingQuiz = true
+            scope.launch {
+                try {
+                    viewModel.prepareQuiz()
+                    // No error means the build finished, even when it found nothing to
+                    // ask: the sheet has its own empty state for that.
+                    if (viewModel.state.quizError == null) showQuiz = true
+                } finally {
+                    preparingQuiz = false
+                }
+            }
+        }
+    }
     val context = LocalContext.current
     /**
      * Asked for the first time the reader presses play, not at launch.
@@ -364,6 +399,17 @@ fun ReaderScreen(
         val target = state.resumeParagraph
         if (target > 0) runCatching { listState.scrollToItem(leadingItems + target) }
         restored = true
+    }
+
+    // An explicit jump — a search hit inside the piece already open — lands even on
+    // paragraph zero, which the stored position above deliberately does not scroll to
+    // (zero is also "no stored position"). Watching the request counter rather than the
+    // paragraph is what makes two jumps to the same paragraph both land.
+    LaunchedEffect(state.jumpRequest) {
+        if (state.jumpRequest <= 0L) return@LaunchedEffect
+        val target = state.jumpParagraph
+        if (target < 0 || state.loading || state.paragraphs.isEmpty()) return@LaunchedEffect
+        runCatching { listState.scrollToItem(leadingItems + target) }
     }
 
     // Reports the visible paragraph range as the reader scrolls. The top of the range is
@@ -505,17 +551,15 @@ fun ReaderScreen(
                                     color = theme.subtle,
                                 )
                             }
+                            if (state.showTranslation && state.translationStatus == TranslationStatus.Failed) {
+                                Spacer(Modifier.height(4.dp))
+                                TranslationNotice(
+                                    message = state.translationError ?: "翻译失败",
+                                    theme = theme,
+                                    onRetry = { viewModel.requestTranslation() },
+                                )
+                            }
                             Spacer(Modifier.height(8.dp))
-                        }
-                    }
-
-                    if (state.showTranslation && state.translationStatus == TranslationStatus.Failed) {
-                        item {
-                            TranslationNotice(
-                                message = state.translationError ?: "翻译失败",
-                                theme = theme,
-                                onRetry = { viewModel.requestTranslation() },
-                            )
                         }
                     }
 
@@ -576,6 +620,13 @@ fun ReaderScreen(
 
                     item {
                         Spacer(Modifier.height(24.dp))
+                        state.quizError?.let { message ->
+                            QuizNotice(
+                                message = message,
+                                theme = theme,
+                                onRetry = startQuiz,
+                            )
+                        }
                         Row(
                             Modifier
                                 // Scrollable rather than merely clipped: three labels of
@@ -594,18 +645,12 @@ fun ReaderScreen(
                                 accent = if (theme.isDark) Palette.Mint else Palette.Pine,
                                 busy = preparingQuiz,
                             ) {
-                                if (preparingQuiz) return@ReaderAction
                                 // Building the questions re-reads the whole article and
                                 // looks every candidate up in the dictionary, which is the
                                 // heaviest thing the reader does on demand. Awaiting it
                                 // before showing the sheet left the tap looking ignored
                                 // for as long as it took.
-                                preparingQuiz = true
-                                scope.launch {
-                                    viewModel.prepareQuiz()
-                                    preparingQuiz = false
-                                    showQuiz = true
-                                }
+                                startQuiz()
                             }
                             ReaderAction(
                                 label = if (state.showTranslation) "隐藏译文" else "中文译文",
@@ -712,8 +757,11 @@ fun ReaderScreen(
             },
             onSpeak = { viewModel.speakWord(it) },
             onAnalyzeSentence = {
-                scope.launch { viewModel.analyze(lookup.inSentence) }
+                // Dismissed before the parse starts: closing the sheet bumps the card
+                // generation, and an analysis that began earlier would be dropped as
+                // stale rather than opening its panel.
                 viewModel.dismissLookup()
+                scope.launch { viewModel.analyze(lookup.inSentence) }
             },
             onSwitchReading = { headword -> scope.launch { viewModel.switchReading(headword) } },
             onShowChinese = viewModel::setShowChinese,
@@ -789,7 +837,7 @@ fun ReaderScreen(
             speechVoice = state.speechVoice,
             activeVoice = liveVoice,
             backend = liveBackend,
-            speechReady = liveSpeechState == SpeechState.Ready,
+            speechState = liveSpeechState,
             onFontSize = viewModel::setFontSize,
             onLineHeight = viewModel::setLineHeight,
             onTheme = viewModel::setTheme,
@@ -819,10 +867,12 @@ private fun MetaText(text: String, color: Color) {
 }
 
 /**
- * Shown above the article when a translation run failed.
+ * Shown inside the article header when a translation run failed.
  *
  * The translation is an aid, not the point of the screen, so a failure never blocks
- * reading: the English stays exactly as it was and this is the only trace of it.
+ * reading: the English stays exactly as it was and this is the only trace of it. It
+ * lives in the header item rather than as a list item of its own, so showing it does
+ * not renumber the paragraphs below it.
  */
 @Composable
 private fun TranslationNotice(
@@ -833,10 +883,38 @@ private fun TranslationNotice(
     Column(
         Modifier
             .fillMaxWidth()
-            .padding(horizontal = 22.dp, vertical = 8.dp),
+            .padding(vertical = 8.dp),
     ) {
         Text(
             text = "译文没能取到：$message",
+            style = MaterialTheme.typography.labelSmall,
+            color = theme.subtle,
+        )
+        TextButton(onClick = onRetry, contentPadding = PaddingValues(horizontal = 0.dp, vertical = 2.dp)) {
+            Text("重试", style = MaterialTheme.typography.labelMedium)
+        }
+    }
+}
+
+/**
+ * Shown above the action row when building the comprehension quiz failed.
+ *
+ * The quiz is an extra, so a failure never blocks reading; without this the chip simply
+ * went back to "做理解题" and the tap looked ignored, with no way to tell why.
+ */
+@Composable
+private fun QuizNotice(
+    message: String,
+    theme: com.engreader.app.ui.theme.ReadingTheme,
+    onRetry: () -> Unit,
+) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 22.dp, vertical = 4.dp),
+    ) {
+        Text(
+            text = "出题失败：$message",
             style = MaterialTheme.typography.labelSmall,
             color = theme.subtle,
         )
@@ -980,15 +1058,22 @@ private fun ParagraphBlock(
         // is told where the spoken sentence's own lines sit inside it. The rectangle is
         // rebuilt whenever the layout or the text's position changes, which is what
         // keeps it correct as the list scrolls under it.
-        var origin by remember { mutableStateOf<Offset?>(null) }
+        //
+        // `listening` is a key so the rectangle is reported when read-aloud starts and
+        // dropped when it stops; while it is off the paragraph reports nothing at all.
+        val origin = remember { LayoutOrigin() }
         val flatIndex = if (firstFlatIndex >= 0 && speakingSentenceIndex >= 0) {
             firstFlatIndex + speakingSentenceIndex
         } else {
             -1
         }
-        LaunchedEffect(flatIndex, spokenRange, layout, origin) {
+        LaunchedEffect(flatIndex, spokenRange, layout, listening) {
+            if (!listening) {
+                onSentenceBounds(flatIndex, null)
+                return@LaunchedEffect
+            }
             val measured = layout
-            val at = origin
+            val at = origin.topLeft
             if (flatIndex < 0 || spokenRange == null || measured == null || at == null) {
                 onSentenceBounds(flatIndex, null)
                 return@LaunchedEffect
@@ -1019,7 +1104,7 @@ private fun ParagraphBlock(
             fontFamily = FontFamily.Serif,
             modifier = Modifier
                 .fillMaxWidth()
-                .onGloballyPositioned { origin = unclippedBounds(it).topLeft }
+                .onGloballyPositioned { origin.topLeft = unclippedBounds(it).topLeft }
                 .pointerInput(paragraph, sentences, listening) {
                     detectTapGestures(
                         onTap = { position ->
@@ -1043,8 +1128,19 @@ private fun ParagraphBlock(
                         onLongPress = { position ->
                             val textLayout = layout ?: return@detectTapGestures
                             val offset = textLayout.getOffsetForPosition(position)
+                            // The offset can land in the space between two sentences, or
+                            // in trailing space the trimming removed, where no range
+                            // matches. The nearest sentence is what the finger is on;
+                            // taking the paragraph's first one analysed a sentence the
+                            // reader never touched, and nothing on screen said so.
                             val sentence = sentences.firstOrNull { offset in it.start until it.end }
-                                ?: sentences.firstOrNull()
+                                ?: sentences.minByOrNull { s ->
+                                    when {
+                                        offset < s.start -> s.start - offset
+                                        offset >= s.end -> offset - s.end
+                                        else -> 0
+                                    }
+                                }
                             if (sentence != null) onSentenceLongPress(sentence.text)
                         },
                     )
@@ -1137,10 +1233,22 @@ private fun SentenceBlock(
         )
     }
 
-    // Where this sentence sits, for the listening auto-scroll. Reported on every
-    // position change rather than only when it becomes the spoken one: the scroll
-    // reads it as the list moves, and a rectangle recorded once would be stale the
-    // moment anything above it changed height.
+    // Where this sentence sits, for the listening auto-scroll. While the article is being
+    // read aloud this is reported on every position change rather than only when the
+    // sentence becomes the spoken one: the scroll reads it as the list moves, and a
+    // rectangle recorded once would be stale the moment anything above it changed
+    // height.
+    //
+    // Only while read-aloud is on, though: the callback runs on every placement — every
+    // frame of a scroll — for every sentence in composition, and the rectangles are read
+    // by nothing else. Nothing is lost when read-aloud starts: the scroll falls back to
+    // bringing the paragraph into view and then waits for the rectangle, which is how it
+    // already handles a sentence the list has not composed.
+    val boundsModifier = if (listening) {
+        Modifier.onGloballyPositioned { onBounds(flatIndex, unclippedBounds(it)) }
+    } else {
+        Modifier
+    }
     DisposableEffect(flatIndex) {
         onDispose { onBounds(flatIndex, null) }
     }
@@ -1153,7 +1261,7 @@ private fun SentenceBlock(
         fontFamily = FontFamily.Serif,
         modifier = Modifier
             .fillMaxWidth()
-            .onGloballyPositioned { onBounds(flatIndex, unclippedBounds(it)) }
+            .then(boundsModifier)
             .pointerInput(sentence, listening) {
                 detectTapGestures(
                     onTap = { position ->

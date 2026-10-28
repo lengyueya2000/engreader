@@ -95,7 +95,7 @@ class WordbookRepository(
                 statement.executeUpdateDelete()
             }
             if (bumped == 0) {
-                database.insert(
+                val inserted = database.insert(
                     "word", null,
                     ContentValues().apply {
                         put("lemma", entry.lemma)
@@ -107,6 +107,12 @@ class WordbookRepository(
                         put("dueAt", now)
                     },
                 )
+                // `insert` reports failure as -1 instead of throwing, and the commit
+                // below is unconditional — so without this check a storage failure
+                // committed an empty transaction while the reader had already been told
+                // the word was saved and highlighted it. Throwing skips
+                // `setTransactionSuccessful` and the `finally` rolls back.
+                check(inserted != -1L) { "could not save ${entry.lemma}" }
             }
             database.setTransactionSuccessful()
         } finally {
@@ -122,13 +128,17 @@ class WordbookRepository(
      * disk, but finding the sentence again would mean re-splitting the whole text
      * for every word, and the sentence the user actually tapped is not necessarily
      * the first place the word appears.
+     *
+     * Returns false when the row could not be written: `insert` reports that as -1
+     * rather than throwing, so the outcome was previously indistinguishable from a
+     * successful write.
      */
     suspend fun recordLookup(
         lemma: String,
         articleId: Long?,
         sentence: String = "",
         surface: String = "",
-    ) = withContext(Dispatchers.IO) {
+    ): Boolean = withContext(Dispatchers.IO) {
         db.writableDatabase.insert(
             "lookup", null,
             ContentValues().apply {
@@ -138,8 +148,7 @@ class WordbookRepository(
                 put("sentence", sentence.take(MAX_SENTENCE))
                 put("surface", surface.take(64))
             },
-        )
-        Unit
+        ) != -1L
     }
 
     /**
@@ -203,16 +212,16 @@ class WordbookRepository(
         ).use { it.moveToFirst() }
     }
 
-    suspend fun remove(lemma: String) = withContext(Dispatchers.IO) {
-        db.writableDatabase.delete("word", "lemma = ?", arrayOf(lemma))
-        Unit
+    /** True when a row was removed; a miss leaves the in-memory list claiming otherwise. */
+    suspend fun remove(lemma: String): Boolean = withContext(Dispatchers.IO) {
+        db.writableDatabase.delete("word", "lemma = ?", arrayOf(lemma)) > 0
     }
 
-    suspend fun setNote(lemma: String, note: String) = withContext(Dispatchers.IO) {
+    /** True when the note reached a row; false when there was none to write. */
+    suspend fun setNote(lemma: String, note: String): Boolean = withContext(Dispatchers.IO) {
         db.writableDatabase.update(
             "word", ContentValues().apply { put("note", note) }, "lemma = ?", arrayOf(lemma),
-        )
-        Unit
+        ) > 0
     }
 
     /**
@@ -222,8 +231,12 @@ class WordbookRepository(
      * match it. Un-mastering has to undo that explicitly: clearing only the flag
      * would leave the parked timestamp in place and the word would never come due
      * again, which is indistinguishable from losing it.
+     *
+     * Returns false when no row matched, which is the only signal that the flag the
+     * UI already flipped in memory did not reach the database.
      */
-    suspend fun setMastered(lemma: String, mastered: Boolean) = withContext(Dispatchers.IO) {
+    suspend fun setMastered(lemma: String, mastered: Boolean): Boolean =
+        withContext(Dispatchers.IO) {
         db.writableDatabase.update(
             "word",
             ContentValues().apply {
@@ -234,8 +247,7 @@ class WordbookRepository(
                 )
             },
             "lemma = ?", arrayOf(lemma),
-        )
-        Unit
+        ) > 0
     }
 
     suspend fun all(): List<SavedWord> = withContext(Dispatchers.IO) {
@@ -304,8 +316,9 @@ class WordbookRepository(
     }
 
     /**
-     * Applies a review outcome. [correct] promotes the word; a miss demotes it so
-     * it reappears in the same session's queue.
+     * Applies a review outcome. [correct] promotes the word; a miss demotes it —
+     * clearing the mastered flag as well as the box, so it really is back in the
+     * queue rather than hidden by a filter every consumer applies.
      *
      * One statement, so the counters cannot lose an update. The previous
      * read-then-write pair was not atomic: two answers arriving together — a fast
@@ -319,6 +332,16 @@ class WordbookRepository(
         // The expressions are built from a Kotlin boolean and a constant table, so
         // nothing user-supplied reaches the statement text.
         val nextBox = if (correct) "MIN(box + 1, $MAX_BOX)" else "1"
+        // A miss has to clear `mastered` as well as drop the box. Leaving the flag
+        // alone left the word at `mastered = 1, box = 1` — a state no query can see,
+        // because `due()`, `dueCount()`, `dueLemmas()` and the stats screen all filter
+        // on that flag — so a mastered word answered wrong never came back. That is
+        // what `setMastered(false)` does, and it is what "a miss demotes it" means.
+        val mastered = if (correct) {
+            "CASE WHEN $nextBox >= $MAX_BOX THEN 1 ELSE mastered END"
+        } else {
+            "0"
+        }
         val intervals = INTERVALS_MS.withIndex()
             .joinToString(" ") { (index, ms) -> "WHEN ${index + 1} THEN ? + $ms" }
         db.writableDatabase.execSQL(
@@ -328,7 +351,7 @@ class WordbookRepository(
                 dueAt = CASE $nextBox $intervals ELSE ? END,
                 correct = correct + ${if (correct) 1 else 0},
                 wrong = wrong + ${if (correct) 0 else 1},
-                mastered = CASE WHEN $nextBox >= $MAX_BOX THEN 1 ELSE mastered END
+                mastered = $mastered
             WHERE lemma = ?
             """.trimIndent(),
             // One `?` per interval branch, then the fallback, then the lemma.
@@ -341,22 +364,61 @@ class WordbookRepository(
      * Picks the wrong-answer options for a review card: real words from the
      * wordbook or dictionary with the same part of speech and a similar band, so
      * the distractor is not trivially eliminable.
+     *
+     * A bounded random page first, then a sequential pass only if that page did not
+     * fill the card. The random page is what keeps two sittings from offering the
+     * same options, but on its own it can offer fewer than [count]: the filter
+     * rejects blanks, the answer itself and duplicate glosses, so a small wordbook
+     * used to hand the reader a two-option question. `ORDER BY RANDOM()` with a
+     * `LIMIT` is a bounded sort of the `word` table, which is why it stays.
      */
     suspend fun distractors(target: SavedWord, count: Int = 3): List<String> =
         withContext(Dispatchers.IO) {
-            val out = mutableListOf<String>()
+            if (count <= 0) return@withContext emptyList()
             val targetGloss = dictionary.firstGloss(target.translation)
-            db.readableDatabase.rawQuery(
-                "$SELECT WHERE lemma <> ? AND translation <> '' ORDER BY RANDOM() LIMIT 24",
-                arrayOf(target.lemma),
-            ).use { c ->
-                while (c.moveToNext() && out.size < count) {
-                    val gloss = dictionary.firstGloss(c.getString(c.getColumnIndexOrThrow("translation")))
-                    if (gloss.isNotBlank() && gloss != targetGloss) out += gloss
-                }
+            val out = LinkedHashSet<String>()
+            collectDistractors(
+                "$SELECT WHERE lemma <> ? AND translation <> '' ORDER BY RANDOM() LIMIT ?",
+                arrayOf(target.lemma, (count * 8).toString()),
+                targetGloss,
+                count,
+                out,
+            )
+            var offset = 0
+            val page = count * 32
+            while (out.size < count) {
+                val rows = collectDistractors(
+                    "$SELECT WHERE lemma <> ? AND translation <> '' LIMIT ? OFFSET ?",
+                    arrayOf(target.lemma, page.toString(), offset.toString()),
+                    targetGloss,
+                    count,
+                    out,
+                )
+                if (rows == 0) break
+                offset += page
             }
-            out
+            out.toList()
         }
+
+    /** Adds glosses of the cursor's rows to [out] until it holds [count]; returns rows seen. */
+    private fun collectDistractors(
+        sql: String,
+        args: Array<String>,
+        targetGloss: String,
+        count: Int,
+        out: MutableSet<String>,
+    ): Int {
+        var rows = 0
+        db.readableDatabase.rawQuery(sql, args).use { c ->
+            while (c.moveToNext()) {
+                rows++
+                if (out.size >= count) continue
+                val gloss = dictionary.firstGloss(c.getString(c.getColumnIndexOrThrow("translation")))
+                if (gloss.isNotBlank() && gloss != targetGloss) out += gloss
+            }
+        }
+        return rows
+    }
 
     /**
      * Writes one flush of reading: the time since the last one, and how far into the
@@ -367,9 +429,9 @@ class WordbookRepository(
      * increment instead would need the position at the previous flush, which is not known
      * once the reader has left and come back.
      */
-    suspend fun recordSession(articleId: Long, seconds: Int, wordsRead: Int, lookups: Int) =
+    suspend fun recordSession(articleId: Long, seconds: Int, wordsRead: Int, lookups: Int): Boolean =
         withContext(Dispatchers.IO) {
-            if (seconds <= 0 && lookups <= 0) return@withContext
+            if (seconds <= 0 && lookups <= 0) return@withContext false
             db.writableDatabase.insert(
                 "session", null,
                 ContentValues().apply {
@@ -380,22 +442,22 @@ class WordbookRepository(
                     put("lookups", lookups)
                     put("finishedAt", System.currentTimeMillis())
                 },
-            )
-            Unit
+            ) != -1L
         }
 
-    suspend fun recordQuiz(articleId: Long, correct: Int, total: Int) = withContext(Dispatchers.IO) {
-        db.writableDatabase.insert(
-            "quiz", null,
-            ContentValues().apply {
-                put("articleId", articleId)
-                put("correct", correct)
-                put("total", total)
-                put("takenAt", System.currentTimeMillis())
-            },
-        )
-        Unit
-    }
+    /** True when the result reached a row; `insert` returns -1 rather than throwing. */
+    suspend fun recordQuiz(articleId: Long, correct: Int, total: Int): Boolean =
+        withContext(Dispatchers.IO) {
+            db.writableDatabase.insert(
+                "quiz", null,
+                ContentValues().apply {
+                    put("articleId", articleId)
+                    put("correct", correct)
+                    put("total", total)
+                    put("takenAt", System.currentTimeMillis())
+                },
+            ) != -1L
+        }
 
     private fun Cursor.toWords(): List<SavedWord> = buildList {
         while (moveToNext()) add(toWord())
@@ -446,10 +508,21 @@ class WordbookRepository(
 
 /** Local-date keys for the activity tables; `yyyy-MM-dd` sorts lexicographically. */
 object DayKey {
+    /**
+     * The key for [millis], always in ASCII digits.
+     *
+     * `String.format` without a Locale formats with the default one, and a language
+     * whose digits are not ASCII (Arabic, Persian, Devanagari, Thai, Burmese) produced
+     * keys like `٢٠٢٦-٠٢-٢٥`. Those still sort among themselves, which is why the
+     * breakage hides: rows written before a language change keep ASCII keys, and
+     * `ORDER BY day` then interleaves two alphabets while `recent`'s set comparison
+     * matches neither — the reader's streak reads 0 after studying.
+     */
     fun of(millis: Long): String {
         val cal = java.util.Calendar.getInstance()
         cal.timeInMillis = millis
         return "%04d-%02d-%02d".format(
+            java.util.Locale.US,
             cal.get(java.util.Calendar.YEAR),
             cal.get(java.util.Calendar.MONTH) + 1,
             cal.get(java.util.Calendar.DAY_OF_MONTH),

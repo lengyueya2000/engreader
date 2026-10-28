@@ -1,5 +1,7 @@
 package com.engreader.app.tts
 
+import java.util.concurrent.atomic.AtomicInteger
+
 /** Engine lifecycle, so the UI can tell "no voice available" apart from "still loading". */
 enum class SpeechState { Idle, Preparing, Ready, Unavailable }
 
@@ -17,10 +19,22 @@ enum class SpeechRole { Reading, Translation }
 sealed interface SpeechEvent {
     data class Finished(val utteranceId: String) : SpeechEvent
     data class Failed(val utteranceId: String) : SpeechEvent
+
+    /**
+     * The request never reached the voice, or was replaced before it could finish.
+     *
+     * Distinct from [Failed] on purpose. A failure means the voice is gone and the
+     * read-aloud has to stop; this only means *this request* will never report anything.
+     * Reporting it as a failure ended a session that had already moved on to a newer
+     * sentence, and not reporting it at all left the queue waiting on an utterance nobody
+     * would ever finish — the reader saw "playing" and a highlighted sentence, with no
+     * audio and no event, indefinitely.
+     */
+    data class Abandoned(val utteranceId: String) : SpeechEvent
 }
 
 /** A sentence, and which of the two voices reads it. */
-data class SpokenUtterance(val index: Int, val role: SpeechRole)
+data class SpokenUtterance(val index: Int, val role: SpeechRole, val serial: Int? = null)
 
 /**
  * The ids the read-aloud queue tags its utterances with.
@@ -31,20 +45,40 @@ data class SpokenUtterance(val index: Int, val role: SpeechRole)
  * keeps the two ends in agreement: if the suffix a producer writes is not the suffix a
  * consumer strips, the queue stops at the end of the first pair and the reader hears
  * nothing after it, which is a silent failure rather than a visible one.
+ *
+ * An id may also carry the serial of the *request* that produced it — `sentence:N#7`.
+ * That is what tells two requests for the same sentence apart: tapping the sentence being
+ * read asks for it again, and the id used to name only the sentence, so the completion of
+ * the request the queue had already replaced arrived under the id the queue was waiting
+ * for. The queue advanced on it and the replay was never heard, with no race involved.
  */
 object UtteranceId {
 
     private const val PREFIX = "sentence:"
 
+    /** Separates the sentence index from the serial of the request that asked for it. */
+    private const val SERIAL_MARK = "#"
+
     /** Marks the utterance that reads a sentence's Chinese, after its English. */
     const val TRANSLATION_SUFFIX = ":zh"
 
-    fun english(index: Int): String = "$PREFIX$index"
+    /**
+     * The id for the English of sentence [index], from request [serial].
+     *
+     * [serial] is omitted only by callers that have no request to name; a serial-less id
+     * still parses, and always will, because two requests for one sentence are what the
+     * serial exists to tell apart — never a property of the sentence itself.
+     */
+    fun english(index: Int, serial: Int? = null): String = "$PREFIX$index${serialOf(serial)}"
 
-    fun translation(index: Int): String = "$PREFIX$index$TRANSLATION_SUFFIX"
+    fun translation(index: Int, serial: Int? = null): String =
+        "$PREFIX$index${serialOf(serial)}$TRANSLATION_SUFFIX"
+
+    private fun serialOf(serial: Int?): String =
+        if (serial == null) "" else "$SERIAL_MARK$serial"
 
     /**
-     * The sentence and role an id names, or null when it is not one of ours.
+     * The sentence, role and request serial an id names, or null when it is not one of ours.
      *
      * The Chinese has to be recognised before the English: `5:zh` does not parse as a
      * number, so a reader that checked for the bare form first would drop every Chinese
@@ -52,14 +86,94 @@ object UtteranceId {
      */
     fun parse(id: String): SpokenUtterance? {
         if (!id.startsWith(PREFIX)) return null
-        val body = id.removePrefix(PREFIX)
-        if (body.endsWith(TRANSLATION_SUFFIX)) {
-            val index = body.removeSuffix(TRANSLATION_SUFFIX).toIntOrNull() ?: return null
-            return SpokenUtterance(index, SpeechRole.Translation)
-        }
-        val index = body.toIntOrNull() ?: return null
-        return SpokenUtterance(index, SpeechRole.Reading)
+        var body = id.removePrefix(PREFIX)
+        val translation = body.endsWith(TRANSLATION_SUFFIX)
+        if (translation) body = body.removeSuffix(TRANSLATION_SUFFIX)
+        val mark = body.indexOf(SERIAL_MARK)
+        val digits = if (mark >= 0) body.substring(0, mark) else body
+        val index = digits.toIntOrNull() ?: return null
+        val serial = if (mark < 0) null else body.substring(mark + 1).toIntOrNull() ?: return null
+        val role = if (translation) SpeechRole.Translation else SpeechRole.Reading
+        return SpokenUtterance(index, role, serial)
     }
+}
+
+/**
+ * What the read-aloud queue does when one of its utterances finishes.
+ *
+ * Kept out of [ListeningSession] because it is the decision the queue has got wrong, and
+ * because it is a decision about ids and queue indices rather than about Android: this
+ * way the skip semantics can be pinned down by a JVM test instead of by a device. The
+ * rule is that only the request the queue most recently issued ends the sentence — the
+ * sentence index alone is not the identity of a request, because the same sentence can be
+ * asked for twice.
+ */
+object QueueAdvance {
+
+    /** The queue's next move after one of its utterances finishes. */
+    sealed interface Step {
+        /** Read sentence [index] in English. */
+        data class English(val index: Int) : Step
+
+        /** Read sentence [index]'s Chinese. */
+        data class Translation(val index: Int) : Step
+
+        /** The finishing utterance has nothing to do with what is playing. */
+        data object Ignore : Step
+
+        /** The piece has been read to the end. */
+        data object EndOfPiece : Step
+    }
+
+    /**
+     * @param utteranceId the id the finishing utterance reported.
+     * @param issued the id of the request the queue most recently handed to the voice.
+     * @param total how many sentences the queue holds.
+     * @param translationPending true when this sentence's Chinese is what is read next.
+     */
+    fun after(
+        utteranceId: String,
+        issued: String?,
+        total: Int,
+        translationPending: Boolean,
+    ): Step {
+        val spoken = UtteranceId.parse(utteranceId) ?: return Step.Ignore
+        // A completion for anything but the request the queue is waiting on is a late
+        // report from a request it has already replaced. Taking it for the current one is
+        // what made "say this sentence again" skip forward instead of replaying, and what
+        // made the loser of two requests for the same next sentence advance twice.
+        if (issued == null || issued != utteranceId) return Step.Ignore
+        val next = spoken.index + 1
+        if (spoken.role == SpeechRole.Translation) {
+            return if (next < total) Step.English(next) else Step.EndOfPiece
+        }
+        if (translationPending) return Step.Translation(spoken.index)
+        return if (next < total) Step.English(next) else Step.EndOfPiece
+    }
+}
+
+/**
+ * The counter that says whether a request to speak has been superseded.
+ *
+ * A request captures its token when it is made; a newer request, or a stop, bumps the
+ * counter and the token no longer matches. Extracted from [NeuralTts] so the rule the
+ * whole cancellation design rests on — a superseded request is reported as abandoned,
+ * never as finished — has somewhere to be held still by a test.
+ */
+internal class RequestGeneration {
+
+    private val counter = AtomicInteger(0)
+
+    /** Claims a token for a new request. */
+    fun next(): Int = counter.incrementAndGet()
+
+    /** Supersedes everything in flight without issuing a request: a stop, or a reload. */
+    fun supersede() {
+        counter.incrementAndGet()
+    }
+
+    /** True when [token] has been superseded. */
+    fun isStale(token: Int): Boolean = counter.get() != token
 }
 
 /**

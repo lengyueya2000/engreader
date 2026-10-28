@@ -1,6 +1,8 @@
 package com.engreader.app.nlp
 
+import com.engreader.app.dict.Lexicon
 import com.engreader.app.dict.PartOfSpeech
+import com.engreader.app.dict.WordEntry
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -416,4 +418,177 @@ class QuizBuilderTest {
         val questions = builder.build("The cat sat on the mat.", maxQuestions = 5)
         assertTrue(questions.isEmpty())
     }
+
+    }
+
+/**
+ * Grammar regressions from review.
+ *
+ * A separate class rather than more cases in [GrammarAnalyzerTest] only because these
+ * were appended after this file's last class. The lexicon is deliberately empty: every
+ * verb these cases turn on (`rained`, `flooded`, `failed`, `resigned`, `announced`) is
+ * read by the `-ed` suffix rule and every noun falls through `guess`, so the cases do not
+ * depend on hand-specified parts of speech — which is how the original defects stayed
+ * invisible. The two cases that turn on the dictionary's *shape* build their own entries.
+ */
+class GrammarAnalyzerReviewTest {
+
+    private val lexicon = FakeLexicon()
+    private val analyzer = GrammarAnalyzer(lexicon)
+
+    // ------------------------------------------------------------ review regressions
+
+    @Test
+    fun `when opens a subordinate clause instead of swallowing the sentence`() {
+        // `when` and `where` were missing from SUBORDINATORS while `whenever`/`wherever`
+        // were in it, so `When it rained, the roads flooded.` came out as a single clause
+        // whose backbone was the subordinate clause — the panel taught the opposite of
+        // the truth for one of the commonest clause types in English.
+        val analysis = analyzer.analyze("When it rained, the roads flooded.")
+        assertTrue(
+            "expected the subordinate clause to be segmented out, got ${analysis.clauses.size}",
+            analysis.clauses.size >= 2,
+        )
+        assertTrue(
+            "the fronted clause must not be the sentence's backbone",
+            analysis.backbone.trim() != "When it rained",
+        )
+        assertTrue(
+            "expected the main clause's subject, got ${analysis.clauses.map { it.subject }}",
+            analysis.clauses.any { it.subject.trim() == "the roads" },
+        )
+    }
+
+    @Test
+    fun `where opens a subordinate clause too`() {
+        val analysis = analyzer.analyze("Where the plan failed, the minister resigned.")
+        assertTrue(analysis.clauses.size >= 2)
+    }
+
+    @Test
+    fun `a fronted time phrase is not part of the subject`() {
+        // The subject used to be "everything before the finite verb", so fronting — which
+        // is ordinary in news prose — put the adverbial inside it.
+        val analysis = analyzer.analyze("In 2020, the government announced the plan.")
+        val main = analysis.clauses.first { it.kind == ClauseKind.Main }
+        assertEquals("the government", main.subject.trim())
+    }
+
+    @Test
+    fun `a fronted day phrase is not part of the subject`() {
+        val analysis = analyzer.analyze("On Monday, the plan failed.")
+        val main = analysis.clauses.first { it.kind == ClauseKind.Main }
+        assertEquals("the plan", main.subject.trim())
+    }
+
+    @Test
+    fun `a comma between list items does not cut the subject short`() {
+        // The counter-case to the fix above: this comma separates items, it does not
+        // close a clause, so the whole noun phrase is the subject.
+        val analysis = analyzer.analyze("The plan, the timetable, the budget were approved.")
+        val main = analysis.clauses.first { it.kind == ClauseKind.Main }
+        assertTrue(
+            "expected the whole phrase as the subject, got '${main.subject}'",
+            main.subject.contains("timetable"),
+        )
+    }
+
+    @Test
+    fun `a curly quote before a contraction is not the subject`() {
+        // Imported EPUB prose is full of curly quotes, and a quote is not blank, so the
+        // hidden-subject branch — the one that exists to read the subject out of a
+        // contraction — was never reached and `“` was reported as the subject.
+        val analysis = analyzer.analyze("\u201CWe're leaving,\u201D she said.")
+        assertFalse(
+            "a quote mark was reported as a subject",
+            analysis.clauses.any {
+                it.subject.isNotBlank() && it.subject.all { c -> c in QUOTE_MARKS }
+            },
+        )
+        assertTrue(
+            "expected the contraction's own subject, got ${analysis.clauses.map { it.subject }}",
+            analysis.clauses.any { it.subject.trim().equals("We", ignoreCase = true) },
+        )
+    }
+
+    @Test
+    fun `an inflected form whose first gloss is an adjective is still a finite verb`() {
+        // The bundled ECDICT files `left` under its own headword and marks the *first*
+        // gloss line with the adjective reading (a. 左边的…), carrying the verb reading of
+        // `leave` as the alternative reading. `posOf` answers from that first line — it is
+        // the reading the lookup sheet shows — so `isFiniteVerb` rejected `left`, the
+        // clause found no finite verb at all, and `She left the room.` was reported as
+        // "the sentence as written": no subject, no predicate, no backbone.
+        val lex = HomographLexicon(
+            mapOf(
+                "left" to entry(
+                    lemma = "left",
+                    translation = "a. 左边的, 左侧的",
+                    alternative = "leave" to listOf("动词 离开，动身"),
+                ),
+                "room" to entry(lemma = "room", translation = "n. 房间"),
+            ),
+        )
+        val analysis = GrammarAnalyzer(lex).analyze("She left the room.")
+        val main = analysis.clauses.first { it.kind == ClauseKind.Main }
+        assertEquals("She", main.subject.trim())
+        assertEquals("left", main.verb.trim())
+    }
+
+    @Test
+    fun `a noun that is also a verb is not the predicate just for having a verb sense`() {
+        // The counter-case: scanning every line of the primary gloss would make `interest`
+        // a finite verb here, and `buildClause` takes the *first* one, so the predicate
+        // would be `interest` and the subject empty. Only a *different* headword the
+        // spelling belongs to is evidence enough.
+        val lex = HomographLexicon(
+            mapOf(
+                "interest" to entry(lemma = "interest", translation = "n. 兴趣\nv. 使感兴趣"),
+                // A plural noun that carries a verb sense on a later gloss line and has
+                // no alternative headword: scanning every gloss line would call this the
+                // predicate (and, being the first verb-shaped token, would leave the
+                // subject empty). Only a different headword is evidence enough.
+                "rates" to entry(lemma = "rates", translation = "n. 比率\nv. 把…列为"),
+                // `rose` has the shape the fix is for: its own headword is a noun and only
+                // its second reading is a verb.
+                "rose" to entry(
+                    lemma = "rose",
+                    translation = "n. 玫瑰, 蔷薇",
+                    alternative = "rise" to listOf("动词 上升"),
+                ),
+                "percent" to entry(lemma = "percent", translation = "n. 百分比"),
+            ),
+        )
+        val analysis = GrammarAnalyzer(lex).analyze("Interest rates rose to 3.5 per cent.")
+        val main = analysis.clauses.first { it.kind == ClauseKind.Main }
+        assertEquals("Interest rates", main.subject.trim())
+        assertEquals("rose", main.verb.trim())
+    }
+
+    private val QUOTE_MARKS = setOf('\u201C', '\u201D', '\u2018', '\u2019', '"', '\'')
+
+    /** A lexicon whose entries carry a second reading, the shape `Dictionary` produces. */
+    private class HomographLexicon(
+        private val entries: Map<String, WordEntry>,
+    ) : Lexicon by FakeLexicon() {
+        override fun lookup(raw: String): WordEntry? = entries[Tokenizer.normalize(raw)]
+    }
+
+    private fun entry(
+        lemma: String,
+        translation: String,
+        alternative: Pair<String, List<String>>? = null,
+    ) = WordEntry(
+        lemma = lemma,
+        queried = lemma,
+        phonetic = "",
+        translation = translation,
+        definition = "",
+        collins = 2,
+        oxford = false,
+        frq = 12000,
+        bnc = 12000,
+        tag = "",
+        otherReadings = alternative?.let { listOf(it) }.orEmpty(),
+    )
 }

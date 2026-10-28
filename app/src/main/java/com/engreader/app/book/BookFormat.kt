@@ -113,7 +113,10 @@ enum class BookFormat(val label: String) {
             val epub = "application/epub+zip".toByteArray(Charsets.US_ASCII)
             // Local header: 30 bytes, then the name, then the stored payload. The name
             // is always at offset 30 for the first entry; the payload starts right
-            // after it because `mimetype` must be stored uncompressed.
+            // after it because `mimetype` must be stored uncompressed. Both searches
+            // are bounded to the prefix the comment above promises: `indexOf` is a
+            // naive byte scan and `detect` is handed the whole file, so they used to be
+            // two extra full passes over every import.
             if (b.size < 30 + marker.size + epub.size) return false
             val nameAt = indexOf(b, marker)
             if (nameAt !in 0..64) return false
@@ -138,20 +141,30 @@ enum class BookFormat(val label: String) {
         }
 
         private fun firstRecordOffset(b: ByteArray): Int? {
-            if (b.size < 80) return null
+            // The offset field is read from bytes 78..81, so the header needs 82 bytes.
+            // 80 and 81 used to pass a `< 80` test and then throw
+            // `ArrayIndexOutOfBoundsException: Index 80 out of bounds for length 80`
+            // out of `readInt`, which the import path only showed as a raw message.
+            if (b.size < 82) return null
             val offset = readInt(b, 78)
             return offset.takeIf { it in 78 until b.size }
         }
 
-        private fun readInt(b: ByteArray, at: Int): Int =
-            ((b[at].toInt() and 0xFF) shl 24) or
+        private fun readInt(b: ByteArray, at: Int): Int {
+            if (at < 0 || at + 4 > b.size) return 0
+            return ((b[at].toInt() and 0xFF) shl 24) or
                 ((b[at + 1].toInt() and 0xFF) shl 16) or
                 ((b[at + 2].toInt() and 0xFF) shl 8) or
                 (b[at + 3].toInt() and 0xFF)
+        }
 
         private fun indexOf(haystack: ByteArray, needle: ByteArray): Int {
-            if (needle.isEmpty() || haystack.size < needle.size) return -1
-            outer@ for (i in 0..haystack.size - needle.size) {
+            if (needle.isEmpty()) return -1
+            // Bounded to the sniffing prefix: the rules above only ever look at the
+            // opening of the file, and `detect` is handed whole books.
+            val end = minOf(SNIFF_BYTES, haystack.size)
+            if (end < needle.size) return -1
+            outer@ for (i in 0..end - needle.size) {
                 for (j in needle.indices) {
                     if (haystack[i + j] != needle[j]) continue@outer
                 }

@@ -29,7 +29,15 @@ object ArticleExtractor {
         RegexOption.IGNORE_CASE,
     )
 
-    private val PARAGRAPH = Regex("(?is)<p\\b(${Html.ATTRS})>(.*?)</p>")
+    // The lazy group stops at `</p>`, at the next `<p`, or at the end of the document.
+    //
+    // It used to be only `</p>`, which is quadratic on a document that never closes its
+    // paragraphs — legal HTML5, and what a truncated or JSON-rendered page looks like:
+    // every `<p>` scanned to the end of the input, found nothing, and failed. A 648 KB
+    // page took 14.9 s and then yielded *no* paragraphs at all, so the caller silently
+    // downgraded to a two-line feed summary. Ending a paragraph at the next `<p` bounds
+    // each scan, which makes the whole pass linear and keeps the text.
+    private val PARAGRAPH = Regex("(?is)<p\\b(${Html.ATTRS})>(.*?)(?:</p\\s*>|(?=<p\\b)|$)")
     private val HEADING = Regex("(?is)<h([12])\\b${Html.ATTRS}>(.*?)</h\\1>")
     private val TITLE_TAG = Regex("(?is)<title${Html.ATTRS}>(.*?)</title>")
 

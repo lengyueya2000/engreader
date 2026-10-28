@@ -64,11 +64,17 @@ class Dictionary(private val context: Context) : Lexicon, FamilyLexicon {
 
     private val file: File get() = File(context.filesDir, DB_NAME)
 
+    private fun stampFile(): File = File(context.filesDir, "$DB_NAME.stamp")
+
     private fun open(): SQLiteDatabase {
         db?.let { return it }
         synchronized(this) {
             db?.let { return it }
-            if (!file.exists() || file.length() == 0L) install()
+            // The stamp check is what lets a later build's `dict.db` reach an install
+            // that already has one: the copy used to be written only when missing or
+            // empty, so a corrected gloss or a new lemma stayed invisible for the life
+            // of the install and uninstalling was the only way to get it.
+            if (!file.exists() || file.length() == 0L || !installedIsCurrent()) install()
             val opened = runCatching {
                 SQLiteDatabase.openDatabase(file.absolutePath, null, SQLiteDatabase.OPEN_READONLY)
             }.getOrElse {
@@ -84,12 +90,43 @@ class Dictionary(private val context: Context) : Lexicon, FamilyLexicon {
     }
 
     /**
+     * True when the private copy came from the dictionary this build bundles.
+     *
+     * The stamp combines [ASSET_VERSION] with the asset's length: the constant is for
+     * a replacement somebody deliberately published, the length also catches a rebuild
+     * that changed the file without the constant being bumped. The asset is stored
+     * uncompressed (`noCompress("db")`), which is what makes `openFd` report a length
+     * here; a compressed asset would give `null`, which is still a stable stamp. A
+     * stamp that cannot be read counts as "not current", which copies the asset again —
+     * the safe direction, since the alternative is serving a dictionary the build no
+     * longer ships.
+     */
+    private fun installedIsCurrent(): Boolean = runCatching {
+        stampFile().takeIf { it.isFile }?.readText()?.trim() == assetStamp()
+    }.getOrDefault(false)
+
+    private fun assetStamp(): String {
+        val length = runCatching {
+            val descriptor = context.assets.openFd(DB_NAME)
+            try {
+                descriptor.length
+            } finally {
+                descriptor.close()
+            }
+        }.getOrNull()
+        return "$ASSET_VERSION:$length"
+    }
+
+    /**
      * Copies the asset in, via a temporary file that is renamed into place.
      *
      * Writing straight to [file] meant a process death part way through left a short
      * file that the `length() == 0` check did not catch, so the dictionary was broken
      * for good — SQLite would fail to open it and nothing ever re-copied it. The
      * rename is atomic, so the destination is either the whole file or absent.
+     *
+     * The stamp is written last, so an install that failed part way through leaves the
+     * previous stamp in place and the next launch copies again.
      */
     private fun install() {
         val temp = File(context.filesDir, "$DB_NAME.tmp")
@@ -104,6 +141,10 @@ class Dictionary(private val context: Context) : Lexicon, FamilyLexicon {
                 temp.copyTo(file, overwrite = true)
                 temp.delete()
             }
+            // Best effort: a stamp that cannot be written costs one redundant copy on the
+            // next launch, while failing the whole `open()` would leave the reader with
+            // no dictionary at all.
+            runCatching { stampFile().writeText(assetStamp()) }
         } finally {
             if (temp.exists()) temp.delete()
         }
@@ -434,6 +475,14 @@ class Dictionary(private val context: Context) : Lexicon, FamilyLexicon {
 
     companion object {
         private const val DB_NAME = "dict.db"
+
+        /**
+         * Bumped whenever `assets/dict.db` is replaced.
+         *
+         * The asset's length is part of the stamp as well, so a rebuild that changes the
+         * file without this constant being bumped still reaches existing installs.
+         */
+        private const val ASSET_VERSION = 1
 
         /** Entries kept in the look-up cache. A few hundred taps' worth, a few tens of KB. */
         private const val CACHE_LIMIT = 512

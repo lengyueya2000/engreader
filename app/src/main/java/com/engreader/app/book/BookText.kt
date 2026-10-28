@@ -131,12 +131,38 @@ object BookText {
      * which is what keeps the opening paragraph of a chapter out of the title.
      */
     fun firstHeading(html: String): String? {
-        val match = Regex("(?is)<h([1-3])\\b${Html.ATTRS}>(.*?)</h\\1\\s*>").find(html) ?: return null
-        val text = fromHtml(match.groupValues[2]).replace("\n", " ").trim()
-        if (text.isEmpty() || text.length > 90) return null
-        if (SENTENCE_END.containsMatchIn(text)) return null
-        return text
+        // Two scans rather than one lazy `(.*?)</h\1>`: with many unclosed headings the
+        // lazy dot searches to the end of the document from *every* opening tag, which
+        // is quadratic — 32 000 unclosed `<h1>` measured 14 s, and a chapter file can
+        // hold a megabyte of them. The closer is searched once per level, and a level
+        // with no closer left is remembered as such, so the whole search stays linear.
+        val exhausted = BooleanArray(HEADING_CLOSES.size)
+        var at = 0
+        while (true) {
+            val open = HEADING_OPEN.find(html, at) ?: return null
+            at = open.range.last + 1
+            val level = open.groupValues[1].toInt()
+            if (exhausted[level - 1]) continue
+            val close = HEADING_CLOSES[level - 1].find(html, at)
+            if (close == null) {
+                exhausted[level - 1] = true
+                continue
+            }
+            val text = fromHtml(html.substring(at, close.range.first)).replace("\n", " ").trim()
+            if (text.isEmpty() || text.length > 90) return null
+            if (SENTENCE_END.containsMatchIn(text)) return null
+            return text
+        }
     }
+
+    private val HEADING_OPEN = Regex("(?is)<h([1-3])\\b${Html.ATTRS}>")
+
+    /** Closers by level, so the pattern for a level is compiled once, not per call. */
+    private val HEADING_CLOSES = listOf(
+        Regex("(?is)</h1\\s*>"),
+        Regex("(?is)</h2\\s*>"),
+        Regex("(?is)</h3\\s*>"),
+    )
 
     /**
      * A label for a chapter in the table of contents.

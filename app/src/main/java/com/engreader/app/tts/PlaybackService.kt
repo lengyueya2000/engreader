@@ -34,6 +34,18 @@ class PlaybackService : Service() {
     private var session: MediaSession? = null
     private var focusRequest: AudioFocusRequest? = null
 
+    /**
+     * True while audio focus is only lost for a moment — a call, or a navigation prompt.
+     *
+     * [AudioManager.AUDIOFOCUS_GAIN] is the cue that focus is back and the reading should
+     * carry on where it left off; without it a transient loss paused the reader for good,
+     * and a hand on the phone was needed after every phone call. It also decides whether a
+     * pause abandons the focus request: a pause the reader did not ask for has to keep the
+     * request alive, because abandoning it takes this listener off the focus stack and the
+     * `GAIN` that ends the call never arrives.
+     */
+    private var transientLoss: Boolean = false
+
     private var title: String = ""
     private var subtitle: String = ""
     private var playing: Boolean = false
@@ -53,6 +65,8 @@ class PlaybackService : Service() {
             setCallback(
                 object : MediaSession.Callback() {
                     override fun onPlay() {
+                        // The reader asked for play, so they decide, not the focus stack.
+                        transientLoss = false
                         Hooks.resume?.invoke()
                     }
 
@@ -81,22 +95,44 @@ class PlaybackService : Service() {
         when (intent?.action) {
             ACTION_STOP -> {
                 // The reader's own stop path is the only thing that knows to clear the
-                // highlight and the queue, so the button goes through it.
+                // highlight and the queue, so the button goes through it. Focus goes with
+                // the session instead of being held until the service is destroyed.
+                transientLoss = false
+                abandonFocus()
                 Hooks.stop?.invoke()
                 stopSelf()
             }
 
-            ACTION_PAUSE -> control { Hooks.pause?.invoke() }
+            ACTION_PAUSE -> control {
+                // The reader asked for quiet, so the reader decides when it comes back:
+                // the focus request is released, and a later GAIN is not a resume.
+                transientLoss = false
+                abandonFocus()
+                Hooks.pause?.invoke()
+            }
 
-            ACTION_RESUME -> control { Hooks.resume?.invoke() }
+            ACTION_RESUME -> control {
+                transientLoss = false
+                Hooks.resume?.invoke()
+            }
 
-            ACTION_NEXT -> control { Hooks.next?.invoke() }
+            ACTION_NEXT -> control {
+                transientLoss = false
+                Hooks.next?.invoke()
+            }
 
-            ACTION_PREVIOUS -> control { Hooks.previous?.invoke() }
+            ACTION_PREVIOUS -> control {
+                transientLoss = false
+                Hooks.previous?.invoke()
+            }
 
             ACTION_SET_PLAYING -> control {
                 readExtras(intent)
                 playing = intent.getBooleanExtra(EXTRA_PLAYING, playing)
+                // A pause is also what the focus listener itself asks for, so only a
+                // pause the reader caused releases the request: releasing it there would
+                // mean the GAIN that ends a call never reached this listener.
+                if (!playing && !transientLoss) abandonFocus()
                 publish()
             }
 
@@ -197,12 +233,36 @@ class PlaybackService : Service() {
                     .build(),
             )
             .setOnAudioFocusChangeListener { change ->
-                // Anything but a duck means the reader should stop talking: a call, or
-                // another player taking over for good.
-                if (change == AudioManager.AUDIOFOCUS_LOSS ||
-                    change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT
-                ) {
-                    Hooks.pause?.invoke()
+                when (change) {
+                    // Taken for good: a call, or another player taking over. The reading
+                    // stops, and the pause it causes releases the focus request (the loss
+                    // was not transient), so nothing keeps a dead client on the stack.
+                    AudioManager.AUDIOFOCUS_LOSS -> {
+                        transientLoss = false
+                        Hooks.pause?.invoke()
+                    }
+
+                    // A call or a navigation prompt: focus comes back, so the reading is
+                    // asked to come back with it.
+                    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                        transientLoss = true
+                        Hooks.pause?.invoke()
+                    }
+
+                    // Focus is back. Resume only from a loss we paused for: if the reader
+                    // pressed pause in the meantime, a resume here would start the voice
+                    // under their hands. The flag is cleared by every one of their
+                    // commands, and by the resume itself.
+                    AudioManager.AUDIOFOCUS_GAIN -> {
+                        if (transientLoss) {
+                            transientLoss = false
+                            Hooks.resume?.invoke()
+                        }
+                    }
+
+                    // A duck is the one change the reading is meant to survive, and any
+                    // other code is nothing this service has a policy for.
+                    else -> Unit
                 }
             }
             .build()

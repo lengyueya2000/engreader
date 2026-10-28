@@ -228,7 +228,11 @@ object RssParser {
     /** XML's five predefined entities and the numeric references, which stay as written. */
     private val XML_REFERENCE = Regex("&(?:amp|lt|gt|quot|apos|#[0-9]+|#[xX][0-9a-fA-F]+);")
 
-    private val ENTITY_LIKE = Regex("&[A-Za-z][A-Za-z0-9]{1,31};")
+    // The capture group is load-bearing: [sanitize] hands group 1 to `Html.entity`.
+    // Without it, every named entity a feed can carry — `&nbsp;`, `&rsquo;`,
+    // `&mdash;`, `&hellip;` — threw `IndexOutOfBoundsException: No group 1` from
+    // inside the very repair path that exists to make those entities work.
+    private val ENTITY_LIKE = Regex("&([A-Za-z][A-Za-z0-9]{1,31});")
 
     private val BARE_AMP = Regex("&(?!(?:amp|lt|gt|quot|apos|#[0-9]+|#[xX][0-9a-fA-F]+);)")
 
@@ -239,7 +243,7 @@ object RssParser {
      * (`&nbsp;` becomes `&#160;`), so the text survives intact; anything else opening
      * with an ampersand is escaped, which is what a bare `&` in a headline needs.
      */
-    private fun sanitize(text: String): String {
+    internal fun sanitize(text: String): String {
         val mapped = ENTITY_LIKE.replace(text) { match ->
             val value = match.value
             if (XML_REFERENCE.matches(value)) {
