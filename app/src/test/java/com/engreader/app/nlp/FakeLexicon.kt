@@ -65,8 +65,23 @@ class FakeLexicon(
     override fun shortGloss(headword: String): String =
         entries[Tokenizer.normalize(headword)]?.second.orEmpty()
 
-    override fun glosses(translation: String): List<Pair<PartOfSpeech, String>> =
-        listOf(PartOfSpeech.Unknown to firstGloss(translation))
+    /**
+     * Mirrors `Dictionary.glosses`: every line, parsed for ECDICT's part-of-speech
+     * marker, with the `[计]`-style subject labels dropped.
+     *
+     * It used to answer `Unknown to firstGloss(...)`, which made every fake entry look
+     * unlabelled. The analyser reads *this* to decide whether a lemma carries a verb
+     * sense on a later line ([GrammarAnalyzer]'s past-tense fallback), so a fake that
+     * cannot answer that question would hide the very bug that fallback fixes.
+     */
+    override fun glosses(translation: String): List<Pair<PartOfSpeech, String>> {
+        val lines = translation.split("\\n", "\n").map { it.trim() }.filter { it.isNotEmpty() }
+        val general = lines.filterNot { it.startsWith("[") }
+        val chosen = general.ifEmpty { lines }
+        return chosen.map { line ->
+            PartOfSpeechParser.parse(line) to PartOfSpeechParser.stripPrefix(line)
+        }
+    }
 
     override fun firstGloss(translation: String): String =
         translation.substringAfter(' ').trim()

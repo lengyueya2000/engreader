@@ -77,6 +77,14 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
     private val verbReadingCache = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
 
     /**
+     * Cache for [verbInflection]: word → "this past-tense surface form belongs to a
+     * lemma that carries a verb sense". Separate from the two above because it is a
+     * third question again: not the primary reading, and not another headword, but a
+     * later line of the *same* lemma's entry.
+     */
+    private val verbInflectionCache = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+
+    /**
      * How many part-of-speech answers are kept.
      *
      * [analyze] runs on `Dispatchers.Default`, so two sentences can be parsed at once
@@ -518,7 +526,7 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
             if (rest.isNotEmpty()) {
                 // Only split when a finite verb follows, i.e. there really is a main clause.
                 val restWords = Tokenizer.words(rest).map { it.lowercase() }
-                if (restWords.indices.any { isFiniteVerb(restWords, it) }) return comma + 1
+                if (firstFiniteVerb(restWords) >= 0) return comma + 1
             }
         }
         return frontedSplitWithoutComma(raw)
@@ -538,9 +546,8 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
         if (tokens.isEmpty()) return -1
         val lower = tokens.map { it.lowercase() }
         val offsets = wordOffsets(raw, tokens)
-        val firstVerb = lower.indices.firstOrNull { isFiniteVerb(lower, it) } ?: return -1
-        val secondVerb = (firstVerb + 1 until lower.size).firstOrNull { isFiniteVerb(lower, it) }
-            ?: return -1
+        val firstVerb = firstFiniteVerb(lower).takeIf { it >= 0 } ?: return -1
+        val secondVerb = firstFiniteVerb(lower, firstVerb + 1).takeIf { it >= 0 } ?: return -1
         // Walk back from the second verb over its subject phrase, stopping at a word
         // that cannot be part of a subject.
         var start = secondVerb
@@ -645,7 +652,7 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
             opener.firstOrNull()?.isDigit() == true
         if (fronted) return tail
         val tailWords = Tokenizer.words(tail).map { it.lowercase() }
-        return if (tailWords.indices.any { isFiniteVerb(tailWords, it) }) head else text
+        return if (firstFiniteVerb(tailWords) >= 0) head else text
     }
 
     private fun addSegment(
@@ -667,13 +674,7 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
         val lower = tokens.map { it.lowercase() }
         val offsets = wordOffsets(segment.text, tokens)
 
-        var verbIndex = -1
-        for (i in lower.indices) {
-            if (isFiniteVerb(lower, i)) {
-                verbIndex = i
-                break
-            }
-        }
+        val verbIndex = firstFiniteVerb(lower)
 
         // Include leading auxiliaries in the verb phrase.
         var verbStart = verbIndex
@@ -850,12 +851,13 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
         }
         boundaries += tokens.size
 
-        val verbIndex = lower.indices.firstOrNull { isFiniteVerb(lower, it) } ?: -1
+        val verbIndex = firstFiniteVerb(lower)
         // The verb is where the predicate begins, so it is always a chunk edge.
         if (verbIndex > 0) boundaries += verbIndex
         // With the contraction split off, the predicate is what follows it.
         val predicateStart = if (leadingContraction) 1 else verbIndex
         val sorted = boundaries.distinct().sorted()
+        val subjectKey = clause.subject.trim()
 
         return sorted.zipWithNext().mapNotNull { (from, to) ->
             if (from >= to) return@mapNotNull null
@@ -866,13 +868,23 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
             val role = when {
                 leadingContraction && from == 0 -> ChunkRole.Subject
                 predicateStart in from until to -> ChunkRole.Predicate
-                from == 0 -> ChunkRole.Subject
+                // The subject is whatever the clause fields already read out, so a chunk
+                // that spells it exactly *is* the subject — even when it does not start
+                // at offset 0, as in `In 2020, the government announced…`, where the
+                // fronted phrase took the role instead and the subject was "其他".
+                subjectKey.isNotEmpty() && text.equals(subjectKey, ignoreCase = true) ->
+                    ChunkRole.Subject
                 lower[from] in RELATIVE_PRONOUNS -> ChunkRole.Attributive
                 // A prepositional phrase is adverbial even when it follows the verb:
                 // in "expecting to hear from the minister" the object is "to hear"
                 // and "from the minister" tells you where, not what. An infinitive
                 // marker is not a preposition, though — `to hear` is the object.
+                //
+                // Tested before the `from == 0` fallback as well: a sentence that opens
+                // with a fronted phrase (`In 2020, …`, `On Monday, …`) has its adverbial
+                // in the first chunk, not its subject.
                 isPrepositionalPhrase(lower, from) -> ChunkRole.Adverbial
+                from == 0 -> ChunkRole.Subject
                 verbIndex >= 0 && from > verbIndex -> ChunkRole.Object
                 else -> ChunkRole.Other
             }
@@ -1047,6 +1059,61 @@ class GrammarAnalyzer(private val dictionary: Lexicon) {
             .any { (_, lines) -> lines.any { it.startsWith(marker) } }
         if (verbReadingCache.size < POS_CACHE_LIMIT) verbReadingCache[key] = found
         return found
+    }
+
+    /**
+     * True when [word] is a past-tense form whose lemma carries a verb sense on a line
+     * after the first.
+     *
+     * The bundled `dict.db` resolves `rained` to `rain` — first gloss `n. 雨, 下雨,
+     * 雨天`, the verb on the next line — and `flooded` to `flood` — first gloss
+     * `n. 洪水, 大量之水, 涨潮`, `vt. 淹没…` below it. [posOf] answers from the first
+     * line only, deliberately, because scanning every line turns `interest`/`rate`
+     * into predicates, and [verbReadingFromAlternative] only knows about a *different
+     * headword* the spelling also belongs to (`left` → `leave`). So neither word counted
+     * as a finite verb: the clause found no predicate at all and
+     * `When it rained, the roads flooded near the school.` came back as one subordinate
+     * clause whose backbone was `When it rained` — the C4 defect, still visible on a
+     * device after the fix that added `when`/`where` to [SUBORDINATORS].
+     *
+     * The test suite could not see it because `FakeLexicon` returns `null` for a word it
+     * does not know, which lets [posOf] fall through to `PartOfSpeechParser.guess`, and
+     * an `-ed` ending guesses "verb". A real entry *blocks* that fallback, so the
+     * dictionary made the parse worse than no dictionary at all.
+     *
+     * Deliberately narrow: `-ed` only. An `-ing` form is a participle far more often
+     * than a predicate, and a 3rd-person form (`leaves`, `works`) is a plural noun at
+     * least as often as a verb.
+     */
+    private fun verbInflection(word: String): Boolean {
+        val key = Tokenizer.normalize(word)
+        if (key.isEmpty() || !key.endsWith("ed")) return false
+        verbInflectionCache[key]?.let { return it }
+        val entry = dictionary.lookup(key)
+        val found = entry != null && entry.isInflected &&
+            dictionary.glosses(entry.translation).any { (pos, _) -> pos == PartOfSpeech.Verb }
+        if (verbInflectionCache.size < POS_CACHE_LIMIT) verbInflectionCache[key] = found
+        return found
+    }
+
+    /** [verbInflection] for a token, with the same context guards as [isFiniteVerb]. */
+    private fun isWeakFiniteVerb(lower: List<String>, index: Int): Boolean {
+        if (index > 0 && lower[index - 1] == "to") return false
+        return verbInflection(lower[index])
+    }
+
+    /**
+     * Index of the first finite verb from [from] on, or -1.
+     *
+     * A dictionary-confirmed verb always wins: [isWeakFiniteVerb] is a fallback for a
+     * past tense the dictionary files under a noun-first lemma, and using it first would
+     * let a past-participle adjective steal the predicate from a real verb — in
+     * `The interested students left.` the verb is `left`, not `interested`.
+     */
+    private fun firstFiniteVerb(lower: List<String>, from: Int = 0): Int {
+        val range = from.coerceAtLeast(0) until lower.size
+        range.firstOrNull { isFiniteVerb(lower, it) }?.let { return it }
+        return range.firstOrNull { isWeakFiniteVerb(lower, it) } ?: -1
     }
 
     /** Character offset of each token in the original string, in token order. */

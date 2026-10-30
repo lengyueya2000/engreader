@@ -565,6 +565,82 @@ class GrammarAnalyzerReviewTest {
         assertEquals("rose", main.verb.trim())
     }
 
+    @Test
+    fun `a past tense whose lemma is noun first is still a finite verb`() {
+        // The shape the bundled `dict.db` actually produces, and the one `FakeLexicon`
+        // cannot reproduce: `rained` has no headword of its own and resolves to `rain`,
+        // whose first gloss line is a noun (`n. 雨`) and whose second is a verb
+        // (`vi. 下雨`); `flooded` resolves the same way through `flood`. The C8 fix reads
+        // a *different* headword (`left` → `leave`), so neither word counted as a finite
+        // verb: the comma split found no main clause at all, and
+        // "When it rained, the roads flooded near the school." collapsed into a single
+        // subordinate clause whose backbone was "When it rained".
+        //
+        // Found on a device, not here: the test above passes with `FakeLexicon` because a
+        // word it does not know falls through to `PartOfSpeechParser.guess`, and `-ed`
+        // guesses "verb". A real entry blocks that fallback, so the dictionary made the
+        // parse worse than no dictionary at all.
+        val lex = HomographLexicon(
+            mapOf(
+                "rained" to inflected("rained", "rain", "n. 雨, 下雨, 雨天\nvi. 下雨"),
+                "flooded" to inflected(
+                    "flooded",
+                    "flood",
+                    "n. 洪水, 大量之水, 涨潮\nvt. 淹没, 使泛滥, 注满\nvi. 被淹, 溢出, 涌进",
+                ),
+            ),
+        )
+        val analysis = GrammarAnalyzer(lex).analyze("When it rained, the roads flooded near the school.")
+        assertTrue(
+            "expected the subordinate clause to be segmented out, got ${analysis.clauses.size} clause(s)",
+            analysis.clauses.size >= 2,
+        )
+        val main = analysis.clauses.first { it.kind == ClauseKind.Main }
+        assertEquals("the roads", main.subject.trim())
+        assertEquals("flooded", main.verb.trim())
+        assertFalse(
+            "the fronted clause must not be the backbone, got '${analysis.backbone}'",
+            analysis.backbone.trim() == "When it rained",
+        )
+    }
+
+    @Test
+    fun `a past participle used as an adjective does not steal the predicate`() {
+        // The weak fallback the test above needs only runs when no dictionary-confirmed
+        // finite verb exists. Without that guard "The interested students left." would
+        // report `interested` — an adjective whose lemma carries a verb sense — as the
+        // predicate and `The` as the subject.
+        val lex = HomographLexicon(
+            mapOf(
+                "interested" to inflected("interested", "interest", "n. 兴趣, 利息\nvt. 使感兴趣"),
+                "students" to entry("students", "n. 学生"),
+                "left" to entry(
+                    lemma = "left",
+                    translation = "a. 左边的, 左侧的",
+                    alternative = "leave" to listOf("动词 离开，动身"),
+                ),
+            ),
+        )
+        val analysis = GrammarAnalyzer(lex).analyze("The interested students left.")
+        val main = analysis.clauses.first { it.kind == ClauseKind.Main }
+        assertEquals("left", main.verb.trim())
+        assertEquals("The interested students", main.subject.trim())
+    }
+
+    @Test
+    fun `the fronted phrase is an adverbial chunk and the subject is the subject chunk`() {
+        // The clause fields were fixed for this sentence, but the colour line below them
+        // still called the fronted `In 2020` the subject and the real subject "其他",
+        // because the chunk roles used `from == 0 -> Subject` as a fallback.
+        val analysis = analyzer.analyze("In 2020, the government announced the plan.")
+        val fronted = analysis.chunks.firstOrNull { it.text.startsWith("In") }
+        assertNotNull("expected a chunk for the fronted phrase", fronted)
+        assertEquals(ChunkRole.Adverbial, fronted!!.role)
+        val subject = analysis.chunks.firstOrNull { it.text.equals("the government", ignoreCase = true) }
+        assertNotNull("expected a chunk for the subject", subject)
+        assertEquals(ChunkRole.Subject, subject!!.role)
+    }
+
     private val QUOTE_MARKS = setOf('\u201C', '\u201D', '\u2018', '\u2019', '"', '\'')
 
     /** A lexicon whose entries carry a second reading, the shape `Dictionary` produces. */
@@ -573,6 +649,10 @@ class GrammarAnalyzerReviewTest {
     ) : Lexicon by FakeLexicon() {
         override fun lookup(raw: String): WordEntry? = entries[Tokenizer.normalize(raw)]
     }
+
+    /** An entry the dictionary reached through its lemma, e.g. queried `rained`, lemma `rain`. */
+    private fun inflected(form: String, lemma: String, translation: String) =
+        entry(lemma = lemma, translation = translation).copy(queried = form)
 
     private fun entry(
         lemma: String,
