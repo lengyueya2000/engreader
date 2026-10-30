@@ -1,4 +1,4 @@
-﻿plugins {
+plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
@@ -48,8 +48,8 @@ android {
         applicationId = "com.engreader.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 24
-        versionName = "2.0.0"
+        versionCode = 25
+        versionName = "2.0.1"
     }
 
     // One APK per ABI rather than one fat APK: the speech engine's native library is
